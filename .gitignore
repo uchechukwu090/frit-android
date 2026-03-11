@@ -1,0 +1,15 @@
+.env
+*.env
+!.env.example
+node_modules/
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/*.keystore
+!android/app/debug.keystore
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
