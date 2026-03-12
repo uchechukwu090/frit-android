@@ -79,6 +79,15 @@ function pickModel(message = "", hasImage = false, mode = "auto") {
   return MODELS.fast;
 }
 
+// ─── / root ──────────────────────────────────────────────────────────────────
+app.get("/", (_req, res) => {
+  res.json({
+    name: "FRIT Server",
+    status: "online",
+    endpoints: ["/health", "/chat", "/automate", "/analyze", "/transcribe", "/market/quote", "/market/batch"]
+  });
+});
+
 // ─── /health ─────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({
