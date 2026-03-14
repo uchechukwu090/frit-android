@@ -4,6 +4,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
+import FormData from "form-data";
 
 dotenv.config();
 
@@ -84,7 +85,7 @@ app.get("/", (_req, res) => {
   res.json({
     name: "FRIT Server",
     status: "online",
-    endpoints: ["/health", "/chat", "/automate", "/analyze", "/transcribe", "/market/quote", "/market/batch"]
+    endpoints: ["/health", "/chat", "/automate", "/analyze", "/transcribe", "/market/quote", "/market/batch", "/weather", "/reminder"]
   });
 });
 
@@ -108,9 +109,13 @@ app.post("/chat", async (req, res) => {
   const model = pickModel(message, hasImage, mode);
 
   const systemPrompt = [
-    "You are FRIT — a sharp, professional AI assistant running on a custom mobile system.",
+    "You are FRIT — a sharp, professional AI assistant running on a custom Android system.",
     "Be concise but complete. Never refuse reasonable requests.",
-    memory.length ? `User memory context:\n${memory.join("\n")}` : ""
+    "You have full access to the user's phone: calls, WhatsApp, SMS, alarms, timers, music, navigation, notes, settings, and any app.",
+    "When the user says something like 'call mum', 'set alarm for 7am', 'play Afrobeats', 'navigate to Lekki', 'remind me in 10 minutes' — execute it directly via the automation system.",
+    "You also have live market data, web search, and weather.",
+    "Always respond in the user's conversational tone. Be helpful like a personal assistant, not a chatbot.",
+    memory.length ? `User context & memory:\n${memory.join("\n")}` : ""
   ].filter(Boolean).join("\n\n");
 
   const userContent = hasImage
@@ -138,65 +143,31 @@ app.post("/automate", async (req, res) => {
   if (!task) return res.status(400).json({ error: "No task provided" });
 
   const tools = [
-    {
-      type: "function",
-      function: {
-        name: "search_web",
-        description: "Search the internet for current information",
-        parameters: {
-          type: "object",
-          properties: { query: { type: "string" } },
-          required: ["query"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "open_app",
-        description: "Open an application on the user's PC (e.g. MT5, Chrome, Notepad)",
-        parameters: {
-          type: "object",
-          properties: { app_name: { type: "string" } },
-          required: ["app_name"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "get_market_data",
-        description: "Fetch live market prices for crypto or forex",
-        parameters: {
-          type: "object",
-          properties: { symbols: { type: "array", items: { type: "string" } } },
-          required: ["symbols"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "schedule_task",
-        description: "Schedule a recurring or delayed background task",
-        parameters: {
-          type: "object",
-          properties: {
-            task_description: { type: "string" },
-            delay_seconds: { type: "number" }
-          },
-          required: ["task_description"]
-        }
-      }
-    }
+    { type: "function", function: { name: "search_web", description: "Search the internet for current info, news, facts", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "open_app", description: "Open an app on Android (e.g. WhatsApp, Chrome, MT5, Instagram)", parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] } } },
+    { type: "function", function: { name: "make_call", description: "Call a contact or phone number", parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" } }, required: [] } } },
+    { type: "function", function: { name: "send_whatsapp", description: "Send a WhatsApp message to a contact", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["message"] } } },
+    { type: "function", function: { name: "send_sms", description: "Send an SMS text message", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["message"] } } },
+    { type: "function", function: { name: "get_market_data", description: "Fetch live crypto/forex prices", parameters: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } } }, required: ["symbols"] } } },
+    { type: "function", function: { name: "get_weather", description: "Get current weather for a city", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
+    { type: "function", function: { name: "set_alarm", description: "Set an alarm or reminder", parameters: { type: "object", properties: { label: { type: "string" }, time: { type: "string", description: "e.g. '7:30 AM' or 'in 30 minutes'" } }, required: ["label"] } } },
+    { type: "function", function: { name: "set_timer", description: "Start a countdown timer", parameters: { type: "object", properties: { duration: { type: "string", description: "e.g. '10 minutes', '30 seconds'" } }, required: ["duration"] } } },
+    { type: "function", function: { name: "play_music", description: "Play music on Spotify or YouTube", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "navigate_to", description: "Open Google Maps navigation to a location", parameters: { type: "object", properties: { destination: { type: "string" } }, required: ["destination"] } } },
+    { type: "function", function: { name: "schedule_task", description: "Schedule a background recurring task", parameters: { type: "object", properties: { task_description: { type: "string" }, delay_seconds: { type: "number" } }, required: ["task_description"] } } },
+    { type: "function", function: { name: "take_note", description: "Save a note or memo", parameters: { type: "object", properties: { title: { type: "string" }, content: { type: "string" } }, required: ["content"] } } },
+    { type: "function", function: { name: "open_settings", description: "Open phone settings (WiFi, Bluetooth, etc.)", parameters: { type: "object", properties: { section: { type: "string", description: "wifi, bluetooth, battery, display, sound, all" } }, required: [] } } }
   ];
 
   const messages = [
-    { role: "system", content: `You are FRIT — an agentic AI assistant. When given a task:
-1. Call ALL tools needed to fully complete it, not just the first step.
-2. If asked to open an app AND analyze something, call open_app AND get_market_data (or search_web) together.
-3. After tool calls are processed, the Android device will take a screenshot for visual analysis.
-4. Be decisive. Never call fewer tools than needed to fully resolve the task.` },
+    { role: "system", content: `You are FRIT — an agentic AI assistant with full control over the user's Android phone and PC.
+You can call, WhatsApp, SMS, set alarms/timers, play music, navigate, search, take notes, open any app, check weather, get market data, and automate background tasks.
+Rules:
+1. ALWAYS call the most appropriate tool. Never say "I can't do that" if a tool exists for it.
+2. For "call mum" → use make_call with contact_name="mum". For "WhatsApp dad" → use send_whatsapp.
+3. For "set alarm 7am" → use set_alarm. For "remind me in 20 min" → use set_timer.
+4. For "play Burna Boy" → use play_music. For "navigate to Victoria Island" → use navigate_to.
+5. Call ALL tools needed. If the task needs two tools, call both.` },
     { role: "user", content: `Task: ${task}\nContext: ${context}` }
   ];
 
@@ -219,7 +190,20 @@ app.post("/automate", async (req, res) => {
           const searchResult = await webSearch(call.args.query);
           return { tool: call.name, result: searchResult };
         }
-        // open_app / schedule_task → send back to Android to execute
+        if (call.name === "get_weather") {
+          try {
+            const city = call.args.city || "Lagos";
+            const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`);
+            const geoData = await geoRes.json();
+            const loc = geoData.results?.[0];
+            if (!loc) return { tool: call.name, result: "City not found" };
+            const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current_weather=true&timezone=auto`);
+            const wData = await wRes.json();
+            const cw = wData.current_weather;
+            return { tool: call.name, result: `${loc.name}: ${cw.temperature}°C, wind ${cw.windspeed}km/h` };
+          } catch(e) { return { tool: call.name, result: "Weather unavailable" }; }
+        }
+        // All other tools → send to Android to execute locally
         return { tool: call.name, args: call.args, action: "android_execute" };
       }));
 
@@ -282,26 +266,34 @@ app.post("/transcribe", async (req, res) => {
   if (!audio_base64) return res.status(400).json({ error: "audio_base64 required" });
 
   try {
-  const audioBuffer = Buffer.from(audio_base64, "base64");
+    const audioBuffer = Buffer.from(audio_base64, "base64");
+    if (!audioBuffer || audioBuffer.length === 0) {
+      return res.status(400).json({ error: "Empty audio buffer received" });
+    }
 
-  // Use Node 18+ built-in FormData + Blob (no external package needed)
-  const form = new FormData();
-        form.append("file", new Blob([audioBuffer], { type: "audio/wav" }), "audio.wav");
-  form.append("model", MODELS.whisper);
-  form.append("language", language);
-  form.append("response_format", "json");
+    // CRITICAL FIX: Use the `form-data` npm package (not Node built-in FormData)
+    // Node's built-in Blob+FormData causes "zero-length or detached ArrayBuffer"
+    // when used with node-fetch. The form-data package handles Buffers correctly.
+    const form = new FormData();
+    form.append("file", audioBuffer, { filename: "audio.wav", contentType: "audio/wav" });
+    form.append("model", MODELS.whisper);
+    form.append("language", language);
+    form.append("response_format", "json");
 
-  const whisperRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-          method: "POST",
-    headers: { "Authorization": `Bearer ${GROQ_API_KEY}` },
-  body: form
-  });
+    const whisperRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${GROQ_API_KEY}`,
+        ...form.getHeaders()
+      },
+      body: form
+    });
 
-  const result = await whisperRes.json();
-        if (!whisperRes.ok) throw new Error(JSON.stringify(result));
-  res.json({ text: result.text });
+    const result = await whisperRes.json();
+    if (!whisperRes.ok) throw new Error(JSON.stringify(result));
+    res.json({ text: result.text || "" });
   } catch (err) {
-  console.error("Transcription error:", err.message);
+    console.error("Transcription error:", err.message);
     res.status(500).json({ error: "Transcription failed", details: err.message });
   }
 });
@@ -361,6 +353,35 @@ async function fetchMarketPrices(symbols) {
 
   return result;
 }
+
+// ─── /weather ────────────────────────────────────────────────────────────────
+app.get("/weather", async (req, res) => {
+  const { city = "Lagos" } = req.query;
+  try {
+    const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`);
+    const geoData = await geoRes.json();
+    const loc = geoData.results?.[0];
+    if (!loc) return res.status(404).json({ error: "City not found" });
+    const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current_weather=true&hourly=precipitation_probability&timezone=auto`);
+    const wData = await wRes.json();
+    const cw = wData.current_weather;
+    const rain = wData.hourly?.precipitation_probability?.[0] ?? 0;
+    res.json({
+      city: loc.name, country: loc.country,
+      temp_c: cw.temperature, wind_kmh: cw.windspeed,
+      condition: cw.weathercode <= 1 ? "Clear" : cw.weathercode <= 3 ? "Cloudy" : cw.weathercode <= 67 ? "Rainy" : "Stormy",
+      rain_chance: rain + "%"
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── /reminder  ──────────────────────────────────────────────────────────────
+// Server-side: just acknowledges. Actual alarm is set on Android via AutomationEngine.
+app.post("/reminder", (req, res) => {
+  const { text, delay_seconds } = req.body || {};
+  if (!text) return res.status(400).json({ error: "text required" });
+  res.json({ scheduled: true, task: text, in_seconds: delay_seconds || 0 });
+});
 
 // ─── WEB SEARCH HELPER ───────────────────────────────────────────────────────
 async function webSearch(query) {
