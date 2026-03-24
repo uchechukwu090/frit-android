@@ -418,78 +418,82 @@ app.post("/chat", async (req, res) => {
 });
 
 // ── /automate: llama-3.3-70b + AGENT_TOOLS (custom tool calling) ──
+
 app.post("/automate", async (req, res) => {
-  const { task, context="", screen_text="" } = req.body||{};
+  const { task, context="", screen_text="", steps_done="" } = req.body||{};
   if (!task) return res.status(400).json({ error:"No task provided" });
-
-  const systemPrompt = `You are FRIT agentic engine. Complete tasks end-to-end on Android.
-Rules:
-1. Chain tools until fully done. Never stop after one step.
-2. After open_app always call read_screen.
-3. analyze_market works for ALL symbols including BTCUSD, ETHUSD, EURUSD, XAUUSD.
-4. For trading: analyze_market first (unless user says force), place_trade if STRONG or MODERATE signal.
-5. For news/sentiment: search_web first.
-6. Current screen: ${screen_text||"Unknown"}
-7. Context: ${context||"Forex/crypto trader Lagos Nigeria. Pairs: EURUSD GBPUSD XAUUSD BTCUSD."}`;
-
-  const messages = [{role:"system",content:systemPrompt},{role:"user",content:`Task: ${task}`}];
+  const spLines = [
+    "You are FRIT, an AI that controls an Android phone step by step",
+    "You receive: the task, what is on screen NOW, and steps done so far",
+    "Decide ONLY the NEXT action - do not plan the whole sequence upfront",
+    "",
+    "RULES",
+    "1 Read current screen content before deciding what to do next",
+    "2 If screen is empty or wrong app - call open_app first",
+    "3 After open_app Android waits 3 seconds and reads screen - you see result next call",
+    "4 WhatsApp: open_app then tap_button(person name) then type_text(message) then tap_button(Send)",
+    "5 MT5: analyze_market then place_trade if signal strong or moderate or user said force",
+    "6 Reading messages: screen_text IS the live screen - read and summarise it",
+    "7 When task complete set done true and explain in summary",
+    "8 Never repeat actions already in steps_done",
+    "9 All symbols supported BTCUSD ETHUSD EURUSD GBPUSD XAUUSD",
+    "10 Website: open_app(chrome) then tap address bar then type url then fill in login fields",
+    "",
+    "Current screen: " + (screen_text || "Not available - enable accessibility service"),
+    "Steps done: " + (steps_done || "None - first step"),
+    "Context: " + (context || "Forex/crypto trader Lagos Nigeria")
+  ];
+  const sp = spLines.join("\n");
+  const messages = [{role:"system",content:sp},{role:"user",content:"Task: "+task}];
   const allActions = [];
-  let finalText = "";
-
-  for (let i=0; i<8; i++) {
+  let finalText = "", isDone = false;
+  for (let i=0; i<4; i++) {
     let result;
-    try { result = await groqChat({model:MODELS.tools,messages,tools:AGENT_TOOLS,max_tokens:1200}); }
+    try { result = await groqChat({model:MODELS.tools,messages,tools:AGENT_TOOLS,max_tokens:900}); }
     catch(err) { return res.status(500).json({error:"AI failed",details:err.message}); }
-
     const choice = result.choices[0];
     if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls?.length) {
-      finalText = choice.message.content||""; break;
+      finalText = choice.message.content||"";
+      isDone = /done|complete|finish|sent|placed|opened|navigating/i.test(finalText);
+      break;
     }
     messages.push({role:"assistant",content:choice.message.content||null,tool_calls:choice.message.tool_calls});
-
     const toolResults = [];
     for (const tc of choice.message.tool_calls) {
       const name = tc.function.name;
       let args = {}; try { args = JSON.parse(tc.function.arguments); } catch {}
       let toolResult = "";
-
       if (name==="analyze_market") {
         const sym = (args.symbol||"").toUpperCase();
-        const interval = args.interval||"1h";
-        const analysis = await analyzeSymbol(sym, interval, args.outputsize||null);
+        const analysis = await analyzeSymbol(sym, args.interval||"1h", args.outputsize||null);
         if (!analysis.error) {
-          const aiRes = await groqChat({model:MODELS.fast, max_tokens:600, temperature:0.3,
-            messages:[{role:"user",content:`You are a professional trader analyst.\nSymbol: ${sym} | Interval: ${interval} | Candles: ${analysis.candleCount}\nIndicators: RSI:${analysis.rsi} MACD:${analysis.macd_signal} EMA20:${analysis.ema20} EMA50:${analysis.ema50} EMA200:${analysis.ema200} BB_U:${analysis.bb_upper} BB_L:${analysis.bb_lower}\nS:${analysis.support} R:${analysis.resistance}\nDirection:${analysis.direction}(${analysis.strength})\nLast 20 candles: ${analysis.recent_candles}\nGive: direction, confidence%, entry price, stop loss, take profit. Be specific with exact numbers.`}]});
-          analysis.ai_opinion = aiRes.choices[0].message.content;
+          const aR = await groqChat({model:MODELS.fast,max_tokens:600,temperature:0.3,
+            messages:[{role:"user",content:"Analyst "+sym+" RSI "+analysis.rsi+" Dir "+analysis.direction+" "+analysis.strength+" S "+analysis.support+" R "+analysis.resistance+" Candles "+analysis.recent_candles+" Give direction confidence entry SL TP exact"}]});
+          analysis.ai_opinion = aR.choices[0].message.content;
         }
         toolResult = JSON.stringify(analysis);
-        allActions.push({tool:name, result:analysis, server_side:true});
-
+        allActions.push({tool:name,result:analysis,server_side:true});
       } else if (name==="get_market_data") {
         const sym = (args.symbol||"").toUpperCase();
         const data = await fetchMarketPrices([sym]);
         toolResult = JSON.stringify(data[sym]);
-        allActions.push({tool:name, result:data[sym], server_side:true});
-
+        allActions.push({tool:name,result:data[sym],server_side:true});
       } else if (name==="search_web") {
         toolResult = await webSearch(args.query);
-        allActions.push({tool:name, result:toolResult, server_side:true});
-
+        allActions.push({tool:name,result:toolResult,server_side:true});
       } else if (name==="get_weather") {
         toolResult = await getWeather(args.city);
-        allActions.push({tool:name, result:toolResult, server_side:true});
-
+        allActions.push({tool:name,result:toolResult,server_side:true});
       } else {
-        toolResult = `Queued for Android: ${name}`;
-        allActions.push({tool:name, args, action:"android_execute"});
+        toolResult = "Queued for Android: "+name;
+        allActions.push({tool:name,args,action:"android_execute"});
       }
-      toolResults.push({role:"tool", tool_call_id:tc.id, content:toolResult});
+      toolResults.push({role:"tool",tool_call_id:tc.id,content:toolResult});
     }
     messages.push(...toolResults);
   }
-  res.json({type:"tool_result", actions:allActions, summary:finalText, model_used:MODELS.tools});
+  res.json({type:"tool_result",actions:allActions,summary:finalText,done:isDone,model_used:MODELS.tools});
 });
-
 // ── /market/analyze ───────────────────────────────────────────────
 app.post("/market/analyze", async (req, res) => {
   const { symbol, interval="1h", user_context="", outputsize=null } = req.body||{};
