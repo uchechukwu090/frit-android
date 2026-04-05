@@ -13,16 +13,32 @@ const PORT = Number(process.env.PORT || 8787);
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
-const SANDBOX_URL = process.env.SANDBOX_URL || "http://127.0.0.1:8790";
+const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-production-839a.up.railway.app";
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
+const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || ""; // empty = paper mode
 
 if (!GROQ_API_KEY) {
   console.error("GROQ_API_KEY missing");
   process.exit(1);
 }
+if (!AUTH_TOKEN) {
+  console.warn("[WARN] AUTH_TOKEN not set — sandbox endpoint is unprotected!");
+}
+
+// Middleware: protect sensitive endpoints with Bearer token
+function requireAuth(req, res, next) {
+  if (!AUTH_TOKEN) return next(); // skip if not configured (warns above)
+  const header = req.headers["authorization"] || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (token !== AUTH_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
 
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ limit: "2mb", extended: true }));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
@@ -42,6 +58,15 @@ const MODELS = {
    CACHE
 ────────────────────────────────────────────────────────────── */
 const _cache = new Map();
+const pendingActions = new Map(); // Tracks Android tool execution status
+
+// Periodic cache cleanup — prevents memory leaks on long-running server
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of _cache.entries()) {
+    if (now > entry.exp) _cache.delete(key);
+  }
+}, 1000 * 60 * 60); // every hour
 
 function cacheGet(key) {
   const entry = _cache.get(key);
@@ -355,6 +380,21 @@ const FRANKFURTER_MAP = {
   GBPJPY: { base: "GBP", quote: "JPY" },
 };
 
+/* ──────────────────────────────────────────────────────────────
+   DATA NORMALIZATION LAYER
+────────────────────────────────────────────────────────────── */
+function normalizeCandles(data, source = "twelve_data") {
+  if (!Array.isArray(data)) return [];
+  return data.map((c) => ({
+    time: source === "twelve_data" ? new Date(c.datetime).getTime() : c[0],
+    open: parseFloat(source === "twelve_data" ? c.open : c[1]),
+    high: parseFloat(source === "twelve_data" ? c.high : c[2]),
+    low: parseFloat(source === "twelve_data" ? c.low : c[3]),
+    close: parseFloat(source === "twelve_data" ? c.close : c[4]),
+    volume: parseFloat(source === "twelve_data" ? (c.volume || 0) : (c[5] || 0)),
+  })).filter((c) => !isNaN(c.close) && !isNaN(c.open) && c.high >= c.low);
+}
+
 async function fetchCandles(symbol, interval = "1h", outputsize = null) {
   const sym = String(symbol || "").toUpperCase();
   const iv = normalizeInterval(interval);
@@ -374,16 +414,9 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
       const data = await res.json();
 
       if (data.status !== "error" && data.values?.length >= 10) {
-        const candles = data.values.reverse().map((v) => ({
-          time: new Date(v.datetime).getTime(),
-          open: parseFloat(v.open),
-          high: parseFloat(v.high),
-          low: parseFloat(v.low),
-          close: parseFloat(v.close),
-          volume: parseFloat(v.volume || 0),
-        }));
-        cacheSet(ck, candles, 60000);
-        return candles;
+          const candles = normalizeCandles(data.values.reverse(), "twelve_data");
+          cacheSet(ck, candles, 60000);
+          return candles;
       } else {
         console.error("[TwelveData candles]", sym, data?.message || "Unknown error");
       }
@@ -402,16 +435,9 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
       const arr = await res.json();
 
       if (Array.isArray(arr) && arr.length >= 10) {
-        const candles = arr.map((k) => ({
-          time: k[0],
-          open: parseFloat(k[1]),
-          high: parseFloat(k[2]),
-          low: parseFloat(k[3]),
-          close: parseFloat(k[4]),
-          volume: parseFloat(k[5]),
-        }));
-        cacheSet(ck, candles, 60000);
-        return candles;
+          const candles = normalizeCandles(arr, "binance");
+          cacheSet(ck, candles, 60000);
+          return candles;
       }
     } catch (e) {
       console.error("[Binance candles]", sym, e.message);
@@ -593,11 +619,26 @@ function calcMACD(closes) {
 }
 
 function calcSR(candles) {
-  const r = candles.slice(-20);
-  return {
-    support: Math.min(...r.map((c) => c.low)),
-    resistance: Math.max(...r.map((c) => c.high)),
-  };
+  // Use swing highs/lows from last 50 candles instead of simple min/max of 20
+  const window = candles.slice(-50);
+  const swings = findSwings(window, 3);
+
+  const recentHighs = swings.highs.map((s) => s.price);
+  const recentLows = swings.lows.map((s) => s.price);
+
+  const currentPrice = candles.at(-1)?.close ?? 0;
+
+  // Support = highest swing low BELOW current price
+  const support =
+    recentLows.filter((p) => p < currentPrice).sort((a, b) => b - a)[0] ??
+    Math.min(...window.map((c) => c.low));
+
+  // Resistance = lowest swing high ABOVE current price
+  const resistance =
+    recentHighs.filter((p) => p > currentPrice).sort((a, b) => a - b)[0] ??
+    Math.max(...window.map((c) => c.high));
+
+  return { support, resistance };
 }
 
 function calcBB(closes, period = 20, mult = 2) {
@@ -627,6 +668,104 @@ function calcATR(candles, period = 14) {
   }
   const recent = trs.slice(-period);
   return recent.reduce((a, b) => a + b, 0) / recent.length;
+}
+
+/* ── AUCTION / VOLUME PROFILE (derived from OHLCV) ── */
+function calcAuction(candles, buckets = 40) {
+  if (!candles || candles.length < 10) return null;
+
+  const window = candles.slice(-100);
+
+  // Detect if volume data is meaningful or all zeros (common in forex free tier)
+  const totalRawVol = window.reduce((s, c) => s + (c.volume || 0), 0);
+  const hasRealVolume = totalRawVol > window.length * 2; // avg > 2 per candle
+
+  const hi = Math.max(...window.map((c) => c.high));
+  const lo = Math.min(...window.map((c) => c.low));
+  if (hi === lo) return null;
+
+  const bucketSize = (hi - lo) / buckets;
+  const vap = new Array(buckets).fill(0);
+
+  for (const c of window) {
+    // If no real volume, use candle range * body size as proxy (tick volume estimate)
+    const rangeProxy = (c.high - c.low) || bucketSize;
+    const bodySize = Math.abs(c.close - c.open) || rangeProxy * 0.3;
+    const vol = hasRealVolume
+      ? (c.volume > 0 ? c.volume : rangeProxy)
+      : rangeProxy * (1 + bodySize / rangeProxy);
+
+    const candleRange = c.high - c.low || bucketSize;
+    for (let b = 0; b < buckets; b++) {
+      const bLo = lo + b * bucketSize;
+      const bHi = bLo + bucketSize;
+      const overlap = Math.max(0, Math.min(c.high, bHi) - Math.max(c.low, bLo));
+      vap[b] += vol * (overlap / candleRange);
+    }
+  }
+
+  const pocIdx = vap.indexOf(Math.max(...vap));
+  const poc = lo + (pocIdx + 0.5) * bucketSize;
+
+  const totalVol = vap.reduce((a, b) => a + b, 0);
+  const target = totalVol * 0.7;
+
+  let lo_idx = pocIdx;
+  let hi_idx = pocIdx;
+  let accumulated = vap[pocIdx];
+
+  while (accumulated < target) {
+    const addLo = lo_idx > 0 ? vap[lo_idx - 1] : 0;
+    const addHi = hi_idx < buckets - 1 ? vap[hi_idx + 1] : 0;
+    if (addLo === 0 && addHi === 0) break;
+    if (addHi >= addLo) { hi_idx++; accumulated += addHi; }
+    else { lo_idx--; accumulated += addLo; }
+  }
+
+  const vah = lo + (hi_idx + 1) * bucketSize;
+  const val = lo + lo_idx * bucketSize;
+
+  const sorted = vap
+    .map((v, i) => ({ v, price: lo + (i + 0.5) * bucketSize }))
+    .sort((a, b) => b.v - a.v);
+  const hvn = sorted.slice(0, 3).map((x) => x.price);
+  const lvn = sorted.slice(-5).map((x) => x.price);
+
+  return { poc, vah, val, hvn, lvn, range_hi: hi, range_lo: lo, volume_mode: hasRealVolume ? "real" : "proxy" };
+}
+
+function auctionSignal(price, auction) {
+  if (!auction) return { position: "unknown", bias: "neutral", note: "" };
+
+  const { poc, vah, val } = auction;
+
+  if (price > vah) {
+    return {
+      position: "above_value",
+      bias: "bullish",
+      note: "Price above Value Area — buyers in control, trend continuation likely.",
+    };
+  }
+  if (price < val) {
+    return {
+      position: "below_value",
+      bias: "bearish",
+      note: "Price below Value Area — sellers in control, trend continuation likely.",
+    };
+  }
+  // Inside value area
+  if (price > poc) {
+    return {
+      position: "inside_value_upper",
+      bias: "mild_bullish",
+      note: "Price inside Value Area above POC — mean reversion risk, wait for VAH break.",
+    };
+  }
+  return {
+    position: "inside_value_lower",
+    bias: "mild_bearish",
+    note: "Price inside Value Area below POC — mean reversion risk, watch VAL for support.",
+  };
 }
 
 function findSwings(candles, lookback = 2) {
@@ -720,7 +859,7 @@ function analyzeVolatility(candles, price) {
   };
 }
 
-function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, support, resistance, patterns }) {
+function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, support, resistance, patterns, auctionSig, auction, mtf }) {
   let bull = 0;
   let bear = 0;
 
@@ -742,12 +881,35 @@ function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, su
   if (price > support && (price - support) / (price || 1) < 0.003) bull += 1;
   if (price < resistance && (resistance - price) / (price || 1) < 0.003) bear += 1;
 
-  if (patterns.includes("bullish_engulfing") || patterns.includes("pinbar_bullish")) bull += 1;
-  if (patterns.includes("bearish_engulfing") || patterns.includes("pinbar_bearish")) bear += 1;
+  // ── Auction bias (2 pts strong, 1 pt mild) ──
+  if (auctionSig) {
+    if (auctionSig.bias === "bullish") bull += 2;
+    else if (auctionSig.bias === "bearish") bear += 2;
+    else if (auctionSig.bias === "mild_bullish") bull += 1;
+    else if (auctionSig.bias === "mild_bearish") bear += 1;
+  }
 
-  if (volatility.regime === "compressed") {
-    bull -= 0.5;
-    bear -= 0.5;
+  // ── Patterns only score near key levels (ATR proximity) ──
+  const atr = volatility.atr || 1;
+  const keyLevels = [support, resistance];
+  if (auction) keyLevels.push(auction.poc, auction.vah, auction.val);
+  const isNearLevel = (p) => keyLevels.some((lvl) => lvl && Math.abs(p - lvl) <= atr * 0.5);
+  const priceNearLevel = isNearLevel(price);
+
+  if (priceNearLevel) {
+    if (patterns.includes("bullish_engulfing") || patterns.includes("pinbar_bullish")) bull += 2;
+    if (patterns.includes("bearish_engulfing") || patterns.includes("pinbar_bearish")) bear += 2;
+  }
+  if (priceNearLevel && patterns.includes("indecision")) { bull -= 0.5; bear -= 0.5; }
+
+  if (volatility.regime === "compressed") { bull -= 0.5; bear -= 0.5; }
+
+  // ── MTF Filter — 4H trend alignment ──
+  let mtfNote = "4H data unavailable";
+  if (mtf) {
+    if (mtf.trend === "up")   { bull += 2; bear -= 2; mtfNote = "4H trend UP — favors longs only"; }
+    else if (mtf.trend === "down") { bear += 2; bull -= 2; mtfNote = "4H trend DOWN — favors shorts only"; }
+    else mtfNote = "4H trend neutral — both directions open";
   }
 
   let bias = "neutral";
@@ -758,7 +920,7 @@ function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, su
   let confidence = 50 + diff * 8;
   confidence = Math.max(5, Math.min(95, Math.round(confidence)));
 
-  return { bull_score: bull, bear_score: bear, bias, confidence };
+  return { bull_score: bull, bear_score: bear, bias, confidence, mtf_note: mtfNote };
 }
 
 function buildTradePlan({ bias, price, support, resistance, atr, dp }) {
@@ -811,6 +973,100 @@ function buildTradePlan({ bias, price, support, resistance, atr, dp }) {
   };
 }
 
+/* ──────────────────────────────────────────────────────────────
+   NEWS FILTER — "Volatility Shield"
+   Uses ForexFactory-style schedule logic. No API key needed.
+   Covers currencies affected by each symbol.
+────────────────────────────────────────────────────────────── */
+const SYMBOL_CURRENCIES = {
+  EURUSD: ["EUR", "USD"], GBPUSD: ["GBP", "USD"], USDJPY: ["USD", "JPY"],
+  AUDUSD: ["AUD", "USD"], USDCHF: ["USD", "CHF"], USDCAD: ["USD", "CAD"],
+  NZDUSD: ["NZD", "USD"], GBPJPY: ["GBP", "JPY"], EURJPY: ["EUR", "JPY"],
+  EURGBP: ["EUR", "GBP"], XAUUSD: ["USD"], XAGUSD: ["USD"],
+  BTCUSD: ["USD"], ETHUSD: ["USD"], SOLUSD: ["USD"],
+  BNBUSD: ["USD"], XRPUSD: ["USD"], DOGEUSD: ["USD"], ADAUSD: ["USD"],
+};
+
+// Fetch high-impact events from free FF calendar API
+async function fetchHighImpactEvents() {
+  const ck = "news_events";
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  try {
+    const res = await fetch("https://nfs.faireconomy.media/ff_calendar_thisweek.json");
+    if (!res.ok) return [];
+    const data = await res.json();
+    // Keep only high-impact events
+    const high = data.filter((e) => e.impact === "High").map((e) => ({
+      currency: e.currency,
+      title: e.title,
+      time: new Date(e.date).getTime(),
+    }));
+    cacheSet(ck, high, 1000 * 60 * 60); // cache 1 hour
+    return high;
+  } catch (err) {
+    console.warn("[NewsFilter] Could not fetch calendar:", err.message);
+    return [];
+  }
+}
+
+async function checkNewsFilter(symbol) {
+  const sym = String(symbol || "").toUpperCase();
+  const currencies = SYMBOL_CURRENCIES[sym] || ["USD"];
+  const events = await fetchHighImpactEvents();
+  const now = Date.now();
+  const window = 30 * 60 * 1000; // 30 min before/after
+
+  const nearby = events.filter((e) =>
+    currencies.includes(e.currency) &&
+    Math.abs(e.time - now) <= window
+  );
+
+  if (nearby.length > 0) {
+    return {
+      blocked: true,
+      reason: `High-impact news within 30 min: ${nearby.map((e) => `${e.currency} ${e.title}`).join(", ")}`,
+      events: nearby,
+    };
+  }
+  return { blocked: false };
+}
+
+/* ──────────────────────────────────────────────────────────────
+   MULTI-TIMEFRAME CONFIRMATION
+   Fetches 4H trend to filter 1H signals.
+   Rule: 1H Buy only allowed if 4H trend is up or neutral.
+         1H Sell only allowed if 4H trend is down or neutral.
+────────────────────────────────────────────────────────────── */
+async function getMTFBias(symbol) {
+  const sym = String(symbol || "").toUpperCase();
+  const ck = `mtf:${sym}`;
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  try {
+    const candles4h = await fetchCandles(sym, "4h", 100);
+    if (!candles4h || candles4h.length < 50) return { trend: "neutral", ema200: null };
+
+    const closes = candles4h.map((c) => c.close);
+    const price = closes.at(-1);
+    const ema50 = calcEMA(closes, 50).at(-1) ?? price;
+    const ema200 = calcEMA(closes, 200).at(-1) ?? price;
+
+    let trend = "neutral";
+    if (price > ema50 && ema50 > ema200) trend = "up";
+    else if (price < ema50 && ema50 < ema200) trend = "down";
+
+    const result = { trend, ema50: +ema50.toFixed(5), ema200: +ema200.toFixed(5), price };
+    cacheSet(ck, result, 1000 * 60 * 15); // cache 15 min — 4H changes slowly
+    return result;
+  } catch (err) {
+    console.warn("[MTF]", err.message);
+    return { trend: "neutral", ema200: null };
+  }
+}
+
 async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const sym = String(symbol || "").toUpperCase();
   const iv = normalizeInterval(interval);
@@ -819,10 +1075,27 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const cached = cacheGet(ck);
   if (cached) return cached;
 
-  const [candles, spot] = await Promise.all([
+  const [candles, spot, newsCheck, mtf] = await Promise.all([
     fetchCandles(sym, iv, customSize),
     fetchSpotPrice(sym),
+    checkNewsFilter(sym),
+    getMTFBias(sym),
   ]);
+
+  // News blackout — return neutral immediately, no signal
+  if (newsCheck.blocked) {
+    return {
+      symbol: sym,
+      direction: "NEUTRAL",
+      strength: "NEWS_BLACKOUT",
+      interval: iv,
+      news_filter: newsCheck,
+      trade_plan: { entry_zone: null, invalidation: null, tp1: null, tp2: null, risk_state: "no_trade" },
+      concise_signal: { direction: "STAND DOWN", entry: "N/A", sl: "N/A", tp: "N/A", ai_opinion: `News blackout active. ${newsCheck.reason}` },
+      ai_opinion: `STAND DOWN — ${newsCheck.reason}`,
+      summary: `${sym} | STAND DOWN — ${newsCheck.reason}`,
+    };
+  }
 
   if (!candles && !spot) {
     return { symbol: sym, error: `No data for ${sym}` };
@@ -847,6 +1120,8 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const structure = analyzeStructure(candles, price);
   const volatility = analyzeVolatility(candles, price);
   const patterns = detectCandlePattern(candles);
+  const auction = calcAuction(candles);
+  const auctionSig = auctionSignal(price, auction);
   const score = scoreSetup({
     structure,
     volatility,
@@ -858,6 +1133,9 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
     support,
     resistance,
     patterns,
+    auctionSig,
+    auction,
+    mtf,
   });
 
   let direction = "NEUTRAL";
@@ -887,10 +1165,11 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
     dp,
   });
 
+  const auctionNote = auctionSig.note ? ` Auction: ${auctionSig.note}` : "";
   const aiOpinion =
     direction === "NEUTRAL"
-      ? "No clear edge right now. Better to wait for cleaner structure or stronger confirmation."
-      : `${direction} bias with ${strength.toLowerCase()} confidence. Structure=${structure.trend}, volatility=${volatility.regime}, patterns=${patterns.join(", ") || "none"}.`;
+      ? `No clear edge right now. Better to wait for cleaner structure or stronger confirmation.${auctionNote}`
+      : `${direction} bias with ${strength.toLowerCase()} confidence. Structure=${structure.trend}, volatility=${volatility.regime}, patterns=${patterns.join(", ") || "none"}.${auctionNote}`;
 
   const concise_signal = {
     direction,
@@ -939,11 +1218,23 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
     patterns,
     trade_plan,
     concise_signal,
+    auction: auction
+      ? {
+          poc: +auction.poc.toFixed(dp),
+          vah: +auction.vah.toFixed(dp),
+          val: +auction.val.toFixed(dp),
+          position: auctionSig.position,
+          bias: auctionSig.bias,
+          note: auctionSig.note,
+          hvn: auction.hvn.map((p) => +p.toFixed(dp)),
+          lvn: auction.lvn.map((p) => +p.toFixed(dp)),
+        }
+      : null,
+    mtf: { trend: mtf?.trend || "unknown", note: score.mtf_note },
+    news_filter: { blocked: false },
     recent_candles: recentCandles,
     ai_opinion: aiOpinion,
-    summary: `${sym} @${price.toFixed(dp)} | ${direction}(${strength}) | Confidence:${score.confidence} | Trend:${structure.trend} | RSI:${rsi.toFixed(
-      1
-    )} | S:${support.toFixed(dp)} R:${resistance.toFixed(dp)} [${candles.length} candles ${iv}]`,
+    summary: `${sym} @${price.toFixed(dp)} | ${direction}(${strength}) | Conf:${score.confidence} | Trend:${structure.trend}(4H:${mtf?.trend || "?"}) | RSI:${rsi.toFixed(1)} | S:${support.toFixed(dp)} R:${resistance.toFixed(dp)}${auction ? ` | POC:${auction.poc.toFixed(dp)} VAH:${auction.vah.toFixed(dp)} VAL:${auction.val.toFixed(dp)} [${auctionSig.position}]` : ""} [${candles.length} candles ${iv}]`,
   };
 
   cacheSet(ck, result, 60000);
@@ -1505,6 +1796,177 @@ function buildAutomationSystemPrompt({ deviceState, memory }) {
 }
 
 /* ──────────────────────────────────────────────────────────────
+   LIGHTWEIGHT TRADE MEMORY (RAG alternative — no vector DB needed)
+────────────────────────────────────────────────────────────── */
+const tradeMemory = new Map(); // symbol -> array of memory entries
+
+function addTradeMemory(symbol, entry) {
+  const sym = String(symbol || "").toUpperCase();
+  if (!tradeMemory.has(sym)) tradeMemory.set(sym, []);
+  const entries = tradeMemory.get(sym);
+  entries.push({ ...entry, timestamp: Date.now() });
+  // Keep last 20 per symbol
+  if (entries.length > 20) entries.splice(0, entries.length - 20);
+}
+
+function getTradeMemory(symbol, limit = 5) {
+  const sym = String(symbol || "").toUpperCase();
+  const entries = tradeMemory.get(sym) || [];
+  return entries.slice(-limit);
+}
+
+function formatTradeMemoryForPrompt(symbol) {
+  const entries = getTradeMemory(symbol, 5);
+  if (!entries.length) return "";
+  const lines = entries.map((e) => {
+    const d = new Date(e.timestamp).toISOString().slice(0, 10);
+    return `[${d}] ${e.outcome || "?"} | Pattern:${e.pattern || "none"} | Direction:${e.direction || "?"} | Note:${e.note || ""}`;
+  });
+  return `\nPast trade memory for ${symbol}:\n${lines.join("\n")}`;
+}
+
+app.post("/memory/trade", requireAuth, (req, res) => {
+  const { symbol, outcome, pattern, direction, note } = req.body || {};
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  addTradeMemory(symbol, { outcome, pattern, direction, note });
+  res.json({ ok: true, memory_count: tradeMemory.get(symbol.toUpperCase())?.length });
+});
+
+app.get("/memory/trade", requireAuth, (req, res) => {
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  res.json({ symbol, entries: getTradeMemory(symbol) });
+});
+
+/* ──────────────────────────────────────────────────────────────
+   LOT SIZE ENGINE (instrument-aware, server-side math only)
+────────────────────────────────────────────────────────────── */
+const PIP_CONFIG = {
+  // Standard forex 4-digit pairs — pip = 0.0001, pipValue ~$10 per std lot
+  EURUSD: { pipSize: 0.0001, pipValue: 10 },
+  GBPUSD: { pipSize: 0.0001, pipValue: 10 },
+  AUDUSD: { pipSize: 0.0001, pipValue: 10 },
+  NZDUSD: { pipSize: 0.0001, pipValue: 10 },
+  USDCHF: { pipSize: 0.0001, pipValue: 10 },
+  USDCAD: { pipSize: 0.0001, pipValue: 10 },
+  EURGBP: { pipSize: 0.0001, pipValue: 10 },
+  // JPY pairs — pip = 0.01, pipValue ~$9.30 per std lot
+  USDJPY: { pipSize: 0.01, pipValue: 9.3 },
+  GBPJPY: { pipSize: 0.01, pipValue: 9.3 },
+  EURJPY: { pipSize: 0.01, pipValue: 9.3 },
+  // Gold — pip = 0.01 (cent), $1 move = $100 per std lot
+  XAUUSD: { pipSize: 0.01, pipValue: 100 },
+  XAGUSD: { pipSize: 0.001, pipValue: 50 },
+  // Crypto — no pip concept, use price-based % risk
+  BTCUSD:  { pipSize: 1, pipValue: 1, isCrypto: true },
+  ETHUSD:  { pipSize: 0.1, pipValue: 1, isCrypto: true },
+  SOLUSD:  { pipSize: 0.01, pipValue: 1, isCrypto: true },
+  BNBUSD:  { pipSize: 0.01, pipValue: 1, isCrypto: true },
+  XRPUSD:  { pipSize: 0.0001, pipValue: 1, isCrypto: true },
+  DOGEUSD: { pipSize: 0.00001, pipValue: 1, isCrypto: true },
+  ADAUSD:  { pipSize: 0.00001, pipValue: 1, isCrypto: true },
+};
+
+function calculateLotSize({
+  symbol,
+  balance,
+  riskPercent = 1,
+  entry,
+  stopLoss,
+  accountCurrency = "USD",
+}) {
+  const sym = String(symbol || "").toUpperCase();
+  const cfg = PIP_CONFIG[sym];
+
+  // Hard safety caps — AI can never override these
+  const MAX_RISK_PERCENT = 2;
+  const MAX_LOT = 5;
+  const MIN_LOT = 0.01;
+
+  const safeRisk = Math.min(riskPercent, MAX_RISK_PERCENT);
+  const riskAmount = (balance || 1000) * (safeRisk / 100);
+
+  if (!entry || !stopLoss || entry === stopLoss) return MIN_LOT;
+
+  if (!cfg) {
+    // Unknown instrument — use conservative 0.01
+    console.warn(`[LotSize] Unknown symbol ${sym}, defaulting to 0.01`);
+    return MIN_LOT;
+  }
+
+  let lotSize;
+
+  if (cfg.isCrypto) {
+    // Crypto: risk / (price distance in USD)
+    const priceDist = Math.abs(entry - stopLoss);
+    if (priceDist === 0) return MIN_LOT;
+    lotSize = riskAmount / priceDist;
+  } else {
+    // Forex/Gold: risk / (stop pips * pip value)
+    const stopPips = Math.abs(entry - stopLoss) / cfg.pipSize;
+    if (stopPips === 0) return MIN_LOT;
+    lotSize = riskAmount / (stopPips * cfg.pipValue);
+  }
+
+  // Round to 2 decimal places, clamp between min and max
+  lotSize = Math.max(MIN_LOT, Math.min(MAX_LOT, Math.round(lotSize * 100) / 100));
+  return lotSize;
+}
+
+/* ──────────────────────────────────────────────────────────────
+   MT5 BRIDGE CALLER
+   Empty MT5_BRIDGE_URL = paper mode (logs only, no real trade)
+────────────────────────────────────────────────────────────── */
+async function sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason = "" }) {
+  if (!MT5_BRIDGE_URL) {
+    // Paper mode — log and return simulated result
+    console.log(`[PAPER TRADE] ${action.toUpperCase()} ${symbol} | Lot:${lotSize} | Entry:${entry} | SL:${sl} | TP:${tp} | Reason: ${reason}`);
+    return {
+      mode: "paper",
+      symbol, action, lotSize, entry, sl, tp,
+      status: "simulated",
+      message: "MT5_BRIDGE_URL not set — paper mode active",
+    };
+  }
+
+  try {
+    const res = await fetch(`${MT5_BRIDGE_URL}/place_trade`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${AUTH_TOKEN}`,
+      },
+      body: JSON.stringify({ symbol, action, lotSize, entry, sl, tp, reason }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || "MT5 bridge error");
+    return { mode: "live", ...data };
+  } catch (err) {
+    console.error("[MT5 Bridge]", err.message);
+    return { mode: "live", status: "failed", error: err.message };
+  }
+}
+
+/* ──────────────────────────────────────────────────────────────
+   AUTOMATION CALLBACK ENDPOINT
+   Android app calls this after executing a tool to report back result.
+   The /automate route waits on a Promise resolved by this endpoint.
+────────────────────────────────────────────────────────────── */
+app.post("/automation-results", requireAuth, (req, res) => {
+  const { callId, status, observation } = req.body || {};
+  if (!callId) return res.status(400).json({ error: "callId required" });
+
+  if (pendingActions.has(callId)) {
+    const action = pendingActions.get(callId);
+    action.resolve({ status: status || "ok", observation: observation || "" });
+    pendingActions.delete(callId);
+    return res.json({ success: true });
+  }
+
+  res.status(404).json({ error: "callId not found or already resolved" });
+});
+
+/* ──────────────────────────────────────────────────────────────
    ROUTES
 ────────────────────────────────────────────────────────────── */
 app.get("/", (_req, res) => {
@@ -1518,9 +1980,12 @@ app.get("/", (_req, res) => {
       "/chat",
       "/plan",
       "/automate",
+      "/automation-results",
+      "/trade",
       "/market/analyze",
       "/market/batch",
       "/market/quote",
+      "/memory/trade",
       "/transcribe",
       "/weather",
     ],
@@ -1540,7 +2005,7 @@ app.get("/health", (_req, res) => {
 /* ──────────────────────────────────────────────────────────────
    CHAT
 ────────────────────────────────────────────────────────────── */
-app.post("/chat", async (req, res) => {
+app.post("/chat", requireAuth, async (req, res) => {
   const { message, history = [], memory = [], screen_context, mode = "auto" } = req.body || {};
 
   if (!message) {
@@ -1589,11 +2054,15 @@ app.post("/chat", async (req, res) => {
       const a = await analyzeSymbol(sym, iv, sz);
 
       if (!a.error) {
+        const auctionLine = a.auction
+          ? `Auction: POC=${a.auction.poc} VAH=${a.auction.vah} VAL=${a.auction.val} | Position=${a.auction.position} | ${a.auction.note}`
+          : "";
         liveData = [
           "",
           "=== LIVE MARKET DATA (fetched now) ===",
           a.summary,
           `Concise Signal: ${a.concise_signal?.direction || a.direction} | Entry ${a.concise_signal?.entry || "N/A"} | SL ${a.concise_signal?.sl || "N/A"} | TP ${a.concise_signal?.tp || "N/A"}`,
+          auctionLine,
           `AI Opinion: ${a.concise_signal?.ai_opinion || a.ai_opinion || ""}`,
           "",
           "IMPORTANT:",
@@ -1603,9 +2072,9 @@ app.post("/chat", async (req, res) => {
           "- SL",
           "- TP",
           "- AI opinion",
-          "Only explain structure, confidence, patterns, or deeper reasons if the user asks why or requests full analysis.",
+          "Only explain structure, confidence, patterns, auction zones, or deeper reasons if the user asks why or requests full analysis.",
           "",
-        ].join("\n");
+        ].filter(Boolean).join("\n");
       }
     } catch (e) {
       console.error("[/chat market fetch]", e.message);
@@ -1619,6 +2088,7 @@ app.post("/chat", async (req, res) => {
     "For trading replies, be concise by default.",
     "Only show full reasoning when the user explicitly asks for it.",
     liveData,
+    symMatch ? formatTradeMemoryForPrompt(symMatch[1].toUpperCase()) : "",
     buildMemoryBlock(safeMemory),
   ]
     .filter(Boolean)
@@ -1663,7 +2133,7 @@ app.post("/chat", async (req, res) => {
 /* ──────────────────────────────────────────────────────────────
    PLAN
 ────────────────────────────────────────────────────────────── */
-app.post("/plan", async (req, res) => {
+app.post("/plan", requireAuth, async (req, res) => {
   const { task, device_state = {}, memory = [] } = req.body || {};
   if (!task) return res.status(400).json({ error: "No task" });
 
@@ -1711,7 +2181,7 @@ app.post("/plan", async (req, res) => {
 /* ──────────────────────────────────────────────────────────────
    AUTOMATE
 ────────────────────────────────────────────────────────────── */
-app.post("/automate", async (req, res) => {
+app.post("/automate", requireAuth, async (req, res) => {
   const {
     goal,
     device_state = {},
@@ -1719,14 +2189,18 @@ app.post("/automate", async (req, res) => {
     history = [],
     max_steps = 4,
     mode = "tools",
+    retry_state = {},  // { tool: string, attempts: number, last_error: string }
   } = req.body || {};
 
   if (!goal) return res.status(400).json({ error: "No goal" });
 
-  const systemPrompt = buildAutomationSystemPrompt({
-    deviceState: device_state,
-    memory,
-  });
+  // Build retry context hint for the AI
+  const retryHint =
+    retry_state?.tool && retry_state?.attempts > 0
+      ? `\n[RETRY CONTEXT] Last attempted tool: "${retry_state.tool}" failed ${retry_state.attempts} time(s). Last error: "${retry_state.last_error || "unknown"}". Try an alternative approach or verify the UI state first.`
+      : "";
+
+  const systemPrompt = buildAutomationSystemPrompt({ deviceState: device_state, memory }) + retryHint;
 
   let messages = [
     { role: "system", content: systemPrompt },
@@ -1736,6 +2210,7 @@ app.post("/automate", async (req, res) => {
 
   const executedServerTools = [];
   const pendingAndroidActions = [];
+  const failedTools = {}; // { toolName: { attempts, last_error } }
 
   try {
     for (let step = 0; step < Math.max(1, Math.min(max_steps, 8)); step++) {
@@ -1756,6 +2231,10 @@ app.post("/automate", async (req, res) => {
           assistant_text: msg.content || "",
           pending_android_actions: pendingAndroidActions,
           server_tool_results: executedServerTools,
+          failed_tools: failedTools,
+          retry_state: Object.keys(failedTools).length
+            ? { tool: Object.keys(failedTools).at(-1), ...Object.values(failedTools).at(-1) }
+            : null,
           model_used: pickModel({ mode }),
         });
       }
@@ -1771,37 +2250,50 @@ app.post("/automate", async (req, res) => {
         const args = tc.function.arguments || {};
 
         if (isServerSideTool(toolName)) {
-          const result = await runLocalTool(toolName, args);
-          executedServerTools.push({ tool: toolName, arguments: args, result });
+          try {
+            const result = await runLocalTool(toolName, args);
+            executedServerTools.push({ tool: toolName, arguments: args, result });
+            messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(result) });
+          } catch (toolErr) {
+            // Track the failure
+            if (!failedTools[toolName]) failedTools[toolName] = { attempts: 0, last_error: "" };
+            failedTools[toolName].attempts++;
+            failedTools[toolName].last_error = toolErr.message;
 
-          messages.push({
-            role: "tool",
-            tool_call_id: tc.id,
-            content: JSON.stringify(result),
-          });
+            const errResult = { ok: false, error: toolErr.message };
+            executedServerTools.push({ tool: toolName, arguments: args, result: errResult });
+            messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(errResult) });
+          }
         } else {
-          pendingAndroidActions.push({
-            id: tc.id,
-            tool: toolName,
-            arguments: args,
-            requires_android_execution: true,
-          });
+          // Android tool — register a Promise, Android app must call /automation-results
+          const callId = tc.id;
+          const deviceResult = await new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+              pendingActions.delete(callId);
+              resolve({ status: "timeout", observation: "Device did not respond in 45s." });
+            }, 45000);
 
-          messages.push({
-            role: "tool",
-            tool_call_id: tc.id,
-            content: JSON.stringify({
-              ok: false,
-              pending_android_execution: true,
+            pendingActions.set(callId, {
+              resolve: (val) => { clearTimeout(timeout); resolve(val); },
               tool: toolName,
               arguments: args,
-              note: "Execute on device, then call /automate again with updated device_state/history.",
-            }),
+            });
+          });
+
+          pendingAndroidActions.push({
+            id: callId,
+            tool: toolName,
+            arguments: args,
+            device_result: deviceResult,
+          });
+
+          messages.push({
+            role: "tool",
+            tool_call_id: callId,
+            content: JSON.stringify(deviceResult),
           });
         }
       }
-
-      if (pendingAndroidActions.length > 0) break;
     }
 
     return res.json({
@@ -1810,14 +2302,15 @@ app.post("/automate", async (req, res) => {
         "Android actions required. Execute returned actions on device, then send updated device_state and history back to continue.",
       pending_android_actions: pendingAndroidActions,
       server_tool_results: executedServerTools,
+      failed_tools: failedTools,
+      retry_state: Object.keys(failedTools).length
+        ? { tool: Object.keys(failedTools).at(-1), ...Object.values(failedTools).at(-1) }
+        : null,
       model_used: pickModel({ mode }),
     });
   } catch (err) {
     console.error("[/automate]", err.message);
-    res.status(500).json({
-      error: "Automation failed",
-      details: err.message,
-    });
+    res.status(500).json({ error: "Automation failed", details: err.message });
   }
 });
 
@@ -1831,6 +2324,87 @@ app.get("/market/quote", async (req, res) => {
     res.json(data[symbol] || { error: "Not found" });
   } catch (err) {
     res.status(500).json({ error: "Quote fetch failed", details: err.message });
+  }
+});
+
+/* ──────────────────────────────────────────────────────────────
+   TRADE ENDPOINT — server calculates lot size, AI never does
+────────────────────────────────────────────────────────────── */
+app.post("/trade", requireAuth, async (req, res) => {
+  const {
+    symbol,
+    action,           // "buy" or "sell"
+    risk_percent = 1, // AI sends this, never lot size
+    balance,          // pulled from MT5 bridge or passed by client
+    reason = "",      // AI must explain why it's entering
+    interval = "1h",
+  } = req.body || {};
+
+  if (!symbol || !action) return res.status(400).json({ error: "symbol and action required" });
+  if (!["buy", "sell"].includes(action)) return res.status(400).json({ error: "action must be buy or sell" });
+  if (!reason) return res.status(400).json({ error: "reason field required — AI must justify the trade" });
+
+  try {
+    // Re-run analysis to get fresh entry/SL/TP
+    const analysis = await analyzeSymbol(symbol, interval);
+
+    if (analysis.news_filter?.blocked) {
+      return res.status(200).json({ status: "blocked", reason: analysis.ai_opinion });
+    }
+
+    const entry = parseFloat(analysis.trade_plan?.entry_zone?.split("-")[0]) || analysis.price;
+    const sl = parseFloat(analysis.trade_plan?.invalidation) || 0;
+    const tp = parseFloat(analysis.trade_plan?.tp1) || 0;
+
+    if (!sl) return res.status(400).json({ error: "Could not determine stop loss from analysis" });
+
+    // Server calculates lot size — AI never touches this
+    const accountBalance = balance || 1000; // client should always send real balance
+    const lotSize = calculateLotSize({
+      symbol,
+      balance: accountBalance,
+      riskPercent: risk_percent,
+      entry,
+      stopLoss: sl,
+    });
+
+    // Send to MT5 bridge (paper mode if URL not set)
+    const tradeResult = await sendToMT5Bridge({
+      symbol: symbol.toUpperCase(),
+      action,
+      lotSize,
+      entry,
+      sl,
+      tp,
+      reason,
+    });
+
+    // Log to trade memory automatically
+    addTradeMemory(symbol, {
+      direction: action,
+      pattern: analysis.patterns?.join(",") || "none",
+      outcome: "pending",
+      note: reason,
+    });
+
+    res.json({
+      status: "submitted",
+      symbol: symbol.toUpperCase(),
+      action,
+      lotSize,
+      entry,
+      sl,
+      tp,
+      risk_percent,
+      balance_used: accountBalance,
+      reason,
+      mt5_result: tradeResult,
+      analysis_confidence: analysis.confidence,
+      mtf_note: analysis.mtf?.note,
+    });
+  } catch (err) {
+    console.error("[/trade]", err.message);
+    res.status(500).json({ error: "Trade failed", details: err.message });
   }
 });
 
@@ -1848,7 +2422,7 @@ app.post("/market/batch", async (req, res) => {
   }
 });
 
-app.all("/market/analyze", async (req, res) => {
+app.all("/market/analyze", requireAuth, async (req, res) => {
   try {
     const body = req.body || {};
     const query = req.query || {};
