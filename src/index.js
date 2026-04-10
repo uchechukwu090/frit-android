@@ -11,23 +11,25 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
 
+// ==================== ENVIRONMENT ====================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-production-839a.up.railway.app";
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || ""; // empty = paper mode
+const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || "";
 
+// ==================== VALIDATION ====================
 if (!GROQ_API_KEY) {
   console.error("GROQ_API_KEY missing");
   process.exit(1);
 }
 if (!AUTH_TOKEN) {
-  console.warn("[WARN] AUTH_TOKEN not set — sandbox endpoint is unprotected!");
+  console.warn("[WARN] AUTH_TOKEN not set — endpoints are unprotected!");
 }
 
-// Middleware: protect sensitive endpoints with Bearer token
+// ==================== MIDDLEWARE ====================
 function requireAuth(req, res, next) {
-  if (!AUTH_TOKEN) return next(); // skip if not configured (warns above)
+  if (!AUTH_TOKEN) return next();
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (token !== AUTH_TOKEN) {
@@ -37,36 +39,156 @@ function requireAuth(req, res, next) {
 }
 
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ limit: "2mb", extended: true }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-/* ──────────────────────────────────────────────────────────────
-   MODELS
-────────────────────────────────────────────────────────────── */
+// ==================== FIXED MODELS ====================
 const MODELS = {
   vision: "meta-llama/llama-4-scout-17b-16e-instruct",
-  conversation: "compound-beta",
+  agent: "llama-3.3-70b-versatile",
+  conversation: "llama-3.3-70b-versatile",
   tools: "llama-3.3-70b-versatile",
   fast: "llama-3.1-8b-instant",
-  whisper: "whisper-large-v3",
+  whisper: "whisper-large-v3-turbo",
 };
 
-/* ──────────────────────────────────────────────────────────────
-   CACHE
-────────────────────────────────────────────────────────────── */
-const _cache = new Map();
-const pendingActions = new Map(); // Tracks Android tool execution status
+// ==================== VOICE/WAKE WORD STATE ====================
+const voiceState = {
+  isListening: false,
+  wakeWordEnabled: true,
+  wakeWords: ["hey frit", "frit", "hey brit", "brit"],
+  lastCommand: null,
+  commandHistory: [],
+  sessionId: null,
+  continuousMode: false,
+};
 
-// Periodic cache cleanup — prevents memory leaks on long-running server
+// ==================== SCREEN CAST STATE ====================
+const screenCastState = {
+  isActive: false,
+  frameBuffer: [],
+  lastFrameTime: 0,
+  frameRate: 5,
+  resolution: { width: 720, height: 1280 },
+  compressionQuality: 70,
+};
+
+// ==================== AGENTIC STATE MACHINE ====================
+class AgentStateMachine {
+  constructor() {
+    this.state = "idle";
+    this.currentGoal = null;
+    this.currentPlan = [];
+    this.currentStep = 0;
+    this.executionHistory = [];
+    this.deviceState = {};
+    this.pendingActions = new Map();
+    this.failedActions = [];
+    this.startTime = null;
+  }
+
+  reset() {
+    this.state = "idle";
+    this.currentGoal = null;
+    this.currentPlan = [];
+    this.currentStep = 0;
+    this.executionHistory = [];
+    this.failedActions = [];
+    this.startTime = null;
+    for (const [id, action] of this.pendingActions) {
+      if (action.timeout) clearTimeout(action.timeout);
+    }
+    this.pendingActions.clear();
+  }
+
+  startGoal(goal) {
+    this.reset();
+    this.state = "planning";
+    this.currentGoal = goal;
+    this.startTime = Date.now();
+    this.addHistory("goal_started", { goal });
+  }
+
+  setPlan(plan) {
+    this.currentPlan = plan;
+    this.currentStep = 0;
+    this.state = "executing";
+    this.addHistory("plan_created", { steps: plan.length });
+  }
+
+  addHistory(type, data) {
+    this.executionHistory.push({
+      type,
+      data,
+      timestamp: Date.now(),
+      step: this.currentStep,
+    });
+  }
+
+  nextStep() {
+    this.currentStep++;
+    if (this.currentStep >= this.currentPlan.length) {
+      this.state = "completed";
+      this.addHistory("goal_completed", { duration: Date.now() - this.startTime });
+    }
+  }
+
+  failStep(error) {
+    this.failedActions.push({ step: this.currentStep, error, timestamp: Date.now() });
+    this.addHistory("step_failed", { step: this.currentStep, error });
+  }
+
+  waitAndroid(actionId) {
+    this.state = "waiting_android";
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingActions.delete(actionId);
+        this.state = "executing";
+        reject(new Error("Android timeout (60s)"));
+      }, 60000);
+
+      this.pendingActions.set(actionId, { resolve, reject, timeout });
+    });
+  }
+
+  resolveAndroid(actionId, result) {
+    const action = this.pendingActions.get(actionId);
+    if (action) {
+      clearTimeout(action.timeout);
+      this.pendingActions.delete(actionId);
+      this.state = "executing";
+      action.resolve(result);
+    }
+  }
+
+  getStatus() {
+    return {
+      state: this.state,
+      goal: this.currentGoal,
+      currentStep: this.currentStep,
+      totalSteps: this.currentPlan.length,
+      historyCount: this.executionHistory.length,
+      failedActions: this.failedActions.length,
+      duration: this.startTime ? Date.now() - this.startTime : 0,
+    };
+  }
+}
+
+const agentState = new AgentStateMachine();
+
+// ==================== CACHE ====================
+const _cache = new Map();
+const pendingActions = new Map();
+
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of _cache.entries()) {
     if (now > entry.exp) _cache.delete(key);
   }
-}, 1000 * 60 * 60); // every hour
+}, 1000 * 60 * 5);
 
 function cacheGet(key) {
   const entry = _cache.get(key);
@@ -83,16 +205,23 @@ function cacheSet(key, val, ttlMs = 60000) {
 }
 
 function cacheStats() {
-  return { entries: _cache.size };
+  return { entries: _cache.size, agentState: agentState.getStatus() };
 }
 
-/* ──────────────────────────────────────────────────────────────
-   HELPERS
-────────────────────────────────────────────────────────────── */
-function pickModel({ hasImage = false, mode = "auto" } = {}) {
+// ==================== HELPERS ====================
+function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {}) {
   if (mode === "vision" || hasImage) return MODELS.vision;
   if (mode === "fast") return MODELS.fast;
   if (mode === "tools") return MODELS.tools;
+  if (mode === "agent") return MODELS.agent;
+  
+  if (mode === "auto") {
+    const complexTasks = ["automation", "planning", "analysis", "trading", "multistep"];
+    const simpleTasks = ["chat", "greeting", "quick_question"];
+    if (complexTasks.includes(taskType)) return MODELS.agent;
+    if (simpleTasks.includes(taskType)) return MODELS.fast;
+  }
+  
   return MODELS.conversation;
 }
 
@@ -170,6 +299,7 @@ async function groqChat({
   temperature = 0.3,
   max_tokens = 1600,
   tool_choice = "auto",
+  retries = 3,
 }) {
   const body = { model, messages, temperature, max_tokens };
   if (tools?.length) {
@@ -177,23 +307,40 @@ async function groqChat({
     body.tool_choice = tool_choice;
   }
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
 
-  const data = await res.json();
+      const data = await res.json();
 
-  if (!res.ok) {
-    console.error("[Groq Error]", model, JSON.stringify(data?.error || data));
-    throw new Error(data?.error?.message || JSON.stringify(data));
+      if (!res.ok) {
+        console.error("[Groq Error]", model, JSON.stringify(data?.error || data));
+        lastError = new Error(data?.error?.message || JSON.stringify(data));
+        if (res.status === 429) {
+          await new Promise(r => setTimeout(r, attempt * 2000));
+          continue;
+        }
+        continue;
+      }
+
+      return data;
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, attempt * 1000));
+      }
+    }
   }
 
-  return data;
+  throw lastError || new Error("Groq API failed after retries");
 }
 
 function extractToolCalls(choiceMessage) {
@@ -245,9 +392,7 @@ function normalizeInterval(v) {
   return allowed.includes(iv) ? iv : "1h";
 }
 
-/* ──────────────────────────────────────────────────────────────
-   MARKET MESSAGE HELPERS (NEW)
-────────────────────────────────────────────────────────────── */
+// ==================== MARKET MESSAGE HELPERS ====================
 function isMarketMessage(message = "") {
   const text = String(message || "").toLowerCase();
   return (
@@ -296,9 +441,7 @@ function formatConciseSignal(analysis) {
   ].join("\n");
 }
 
-/* ──────────────────────────────────────────────────────────────
-   MARKET DATA
-────────────────────────────────────────────────────────────── */
+// ==================== MARKET DATA CONSTANTS ====================
 const TD_SYMBOLS = {
   EURUSD: "EUR/USD",
   GBPUSD: "GBP/USD",
@@ -329,8 +472,20 @@ const TD_SYMBOLS = {
 };
 
 const CRYPTO_SET = new Set([
-  "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA",
-  "BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD", "ADAUSD",
+  "BTC",
+  "ETH",
+  "SOL",
+  "BNB",
+  "XRP",
+  "DOGE",
+  "ADA",
+  "BTCUSD",
+  "ETHUSD",
+  "SOLUSD",
+  "BNBUSD",
+  "XRPUSD",
+  "DOGEUSD",
+  "ADAUSD",
 ]);
 
 const COINGECKO_IDS = {
@@ -380,19 +535,19 @@ const FRANKFURTER_MAP = {
   GBPJPY: { base: "GBP", quote: "JPY" },
 };
 
-/* ──────────────────────────────────────────────────────────────
-   DATA NORMALIZATION LAYER
-────────────────────────────────────────────────────────────── */
+// ==================== DATA NORMALIZATION ====================
 function normalizeCandles(data, source = "twelve_data") {
   if (!Array.isArray(data)) return [];
-  return data.map((c) => ({
-    time: source === "twelve_data" ? new Date(c.datetime).getTime() : c[0],
-    open: parseFloat(source === "twelve_data" ? c.open : c[1]),
-    high: parseFloat(source === "twelve_data" ? c.high : c[2]),
-    low: parseFloat(source === "twelve_data" ? c.low : c[3]),
-    close: parseFloat(source === "twelve_data" ? c.close : c[4]),
-    volume: parseFloat(source === "twelve_data" ? (c.volume || 0) : (c[5] || 0)),
-  })).filter((c) => !isNaN(c.close) && !isNaN(c.open) && c.high >= c.low);
+  return data
+    .map((c) => ({
+      time: source === "twelve_data" ? new Date(c.datetime).getTime() : c[0],
+      open: parseFloat(source === "twelve_data" ? c.open : c[1]),
+      high: parseFloat(source === "twelve_data" ? c.high : c[2]),
+      low: parseFloat(source === "twelve_data" ? c.low : c[3]),
+      close: parseFloat(source === "twelve_data" ? c.close : c[4]),
+      volume: parseFloat(source === "twelve_data" ? c.volume || 0 : c[5] || 0),
+    }))
+    .filter((c) => !isNaN(c.close) && !isNaN(c.open) && c.high >= c.low);
 }
 
 async function fetchCandles(symbol, interval = "1h", outputsize = null) {
@@ -414,9 +569,9 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
       const data = await res.json();
 
       if (data.status !== "error" && data.values?.length >= 10) {
-          const candles = normalizeCandles(data.values.reverse(), "twelve_data");
-          cacheSet(ck, candles, 60000);
-          return candles;
+        const candles = normalizeCandles(data.values.reverse(), "twelve_data");
+        cacheSet(ck, candles, 60000);
+        return candles;
       } else {
         console.error("[TwelveData candles]", sym, data?.message || "Unknown error");
       }
@@ -435,9 +590,9 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
       const arr = await res.json();
 
       if (Array.isArray(arr) && arr.length >= 10) {
-          const candles = normalizeCandles(arr, "binance");
-          cacheSet(ck, candles, 60000);
-          return candles;
+        const candles = normalizeCandles(arr, "binance");
+        cacheSet(ck, candles, 60000);
+        return candles;
       }
     } catch (e) {
       console.error("[Binance candles]", sym, e.message);
@@ -579,9 +734,7 @@ async function fetchMarketPrices(symbols = []) {
   return result;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   ANALYSIS ENGINE
-────────────────────────────────────────────────────────────── */
+// ==================== ANALYSIS ENGINE ====================
 function calcEMA(closes, period) {
   if (closes.length < period) return [];
   const k = 2 / (period + 1);
@@ -619,7 +772,6 @@ function calcMACD(closes) {
 }
 
 function calcSR(candles) {
-  // Use swing highs/lows from last 50 candles instead of simple min/max of 20
   const window = candles.slice(-50);
   const swings = findSwings(window, 3);
 
@@ -628,12 +780,10 @@ function calcSR(candles) {
 
   const currentPrice = candles.at(-1)?.close ?? 0;
 
-  // Support = highest swing low BELOW current price
   const support =
     recentLows.filter((p) => p < currentPrice).sort((a, b) => b - a)[0] ??
     Math.min(...window.map((c) => c.low));
 
-  // Resistance = lowest swing high ABOVE current price
   const resistance =
     recentHighs.filter((p) => p > currentPrice).sort((a, b) => a - b)[0] ??
     Math.max(...window.map((c) => c.high));
@@ -659,26 +809,20 @@ function calcATR(candles, period = 14) {
   for (let i = 1; i < candles.length; i++) {
     const c = candles[i];
     const p = candles[i - 1];
-    const tr = Math.max(
-      c.high - c.low,
-      Math.abs(c.high - p.close),
-      Math.abs(c.low - p.close)
-    );
+    const tr = Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
     trs.push(tr);
   }
   const recent = trs.slice(-period);
   return recent.reduce((a, b) => a + b, 0) / recent.length;
 }
 
-/* ── AUCTION / VOLUME PROFILE (derived from OHLCV) ── */
 function calcAuction(candles, buckets = 40) {
   if (!candles || candles.length < 10) return null;
 
   const window = candles.slice(-100);
 
-  // Detect if volume data is meaningful or all zeros (common in forex free tier)
   const totalRawVol = window.reduce((s, c) => s + (c.volume || 0), 0);
-  const hasRealVolume = totalRawVol > window.length * 2; // avg > 2 per candle
+  const hasRealVolume = totalRawVol > window.length * 2;
 
   const hi = Math.max(...window.map((c) => c.high));
   const lo = Math.min(...window.map((c) => c.low));
@@ -688,11 +832,12 @@ function calcAuction(candles, buckets = 40) {
   const vap = new Array(buckets).fill(0);
 
   for (const c of window) {
-    // If no real volume, use candle range * body size as proxy (tick volume estimate)
-    const rangeProxy = (c.high - c.low) || bucketSize;
+    const rangeProxy = c.high - c.low || bucketSize;
     const bodySize = Math.abs(c.close - c.open) || rangeProxy * 0.3;
     const vol = hasRealVolume
-      ? (c.volume > 0 ? c.volume : rangeProxy)
+      ? c.volume > 0
+        ? c.volume
+        : rangeProxy
       : rangeProxy * (1 + bodySize / rangeProxy);
 
     const candleRange = c.high - c.low || bucketSize;
@@ -718,8 +863,13 @@ function calcAuction(candles, buckets = 40) {
     const addLo = lo_idx > 0 ? vap[lo_idx - 1] : 0;
     const addHi = hi_idx < buckets - 1 ? vap[hi_idx + 1] : 0;
     if (addLo === 0 && addHi === 0) break;
-    if (addHi >= addLo) { hi_idx++; accumulated += addHi; }
-    else { lo_idx--; accumulated += addLo; }
+    if (addHi >= addLo) {
+      hi_idx++;
+      accumulated += addHi;
+    } else {
+      lo_idx--;
+      accumulated += addLo;
+    }
   }
 
   const vah = lo + (hi_idx + 1) * bucketSize;
@@ -731,7 +881,16 @@ function calcAuction(candles, buckets = 40) {
   const hvn = sorted.slice(0, 3).map((x) => x.price);
   const lvn = sorted.slice(-5).map((x) => x.price);
 
-  return { poc, vah, val, hvn, lvn, range_hi: hi, range_lo: lo, volume_mode: hasRealVolume ? "real" : "proxy" };
+  return {
+    poc,
+    vah,
+    val,
+    hvn,
+    lvn,
+    range_hi: hi,
+    range_lo: lo,
+    volume_mode: hasRealVolume ? "real" : "proxy",
+  };
 }
 
 function auctionSignal(price, auction) {
@@ -753,7 +912,6 @@ function auctionSignal(price, auction) {
       note: "Price below Value Area — sellers in control, trend continuation likely.",
     };
   }
-  // Inside value area
   if (price > poc) {
     return {
       position: "inside_value_upper",
@@ -859,7 +1017,21 @@ function analyzeVolatility(candles, price) {
   };
 }
 
-function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, support, resistance, patterns, auctionSig, auction, mtf }) {
+function scoreSetup({
+  structure,
+  volatility,
+  rsi,
+  macd,
+  macdSig,
+  hist,
+  price,
+  support,
+  resistance,
+  patterns,
+  auctionSig,
+  auction,
+  mtf,
+}) {
   let bull = 0;
   let bear = 0;
 
@@ -881,7 +1053,6 @@ function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, su
   if (price > support && (price - support) / (price || 1) < 0.003) bull += 1;
   if (price < resistance && (resistance - price) / (price || 1) < 0.003) bear += 1;
 
-  // ── Auction bias (2 pts strong, 1 pt mild) ──
   if (auctionSig) {
     if (auctionSig.bias === "bullish") bull += 2;
     else if (auctionSig.bias === "bearish") bear += 2;
@@ -889,7 +1060,6 @@ function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, su
     else if (auctionSig.bias === "mild_bearish") bear += 1;
   }
 
-  // ── Patterns only score near key levels (ATR proximity) ──
   const atr = volatility.atr || 1;
   const keyLevels = [support, resistance];
   if (auction) keyLevels.push(auction.poc, auction.vah, auction.val);
@@ -900,16 +1070,27 @@ function scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, su
     if (patterns.includes("bullish_engulfing") || patterns.includes("pinbar_bullish")) bull += 2;
     if (patterns.includes("bearish_engulfing") || patterns.includes("pinbar_bearish")) bear += 2;
   }
-  if (priceNearLevel && patterns.includes("indecision")) { bull -= 0.5; bear -= 0.5; }
+  if (priceNearLevel && patterns.includes("indecision")) {
+    bull -= 0.5;
+    bear -= 0.5;
+  }
 
-  if (volatility.regime === "compressed") { bull -= 0.5; bear -= 0.5; }
+  if (volatility.regime === "compressed") {
+    bull -= 0.5;
+    bear -= 0.5;
+  }
 
-  // ── MTF Filter — 4H trend alignment ──
   let mtfNote = "4H data unavailable";
   if (mtf) {
-    if (mtf.trend === "up")   { bull += 2; bear -= 2; mtfNote = "4H trend UP — favors longs only"; }
-    else if (mtf.trend === "down") { bear += 2; bull -= 2; mtfNote = "4H trend DOWN — favors shorts only"; }
-    else mtfNote = "4H trend neutral — both directions open";
+    if (mtf.trend === "up") {
+      bull += 2;
+      bear -= 2;
+      mtfNote = "4H trend UP — favors longs only";
+    } else if (mtf.trend === "down") {
+      bear += 2;
+      bull -= 2;
+      mtfNote = "4H trend DOWN — favors shorts only";
+    } else mtfNote = "4H trend neutral — both directions open";
   }
 
   let bias = "neutral";
@@ -973,21 +1154,29 @@ function buildTradePlan({ bias, price, support, resistance, atr, dp }) {
   };
 }
 
-/* ──────────────────────────────────────────────────────────────
-   NEWS FILTER — "Volatility Shield"
-   Uses ForexFactory-style schedule logic. No API key needed.
-   Covers currencies affected by each symbol.
-────────────────────────────────────────────────────────────── */
+// ==================== NEWS FILTER ====================
 const SYMBOL_CURRENCIES = {
-  EURUSD: ["EUR", "USD"], GBPUSD: ["GBP", "USD"], USDJPY: ["USD", "JPY"],
-  AUDUSD: ["AUD", "USD"], USDCHF: ["USD", "CHF"], USDCAD: ["USD", "CAD"],
-  NZDUSD: ["NZD", "USD"], GBPJPY: ["GBP", "JPY"], EURJPY: ["EUR", "JPY"],
-  EURGBP: ["EUR", "GBP"], XAUUSD: ["USD"], XAGUSD: ["USD"],
-  BTCUSD: ["USD"], ETHUSD: ["USD"], SOLUSD: ["USD"],
-  BNBUSD: ["USD"], XRPUSD: ["USD"], DOGEUSD: ["USD"], ADAUSD: ["USD"],
+  EURUSD: ["EUR", "USD"],
+  GBPUSD: ["GBP", "USD"],
+  USDJPY: ["USD", "JPY"],
+  AUDUSD: ["AUD", "USD"],
+  USDCHF: ["USD", "CHF"],
+  USDCAD: ["USD", "CAD"],
+  NZDUSD: ["NZD", "USD"],
+  GBPJPY: ["GBP", "JPY"],
+  EURJPY: ["EUR", "JPY"],
+  EURGBP: ["EUR", "GBP"],
+  XAUUSD: ["USD"],
+  XAGUSD: ["USD"],
+  BTCUSD: ["USD"],
+  ETHUSD: ["USD"],
+  SOLUSD: ["USD"],
+  BNBUSD: ["USD"],
+  XRPUSD: ["USD"],
+  DOGEUSD: ["USD"],
+  ADAUSD: ["USD"],
 };
 
-// Fetch high-impact events from free FF calendar API
 async function fetchHighImpactEvents() {
   const ck = "news_events";
   const cached = cacheGet(ck);
@@ -997,13 +1186,14 @@ async function fetchHighImpactEvents() {
     const res = await fetch("https://nfs.faireconomy.media/ff_calendar_thisweek.json");
     if (!res.ok) return [];
     const data = await res.json();
-    // Keep only high-impact events
-    const high = data.filter((e) => e.impact === "High").map((e) => ({
-      currency: e.currency,
-      title: e.title,
-      time: new Date(e.date).getTime(),
-    }));
-    cacheSet(ck, high, 1000 * 60 * 60); // cache 1 hour
+    const high = data
+      .filter((e) => e.impact === "High")
+      .map((e) => ({
+        currency: e.currency,
+        title: e.title,
+        time: new Date(e.date).getTime(),
+      }));
+    cacheSet(ck, high, 1000 * 60 * 60);
     return high;
   } catch (err) {
     console.warn("[NewsFilter] Could not fetch calendar:", err.message);
@@ -1016,29 +1206,25 @@ async function checkNewsFilter(symbol) {
   const currencies = SYMBOL_CURRENCIES[sym] || ["USD"];
   const events = await fetchHighImpactEvents();
   const now = Date.now();
-  const window = 30 * 60 * 1000; // 30 min before/after
+  const window = 30 * 60 * 1000;
 
-  const nearby = events.filter((e) =>
-    currencies.includes(e.currency) &&
-    Math.abs(e.time - now) <= window
+  const nearby = events.filter(
+    (e) => currencies.includes(e.currency) && Math.abs(e.time - now) <= window
   );
 
   if (nearby.length > 0) {
     return {
       blocked: true,
-      reason: `High-impact news within 30 min: ${nearby.map((e) => `${e.currency} ${e.title}`).join(", ")}`,
+      reason: `High-impact news within 30 min: ${nearby
+        .map((e) => `${e.currency} ${e.title}`)
+        .join(", ")}`,
       events: nearby,
     };
   }
   return { blocked: false };
 }
 
-/* ──────────────────────────────────────────────────────────────
-   MULTI-TIMEFRAME CONFIRMATION
-   Fetches 4H trend to filter 1H signals.
-   Rule: 1H Buy only allowed if 4H trend is up or neutral.
-         1H Sell only allowed if 4H trend is down or neutral.
-────────────────────────────────────────────────────────────── */
+// ==================== MTF CONFIRMATION ====================
 async function getMTFBias(symbol) {
   const sym = String(symbol || "").toUpperCase();
   const ck = `mtf:${sym}`;
@@ -1059,7 +1245,7 @@ async function getMTFBias(symbol) {
     else if (price < ema50 && ema50 < ema200) trend = "down";
 
     const result = { trend, ema50: +ema50.toFixed(5), ema200: +ema200.toFixed(5), price };
-    cacheSet(ck, result, 1000 * 60 * 15); // cache 15 min — 4H changes slowly
+    cacheSet(ck, result, 1000 * 60 * 15);
     return result;
   } catch (err) {
     console.warn("[MTF]", err.message);
@@ -1067,6 +1253,7 @@ async function getMTFBias(symbol) {
   }
 }
 
+// ==================== MAIN ANALYSIS ====================
 async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const sym = String(symbol || "").toUpperCase();
   const iv = normalizeInterval(interval);
@@ -1082,7 +1269,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
     getMTFBias(sym),
   ]);
 
-  // News blackout — return neutral immediately, no signal
   if (newsCheck.blocked) {
     return {
       symbol: sym,
@@ -1090,8 +1276,20 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
       strength: "NEWS_BLACKOUT",
       interval: iv,
       news_filter: newsCheck,
-      trade_plan: { entry_zone: null, invalidation: null, tp1: null, tp2: null, risk_state: "no_trade" },
-      concise_signal: { direction: "STAND DOWN", entry: "N/A", sl: "N/A", tp: "N/A", ai_opinion: `News blackout active. ${newsCheck.reason}` },
+      trade_plan: {
+        entry_zone: null,
+        invalidation: null,
+        tp1: null,
+        tp2: null,
+        risk_state: "no_trade",
+      },
+      concise_signal: {
+        direction: "STAND DOWN",
+        entry: "N/A",
+        sl: "N/A",
+        tp: "N/A",
+        ai_opinion: `News blackout active. ${newsCheck.reason}`,
+      },
       ai_opinion: `STAND DOWN — ${newsCheck.reason}`,
       summary: `${sym} | STAND DOWN — ${newsCheck.reason}`,
     };
@@ -1150,11 +1348,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
 
   const isCrypto = CRYPTO_SET.has(sym);
   const dp = isCrypto || sym === "XAUUSD" ? 2 : 5;
-
-  const recentCandles = candles
-    .slice(-20)
-    .map((c) => `O:${c.open.toFixed(dp)} H:${c.high.toFixed(dp)} L:${c.low.toFixed(dp)} C:${c.close.toFixed(dp)}`)
-    .join(" | ");
 
   const trade_plan = buildTradePlan({
     bias: score.bias,
@@ -1232,7 +1425,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
       : null,
     mtf: { trend: mtf?.trend || "unknown", note: score.mtf_note },
     news_filter: { blocked: false },
-    recent_candles: recentCandles,
     ai_opinion: aiOpinion,
     summary: `${sym} @${price.toFixed(dp)} | ${direction}(${strength}) | Conf:${score.confidence} | Trend:${structure.trend}(4H:${mtf?.trend || "?"}) | RSI:${rsi.toFixed(1)} | S:${support.toFixed(dp)} R:${resistance.toFixed(dp)}${auction ? ` | POC:${auction.poc.toFixed(dp)} VAH:${auction.vah.toFixed(dp)} VAL:${auction.val.toFixed(dp)} [${auctionSig.position}]` : ""} [${candles.length} candles ${iv}]`,
   };
@@ -1241,15 +1433,11 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   return result;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   WEB SEARCH / WEATHER
-────────────────────────────────────────────────────────────── */
+// ==================== WEB SEARCH / WEATHER ====================
 async function webSearch(query) {
   try {
     const res = await fetch(
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(
-        query
-      )}&format=json&no_html=1&skip_disambig=1`
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`
     );
     const d = await res.json();
     return d.AbstractText || d.Answer || d.RelatedTopics?.[0]?.Text || "No result found.";
@@ -1286,16 +1474,18 @@ async function getWeather(city = "Lagos") {
   }
 }
 
-/* ──────────────────────────────────────────────────────────────
-   TOOL DEFINITIONS
-────────────────────────────────────────────────────────────── */
+// ==================== TOOL DEFINITIONS ====================
 const AGENT_TOOLS = [
   {
     type: "function",
     function: {
       name: "open_app",
       description: "Launch any installed app by name.",
-      parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] },
+      parameters: {
+        type: "object",
+        properties: { app_name: { type: "string" } },
+        required: ["app_name"],
+      },
     },
   },
   {
@@ -1303,7 +1493,11 @@ const AGENT_TOOLS = [
     function: {
       name: "open_url",
       description: "Open a full URL in browser.",
-      parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+      },
     },
   },
   {
@@ -1375,7 +1569,11 @@ const AGENT_TOOLS = [
     function: {
       name: "find_element",
       description: "Find element by text, hint, id, class or semantic description.",
-      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
     },
   },
   {
@@ -1391,7 +1589,11 @@ const AGENT_TOOLS = [
     function: {
       name: "analyze_screenshot",
       description: "Analyze screenshot visually for custom UI or icons.",
-      parameters: { type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"] },
+      parameters: {
+        type: "object",
+        properties: { prompt: { type: "string" } },
+        required: ["prompt"],
+      },
     },
   },
   {
@@ -1399,7 +1601,11 @@ const AGENT_TOOLS = [
     function: {
       name: "tap_button",
       description: "Tap an element by exact visible label or content description.",
-      parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] },
+      parameters: {
+        type: "object",
+        properties: { label: { type: "string" } },
+        required: ["label"],
+      },
     },
   },
   {
@@ -1407,7 +1613,11 @@ const AGENT_TOOLS = [
     function: {
       name: "tap_coordinates",
       description: "Tap screen by exact x/y coordinates.",
-      parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] },
+      parameters: {
+        type: "object",
+        properties: { x: { type: "number" }, y: { type: "number" } },
+        required: ["x", "y"],
+      },
     },
   },
   {
@@ -1415,7 +1625,10 @@ const AGENT_TOOLS = [
     function: {
       name: "double_tap",
       description: "Double tap by label or coordinates.",
-      parameters: { type: "object", properties: { label: { type: "string" }, x: { type: "number" }, y: { type: "number" } } },
+      parameters: {
+        type: "object",
+        properties: { label: { type: "string" }, x: { type: "number" }, y: { type: "number" } },
+      },
     },
   },
   {
@@ -1423,7 +1636,15 @@ const AGENT_TOOLS = [
     function: {
       name: "long_press",
       description: "Long press by label or coordinates.",
-      parameters: { type: "object", properties: { label: { type: "string" }, x: { type: "number" }, y: { type: "number" }, duration_ms: { type: "number" } } },
+      parameters: {
+        type: "object",
+        properties: {
+          label: { type: "string" },
+          x: { type: "number" },
+          y: { type: "number" },
+          duration_ms: { type: "number" },
+        },
+      },
     },
   },
   {
@@ -1431,7 +1652,10 @@ const AGENT_TOOLS = [
     function: {
       name: "scroll",
       description: "Scroll the current screen in a direction.",
-      parameters: { type: "object", properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] } } },
+      parameters: {
+        type: "object",
+        properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] } },
+      },
     },
   },
   {
@@ -1475,7 +1699,11 @@ const AGENT_TOOLS = [
     function: {
       name: "focus_field",
       description: "Focus a text field by label, hint, content-desc, or query.",
-      parameters: { type: "object", properties: { field: { type: "string" } }, required: ["field"] },
+      parameters: {
+        type: "object",
+        properties: { field: { type: "string" } },
+        required: ["field"],
+      },
     },
   },
   {
@@ -1483,7 +1711,11 @@ const AGENT_TOOLS = [
     function: {
       name: "type_text",
       description: "Type text into current or targeted field.",
-      parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] },
+      parameters: {
+        type: "object",
+        properties: { value: { type: "string" }, field: { type: "string" } },
+        required: ["value"],
+      },
     },
   },
   {
@@ -1499,7 +1731,11 @@ const AGENT_TOOLS = [
     function: {
       name: "paste_text",
       description: "Paste text via clipboard into current or targeted field.",
-      parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] },
+      parameters: {
+        type: "object",
+        properties: { value: { type: "string" }, field: { type: "string" } },
+        required: ["value"],
+      },
     },
   },
   {
@@ -1523,7 +1759,11 @@ const AGENT_TOOLS = [
     function: {
       name: "toggle_wifi",
       description: "Toggle Wi-Fi on or off if Android side supports it.",
-      parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] },
+      parameters: {
+        type: "object",
+        properties: { enabled: { type: "boolean" } },
+        required: ["enabled"],
+      },
     },
   },
   {
@@ -1531,7 +1771,11 @@ const AGENT_TOOLS = [
     function: {
       name: "toggle_bluetooth",
       description: "Toggle Bluetooth on or off if Android side supports it.",
-      parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] },
+      parameters: {
+        type: "object",
+        properties: { enabled: { type: "boolean" } },
+        required: ["enabled"],
+      },
     },
   },
   {
@@ -1539,7 +1783,11 @@ const AGENT_TOOLS = [
     function: {
       name: "set_volume",
       description: "Set media volume level 0-100.",
-      parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] },
+      parameters: {
+        type: "object",
+        properties: { level: { type: "number" } },
+        required: ["level"],
+      },
     },
   },
   {
@@ -1547,7 +1795,11 @@ const AGENT_TOOLS = [
     function: {
       name: "set_brightness",
       description: "Set screen brightness level 0-100.",
-      parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] },
+      parameters: {
+        type: "object",
+        properties: { level: { type: "number" } },
+        required: ["level"],
+      },
     },
   },
   {
@@ -1555,7 +1807,11 @@ const AGENT_TOOLS = [
     function: {
       name: "open_app_settings",
       description: "Open Android settings page for a specific app.",
-      parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] },
+      parameters: {
+        type: "object",
+        properties: { app_name: { type: "string" } },
+        required: ["app_name"],
+      },
     },
   },
   {
@@ -1563,7 +1819,11 @@ const AGENT_TOOLS = [
     function: {
       name: "grant_permission_if_prompted",
       description: "Handle common Android permission prompts.",
-      parameters: { type: "object", properties: { allow: { type: "boolean" } }, required: ["allow"] },
+      parameters: {
+        type: "object",
+        properties: { allow: { type: "boolean" } },
+        required: ["allow"],
+      },
     },
   },
   {
@@ -1571,7 +1831,10 @@ const AGENT_TOOLS = [
     function: {
       name: "make_call",
       description: "Call a contact or phone number.",
-      parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" } } },
+      parameters: {
+        type: "object",
+        properties: { contact_name: { type: "string" }, phone_number: { type: "string" } },
+      },
     },
   },
   {
@@ -1579,7 +1842,11 @@ const AGENT_TOOLS = [
     function: {
       name: "send_whatsapp",
       description: "Open WhatsApp for a contact/message workflow.",
-      parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] },
+      parameters: {
+        type: "object",
+        properties: { contact_name: { type: "string" }, message: { type: "string" } },
+        required: ["contact_name"],
+      },
     },
   },
   {
@@ -1587,7 +1854,11 @@ const AGENT_TOOLS = [
     function: {
       name: "send_sms",
       description: "Open SMS composer for a contact.",
-      parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] },
+      parameters: {
+        type: "object",
+        properties: { contact_name: { type: "string" }, message: { type: "string" } },
+        required: ["contact_name"],
+      },
     },
   },
   {
@@ -1595,7 +1866,11 @@ const AGENT_TOOLS = [
     function: {
       name: "set_alarm",
       description: "Set an alarm at a given time.",
-      parameters: { type: "object", properties: { label: { type: "string" }, time: { type: "string" } }, required: ["time"] },
+      parameters: {
+        type: "object",
+        properties: { label: { type: "string" }, time: { type: "string" } },
+        required: ["time"],
+      },
     },
   },
   {
@@ -1603,7 +1878,11 @@ const AGENT_TOOLS = [
     function: {
       name: "set_timer",
       description: "Start a countdown timer.",
-      parameters: { type: "object", properties: { duration: { type: "string" } }, required: ["duration"] },
+      parameters: {
+        type: "object",
+        properties: { duration: { type: "string" } },
+        required: ["duration"],
+      },
     },
   },
   {
@@ -1611,7 +1890,11 @@ const AGENT_TOOLS = [
     function: {
       name: "play_music",
       description: "Play music on Spotify, YouTube, or supported music app.",
-      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
     },
   },
   {
@@ -1619,7 +1902,11 @@ const AGENT_TOOLS = [
     function: {
       name: "navigate_to",
       description: "Open Maps and navigate to destination.",
-      parameters: { type: "object", properties: { destination: { type: "string" } }, required: ["destination"] },
+      parameters: {
+        type: "object",
+        properties: { destination: { type: "string" } },
+        required: ["destination"],
+      },
     },
   },
   {
@@ -1635,7 +1922,11 @@ const AGENT_TOOLS = [
     function: {
       name: "search_web",
       description: "Search current web information.",
-      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
     },
   },
   {
@@ -1643,7 +1934,11 @@ const AGENT_TOOLS = [
     function: {
       name: "get_weather",
       description: "Get current weather for city.",
-      parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+      parameters: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+      },
     },
   },
   {
@@ -1651,7 +1946,11 @@ const AGENT_TOOLS = [
     function: {
       name: "get_market_data",
       description: "Get live spot price for forex/crypto symbol.",
-      parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] },
+      parameters: {
+        type: "object",
+        properties: { symbol: { type: "string" } },
+        required: ["symbol"],
+      },
     },
   },
   {
@@ -1692,7 +1991,7 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "run_code",
-      description: "Run Python or JavaScript code in a controlled sandbox. Use for calculations, data processing, or any task that benefits from code execution.",
+      description: "Run Python or JavaScript code in a controlled sandbox.",
       parameters: {
         type: "object",
         properties: {
@@ -1707,9 +2006,82 @@ const AGENT_TOOLS = [
   },
 ];
 
-/* ──────────────────────────────────────────────────────────────
-   LOCAL TOOL EXECUTION
-────────────────────────────────────────────────────────────── */
+// ==================== TOOL CATEGORIZATION ====================
+const TOOL_CATEGORIES = {
+  navigation: [
+    "press_back",
+    "press_home",
+    "open_recents",
+    "open_notifications",
+    "open_app",
+    "open_url",
+  ],
+  screen: ["read_screen", "read_screen_structured", "take_screenshot", "analyze_screenshot", "find_element"],
+  interaction: [
+    "tap_button",
+    "tap_coordinates",
+    "double_tap",
+    "long_press",
+    "scroll",
+    "swipe",
+    "drag_and_drop",
+  ],
+  input: ["focus_field", "type_text", "clear_text", "paste_text", "press_enter", "hide_keyboard"],
+  system: [
+    "toggle_wifi",
+    "toggle_bluetooth",
+    "set_volume",
+    "set_brightness",
+    "open_app_settings",
+    "grant_permission_if_prompted",
+  ],
+  communication: ["make_call", "send_whatsapp", "send_sms"],
+  media: ["play_music", "take_photo", "navigate_to"],
+  productivity: ["set_alarm", "set_timer"],
+  market: ["get_market_data", "analyze_market", "place_trade"],
+  utility: ["search_web", "get_weather", "run_code"],
+  camera: ["take_photo"],
+};
+
+function getToolsForTask(goal) {
+  const text = String(goal || "").toLowerCase();
+  const selectedTools = [];
+
+  // Always include core tools
+  selectedTools.push(
+    ...TOOL_CATEGORIES.navigation,
+    ...TOOL_CATEGORIES.screen,
+    ...TOOL_CATEGORIES.interaction
+  );
+
+  // Add task-specific tools
+  if (/(?:text|type|search|input|write)/i.test(text)) {
+    selectedTools.push(...TOOL_CATEGORIES.input);
+  }
+  if (/(?:call|whatsapp|sms|message|text\s*(?:to|him|her)|send)/i.test(text)) {
+    selectedTools.push(...TOOL_CATEGORIES.communication);
+  }
+  if (/(?:photo|camera|picture|screenshot|capture|snap|image)/i.test(text)) {
+    selectedTools.push(...TOOL_CATEGORIES.camera);
+    selectedTools.push("analyze_screenshot");
+  }
+  if (/(?:trade|buy|sell|market|price|stock|forex|crypto|bitcoin|ethereum|chart)/i.test(text)) {
+    selectedTools.push(...TOOL_CATEGORIES.market);
+  }
+  if (/(?:music|play|song|spotify|youtube)/i.test(text)) {
+    selectedTools.push(...TOOL_CATEGORIES.media);
+  }
+  if (/(?:code|calculate|compute|script|program|python|javascript)/i.test(text)) {
+    selectedTools.push(...TOOL_CATEGORIES.utility);
+  }
+
+  // Always include utility tools
+  selectedTools.push(...TOOL_CATEGORIES.utility.slice(0, 2));
+
+  return [...new Set(selectedTools)];
+}
+
+// ==================== LOCAL TOOL EXECUTION ====================
 async function runLocalTool(name, args = {}) {
   switch (name) {
     case "search_web":
@@ -1744,12 +2116,16 @@ async function runLocalTool(name, args = {}) {
 }
 
 function isServerSideTool(name) {
-  return ["search_web", "get_weather", "get_market_data", "analyze_market", "run_code"].includes(name);
+  return [
+    "search_web",
+    "get_weather",
+    "get_market_data",
+    "analyze_market",
+    "run_code",
+  ].includes(name);
 }
 
-/* ──────────────────────────────────────────────────────────────
-   PROMPT BUILDERS
-────────────────────────────────────────────────────────────── */
+// ==================== PROMPT BUILDERS ====================
 function buildDeviceStateBlock(deviceState = {}) {
   const ds = typeof deviceState === "string" ? { raw: deviceState } : deviceState || {};
   const parts = [];
@@ -1762,7 +2138,8 @@ function buildDeviceStateBlock(deviceState = {}) {
   if (ds.network_status) parts.push(`Network: ${ds.network_status}`);
   if (ds.battery_level !== undefined) parts.push(`Battery: ${ds.battery_level}%`);
   if (ds.keyboard_open !== undefined) parts.push(`Keyboard open: ${ds.keyboard_open}`);
-  if (ds.notifications_count !== undefined) parts.push(`Notifications count: ${ds.notifications_count}`);
+  if (ds.notifications_count !== undefined)
+    parts.push(`Notifications count: ${ds.notifications_count}`);
 
   return parts.length ? parts.join("\n") : "No device state provided.";
 }
@@ -1795,17 +2172,14 @@ function buildAutomationSystemPrompt({ deviceState, memory }) {
     .join("\n");
 }
 
-/* ──────────────────────────────────────────────────────────────
-   LIGHTWEIGHT TRADE MEMORY (RAG alternative — no vector DB needed)
-────────────────────────────────────────────────────────────── */
-const tradeMemory = new Map(); // symbol -> array of memory entries
+// ==================== TRADE MEMORY ====================
+const tradeMemory = new Map();
 
 function addTradeMemory(symbol, entry) {
   const sym = String(symbol || "").toUpperCase();
   if (!tradeMemory.has(sym)) tradeMemory.set(sym, []);
   const entries = tradeMemory.get(sym);
   entries.push({ ...entry, timestamp: Date.now() });
-  // Keep last 20 per symbol
   if (entries.length > 20) entries.splice(0, entries.length - 20);
 }
 
@@ -1825,24 +2199,8 @@ function formatTradeMemoryForPrompt(symbol) {
   return `\nPast trade memory for ${symbol}:\n${lines.join("\n")}`;
 }
 
-app.post("/memory/trade", requireAuth, (req, res) => {
-  const { symbol, outcome, pattern, direction, note } = req.body || {};
-  if (!symbol) return res.status(400).json({ error: "symbol required" });
-  addTradeMemory(symbol, { outcome, pattern, direction, note });
-  res.json({ ok: true, memory_count: tradeMemory.get(symbol.toUpperCase())?.length });
-});
-
-app.get("/memory/trade", requireAuth, (req, res) => {
-  const symbol = String(req.query.symbol || "").toUpperCase();
-  if (!symbol) return res.status(400).json({ error: "symbol required" });
-  res.json({ symbol, entries: getTradeMemory(symbol) });
-});
-
-/* ──────────────────────────────────────────────────────────────
-   LOT SIZE ENGINE (instrument-aware, server-side math only)
-────────────────────────────────────────────────────────────── */
+// ==================== LOT SIZE ENGINE ====================
 const PIP_CONFIG = {
-  // Standard forex 4-digit pairs — pip = 0.0001, pipValue ~$10 per std lot
   EURUSD: { pipSize: 0.0001, pipValue: 10 },
   GBPUSD: { pipSize: 0.0001, pipValue: 10 },
   AUDUSD: { pipSize: 0.0001, pipValue: 10 },
@@ -1850,35 +2208,24 @@ const PIP_CONFIG = {
   USDCHF: { pipSize: 0.0001, pipValue: 10 },
   USDCAD: { pipSize: 0.0001, pipValue: 10 },
   EURGBP: { pipSize: 0.0001, pipValue: 10 },
-  // JPY pairs — pip = 0.01, pipValue ~$9.30 per std lot
   USDJPY: { pipSize: 0.01, pipValue: 9.3 },
   GBPJPY: { pipSize: 0.01, pipValue: 9.3 },
   EURJPY: { pipSize: 0.01, pipValue: 9.3 },
-  // Gold — pip = 0.01 (cent), $1 move = $100 per std lot
   XAUUSD: { pipSize: 0.01, pipValue: 100 },
   XAGUSD: { pipSize: 0.001, pipValue: 50 },
-  // Crypto — no pip concept, use price-based % risk
-  BTCUSD:  { pipSize: 1, pipValue: 1, isCrypto: true },
-  ETHUSD:  { pipSize: 0.1, pipValue: 1, isCrypto: true },
-  SOLUSD:  { pipSize: 0.01, pipValue: 1, isCrypto: true },
-  BNBUSD:  { pipSize: 0.01, pipValue: 1, isCrypto: true },
-  XRPUSD:  { pipSize: 0.0001, pipValue: 1, isCrypto: true },
+  BTCUSD: { pipSize: 1, pipValue: 1, isCrypto: true },
+  ETHUSD: { pipSize: 0.1, pipValue: 1, isCrypto: true },
+  SOLUSD: { pipSize: 0.01, pipValue: 1, isCrypto: true },
+  BNBUSD: { pipSize: 0.01, pipValue: 1, isCrypto: true },
+  XRPUSD: { pipSize: 0.0001, pipValue: 1, isCrypto: true },
   DOGEUSD: { pipSize: 0.00001, pipValue: 1, isCrypto: true },
-  ADAUSD:  { pipSize: 0.00001, pipValue: 1, isCrypto: true },
+  ADAUSD: { pipSize: 0.00001, pipValue: 1, isCrypto: true },
 };
 
-function calculateLotSize({
-  symbol,
-  balance,
-  riskPercent = 1,
-  entry,
-  stopLoss,
-  accountCurrency = "USD",
-}) {
+function calculateLotSize({ symbol, balance, riskPercent = 1, entry, stopLoss, accountCurrency = "USD" }) {
   const sym = String(symbol || "").toUpperCase();
   const cfg = PIP_CONFIG[sym];
 
-  // Hard safety caps — AI can never override these
   const MAX_RISK_PERCENT = 2;
   const MAX_LOT = 5;
   const MIN_LOT = 0.01;
@@ -1889,7 +2236,6 @@ function calculateLotSize({
   if (!entry || !stopLoss || entry === stopLoss) return MIN_LOT;
 
   if (!cfg) {
-    // Unknown instrument — use conservative 0.01
     console.warn(`[LotSize] Unknown symbol ${sym}, defaulting to 0.01`);
     return MIN_LOT;
   }
@@ -1897,33 +2243,33 @@ function calculateLotSize({
   let lotSize;
 
   if (cfg.isCrypto) {
-    // Crypto: risk / (price distance in USD)
     const priceDist = Math.abs(entry - stopLoss);
     if (priceDist === 0) return MIN_LOT;
     lotSize = riskAmount / priceDist;
   } else {
-    // Forex/Gold: risk / (stop pips * pip value)
     const stopPips = Math.abs(entry - stopLoss) / cfg.pipSize;
     if (stopPips === 0) return MIN_LOT;
     lotSize = riskAmount / (stopPips * cfg.pipValue);
   }
 
-  // Round to 2 decimal places, clamp between min and max
   lotSize = Math.max(MIN_LOT, Math.min(MAX_LOT, Math.round(lotSize * 100) / 100));
   return lotSize;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   MT5 BRIDGE CALLER
-   Empty MT5_BRIDGE_URL = paper mode (logs only, no real trade)
-────────────────────────────────────────────────────────────── */
+// ==================== MT5 BRIDGE ====================
 async function sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason = "" }) {
   if (!MT5_BRIDGE_URL) {
-    // Paper mode — log and return simulated result
-    console.log(`[PAPER TRADE] ${action.toUpperCase()} ${symbol} | Lot:${lotSize} | Entry:${entry} | SL:${sl} | TP:${tp} | Reason: ${reason}`);
+    console.log(
+      `[PAPER TRADE] ${action.toUpperCase()} ${symbol} | Lot:${lotSize} | Entry:${entry} | SL:${sl} | TP:${tp} | Reason: ${reason}`
+    );
     return {
       mode: "paper",
-      symbol, action, lotSize, entry, sl, tp,
+      symbol,
+      action,
+      lotSize,
+      entry,
+      sl,
+      tp,
       status: "simulated",
       message: "MT5_BRIDGE_URL not set — paper mode active",
     };
@@ -1934,7 +2280,7 @@ async function sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason 
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${AUTH_TOKEN}`,
+        Authorization: `Bearer ${AUTH_TOKEN}`,
       },
       body: JSON.stringify({ symbol, action, lotSize, entry, sl, tp, reason }),
     });
@@ -1947,28 +2293,460 @@ async function sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason 
   }
 }
 
-/* ──────────────────────────────────────────────────────────────
-   AUTOMATION CALLBACK ENDPOINT
-   Android app calls this after executing a tool to report back result.
-   The /automate route waits on a Promise resolved by this endpoint.
-────────────────────────────────────────────────────────────── */
-app.post("/automation-results", requireAuth, (req, res) => {
-  const { callId, status, observation } = req.body || {};
-  if (!callId) return res.status(400).json({ error: "callId required" });
-
-  if (pendingActions.has(callId)) {
-    const action = pendingActions.get(callId);
-    action.resolve({ status: status || "ok", observation: observation || "" });
-    pendingActions.delete(callId);
-    return res.json({ success: true });
-  }
-
-  res.status(404).json({ error: "callId not found or already resolved" });
+// ==================== VOICE ENDPOINTS ====================
+app.post("/voice/start-listening", requireAuth, (req, res) => {
+  voiceState.isListening = true;
+  voiceState.sessionId = `voice_${Date.now()}`;
+  res.json({
+    status: "listening",
+    sessionId: voiceState.sessionId,
+    wakeWords: voiceState.wakeWords,
+  });
 });
 
-/* ──────────────────────────────────────────────────────────────
-   ROUTES
-────────────────────────────────────────────────────────────── */
+app.post("/voice/stop-listening", requireAuth, (req, res) => {
+  voiceState.isListening = false;
+  const sessionResults = voiceState.commandHistory.filter((c) => c.sessionId === voiceState.sessionId);
+  res.json({
+    status: "stopped",
+    commandsProcessed: sessionResults.length,
+  });
+});
+
+app.post("/voice/wake-word", requireAuth, (req, res) => {
+  const { enabled, customWords } = req.body || {};
+
+  if (typeof enabled === "boolean") {
+    voiceState.wakeWordEnabled = enabled;
+  }
+  if (Array.isArray(customWords) && customWords.length > 0) {
+    voiceState.wakeWords = customWords.map((w) => w.toLowerCase());
+  }
+
+  res.json({
+    status: "configured",
+    wakeWordEnabled: voiceState.wakeWordEnabled,
+    wakeWords: voiceState.wakeWords,
+  });
+});
+
+app.post("/voice/command", requireAuth, async (req, res) => {
+  const { transcript, sessionId, deviceState } = req.body || {};
+
+  if (!transcript) {
+    return res.status(400).json({ error: "transcript required" });
+  }
+
+  const transcriptLower = transcript.toLowerCase();
+  const hasWakeWord = voiceState.wakeWords.some((w) => transcriptLower.includes(w));
+
+  if (voiceState.wakeWordEnabled && !hasWakeWord) {
+    return res.json({
+      status: "ignored",
+      reason: "wake_word_not_detected",
+      wakeWords: voiceState.wakeWords,
+    });
+  }
+
+  const command = {
+    sessionId: sessionId || voiceState.sessionId,
+    transcript,
+    timestamp: Date.now(),
+    wakeWordDetected: hasWakeWord,
+  };
+
+  voiceState.lastCommand = command;
+  voiceState.commandHistory.push(command);
+
+  if (voiceState.commandHistory.length > 50) {
+    voiceState.commandHistory = voiceState.commandHistory.slice(-50);
+  }
+
+  try {
+    const result = await handleAutomationRequest({
+      goal: transcript,
+      device_state: deviceState || {},
+      mode: "voice",
+    });
+
+    res.json({
+      status: "processed",
+      command,
+      result,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: "Command processing failed",
+      details: err.message,
+    });
+  }
+});
+
+app.get("/voice/history", requireAuth, (req, res) => {
+  const limit = parseInt(req.query.limit) || 20;
+  res.json({
+    commands: voiceState.commandHistory.slice(-limit),
+    lastCommand: voiceState.lastCommand,
+  });
+});
+
+app.post("/voice/replay-last", requireAuth, async (req, res) => {
+  if (!voiceState.lastCommand) {
+    return res.status(400).json({ error: "No previous command to replay" });
+  }
+
+  const result = await handleAutomationRequest({
+    goal: voiceState.lastCommand.transcript,
+    device_state: req.body.device_state || {},
+    mode: "voice",
+  });
+
+  res.json({
+    status: "replaying",
+    command: voiceState.lastCommand,
+    result,
+  });
+});
+
+// ==================== SCREEN CASTING ====================
+app.post("/screen/start-cast", requireAuth, (req, res) => {
+  const { frameRate = 5, quality = 70, resolution } = req.body || {};
+
+  screenCastState.isActive = true;
+  screenCastState.frameRate = Math.min(frameRate, 10);
+  screenCastState.compressionQuality = Math.min(quality, 90);
+  if (resolution) {
+    screenCastState.resolution = resolution;
+  }
+
+  res.json({
+    status: "casting",
+    config: {
+      frameRate: screenCastState.frameRate,
+      quality: screenCastState.compressionQuality,
+      resolution: screenCastState.resolution,
+    },
+  });
+});
+
+app.post("/screen/frame", requireAuth, (req, res) => {
+  const { frameData, timestamp, width, height } = req.body || {};
+
+  if (!screenCastState.isActive) {
+    return res.status(400).json({ error: "Screen cast not active" });
+  }
+
+  if (!frameData) {
+    return res.status(400).json({ error: "frameData required" });
+  }
+
+  screenCastState.frameBuffer.push({
+    data: frameData,
+    timestamp: timestamp || Date.now(),
+    width,
+    height,
+  });
+
+  if (screenCastState.frameBuffer.length > 10) {
+    screenCastState.frameBuffer.shift();
+  }
+
+  screenCastState.lastFrameTime = Date.now();
+
+  res.json({
+    status: "received",
+    frameNumber: screenCastState.frameBuffer.length,
+  });
+});
+
+app.post("/screen/analyze-frame", requireAuth, async (req, res) => {
+  const { prompt, frameIndex = -1 } = req.body || {};
+
+  if (screenCastState.frameBuffer.length === 0) {
+    return res.status(400).json({ error: "No frames available" });
+  }
+
+  const frame =
+    frameIndex >= 0 && frameIndex < screenCastState.frameBuffer.length
+      ? screenCastState.frameBuffer[frameIndex]
+      : screenCastState.frameBuffer[screenCastState.frameBuffer.length - 1];
+
+  try {
+    const result = await groqChat({
+      model: MODELS.vision,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                prompt ||
+                "What do you see in this screen? Describe the UI elements and any actionable items.",
+            },
+            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${frame.data}` } },
+          ],
+        },
+      ],
+      max_tokens: 500,
+    });
+
+    res.json({
+      status: "analyzed",
+      analysis: result.choices[0].message.content,
+      frameTimestamp: frame.timestamp,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Frame analysis failed", details: err.message });
+  }
+});
+
+app.post("/screen/stop-cast", requireAuth, (req, res) => {
+  screenCastState.isActive = false;
+  const frameCount = screenCastState.frameBuffer.length;
+  screenCastState.frameBuffer = [];
+
+  res.json({
+    status: "stopped",
+    framesReceived: frameCount,
+  });
+});
+
+app.get("/screen/status", requireAuth, (req, res) => {
+  res.json({
+    isActive: screenCastState.isActive,
+    frameRate: screenCastState.frameRate,
+    quality: screenCastState.compressionQuality,
+    resolution: screenCastState.resolution,
+    bufferedFrames: screenCastState.frameBuffer.length,
+    lastFrameTime: screenCastState.lastFrameTime,
+  });
+});
+
+// ==================== AUTOMATION HANDLER ====================
+async function handleAutomationRequest({
+  goal,
+  device_state = {},
+  memory = [],
+  history = [],
+  max_steps = 8,
+  mode = "auto",
+}) {
+  agentState.startGoal(goal);
+  agentState.deviceState = device_state;
+
+  const taskType = determineTaskType(goal);
+  const relevantToolNames = getToolsForTask(goal);
+  const relevantTools = AGENT_TOOLS.filter(
+    (t) => relevantToolNames.includes(t.function.name) || isServerSideTool(t.function.name)
+  );
+
+  const systemPrompt = buildAutomationSystemPrompt({ deviceState: device_state, memory });
+
+  let messages = [
+    { role: "system", content: systemPrompt },
+    ...trimHistoryByChars(history, 10, 3500),
+    { role: "user", content: truncateText(goal, 3000) },
+  ];
+
+  const executedServerTools = [];
+  const pendingAndroidActions = [];
+  const failedTools = {};
+
+  try {
+    for (let step = 0; step < Math.max(1, Math.min(max_steps, 10)); step++) {
+      agentState.currentStep = step;
+
+      const out = await groqChat({
+        model: pickModel({ mode, taskType }),
+        messages,
+        tools: relevantTools,
+        tool_choice: "auto",
+        max_tokens: 1500,
+      });
+
+      const msg = out.choices[0].message;
+      const toolCalls = extractToolCalls(msg);
+
+      if (!toolCalls.length) {
+        agentState.addHistory("completed", { message: msg.content });
+        return {
+          done: true,
+          assistant_text: msg.content || "",
+          execution_history: agentState.executionHistory,
+          steps_completed: step,
+        };
+      }
+
+      messages.push({
+        role: "assistant",
+        content: msg.content || "",
+        tool_calls: msg.tool_calls,
+      });
+
+      for (const tc of toolCalls) {
+        const toolName = tc.function.name;
+        const args = tc.function.arguments || {};
+
+        agentState.addHistory("tool_call", { tool: toolName, args, step });
+
+        if (isServerSideTool(toolName)) {
+          try {
+            const result = await runLocalTool(toolName, args);
+            executedServerTools.push({ tool: toolName, arguments: args, result });
+            messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(result) });
+            agentState.addHistory("tool_result", { tool: toolName, result: "success" });
+          } catch (toolErr) {
+            if (!failedTools[toolName]) failedTools[toolName] = { attempts: 0, last_error: "" };
+            failedTools[toolName].attempts++;
+            failedTools[toolName].last_error = toolErr.message;
+
+            const errResult = { ok: false, error: toolErr.message };
+            executedServerTools.push({ tool: toolName, arguments: args, result: errResult });
+            messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(errResult) });
+            agentState.failStep(toolErr.message);
+          }
+        } else {
+          const callId = tc.id;
+
+          try {
+            const deviceResult = await agentState.waitAndroid(callId);
+
+            pendingAndroidActions.push({
+              id: callId,
+              tool: toolName,
+              arguments: args,
+              device_result: deviceResult,
+            });
+
+            messages.push({
+              role: "tool",
+              tool_call_id: callId,
+              content: JSON.stringify(deviceResult),
+            });
+
+            agentState.addHistory("android_result", { tool: toolName, result: deviceResult });
+          } catch (timeoutErr) {
+            pendingAndroidActions.push({
+              id: callId,
+              tool: toolName,
+              arguments: args,
+              device_result: { status: "timeout", observation: "Device did not respond in 60s" },
+            });
+
+            messages.push({
+              role: "tool",
+              tool_call_id: callId,
+              content: JSON.stringify({ status: "timeout", observation: "Device did not respond" }),
+            });
+
+            agentState.failStep(timeoutErr.message);
+          }
+        }
+      }
+    }
+
+    return {
+      done: false,
+      assistant_text: "Multi-step execution in progress. Continue with device state.",
+      pending_android_actions: pendingAndroidActions,
+      server_tool_results: executedServerTools,
+      failed_tools: failedTools,
+      execution_history: agentState.executionHistory,
+      current_step: agentState.currentStep,
+      model_used: pickModel({ mode, taskType }),
+    };
+  } catch (err) {
+    agentState.failStep(err.message);
+    throw err;
+  }
+}
+
+function determineTaskType(goal) {
+  const text = String(goal || "").toLowerCase();
+
+  if (/(?:open|close|launch|start)\s+(?:app|application|camera|whatsapp|telegram|instagram|facebook|twitter|tiktok|youtube|spotify|browser|chrome|safari)/i.test(text))
+    return "app_navigation";
+  if (/(?:send|write|message|text|email|mail)/i.test(text)) return "messaging";
+  if (/(?:photo|picture|camera|screenshot|capture|snap)/i.test(text)) return "camera";
+  if (/(?:trade|buy|sell|market|price|stock|forex|crypto|bitcoin|ethereum)/i.test(text))
+    return "trading";
+  if (/(?:call|phone|dial)/i.test(text)) return "calling";
+  if (/(?:navigate|direction|map|location|go to)/i.test(text)) return "navigation";
+  if (/(?:search|find|look up|what is|who is|when did)/i.test(text)) return "search";
+  if (/(?:code|calculate|compute|script|program)/i.test(text)) return "coding";
+  if (/(?:type|write|input|enter)/i.test(text)) return "input";
+  if (/(?:scroll|swipe|tap|click|press)/i.test(text)) return "interaction";
+
+  return "general";
+}
+
+// ==================== AUTOMATION RESULTS CALLBACK ====================
+app.post("/automation-results", requireAuth, (req, res) => {
+  const { callId, status, observation, deviceState } = req.body || {};
+
+  if (!callId) {
+    return res.status(400).json({ error: "callId required" });
+  }
+
+  if (deviceState) {
+    agentState.deviceState = { ...agentState.deviceState, ...deviceState };
+  }
+
+  agentState.resolveAndroid(callId, { status: status || "ok", observation: observation || "" });
+
+  res.json({ success: true });
+});
+
+// ==================== AGENT STATUS ====================
+app.get("/agent/status", requireAuth, (req, res) => {
+  res.json({
+    agent: agentState.getStatus(),
+    voice: {
+      isListening: voiceState.isListening,
+      wakeWordEnabled: voiceState.wakeWordEnabled,
+      lastCommand: voiceState.lastCommand,
+    },
+    screenCast: {
+      isActive: screenCastState.isActive,
+      bufferedFrames: screenCastState.frameBuffer.length,
+    },
+    cache: cacheStats(),
+  });
+});
+
+app.post("/agent/reset", requireAuth, (req, res) => {
+  agentState.reset();
+  res.json({ status: "reset", agent: agentState.getStatus() });
+});
+
+// ==================== AUTOMATE ENDPOINT ====================
+app.post("/automate", requireAuth, async (req, res) => {
+  const { goal, device_state = {}, memory = [], history = [], max_steps = 8, mode = "auto" } = req.body || {};
+
+  if (!goal) return res.status(400).json({ error: "No goal" });
+
+  try {
+    const result = await handleAutomationRequest({
+      goal,
+      device_state,
+      memory,
+      history,
+      max_steps,
+      mode,
+    });
+    res.json(result);
+  } catch (err) {
+    console.error("[/automate]", err.message);
+    res.status(500).json({
+      error: "Automation failed",
+      details: err.message,
+      execution_history: agentState.executionHistory,
+    });
+  }
+});
+
+// ==================== ROUTES ====================
 app.get("/", (_req, res) => {
   res.json({
     name: "FRIT Advanced AI Server",
@@ -1981,6 +2759,19 @@ app.get("/", (_req, res) => {
       "/plan",
       "/automate",
       "/automation-results",
+      "/agent/status",
+      "/agent/reset",
+      "/voice/start-listening",
+      "/voice/stop-listening",
+      "/voice/wake-word",
+      "/voice/command",
+      "/voice/history",
+      "/voice/replay-last",
+      "/screen/start-cast",
+      "/screen/frame",
+      "/screen/analyze-frame",
+      "/screen/stop-cast",
+      "/screen/status",
       "/trade",
       "/market/analyze",
       "/market/batch",
@@ -2002,9 +2793,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-/* ──────────────────────────────────────────────────────────────
-   CHAT
-────────────────────────────────────────────────────────────── */
+// ==================== CHAT ====================
 app.post("/chat", requireAuth, async (req, res) => {
   const { message, history = [], memory = [], screen_context, mode = "auto" } = req.body || {};
 
@@ -2024,7 +2813,6 @@ app.post("/chat", requireAuth, async (req, res) => {
   const ivMatch = String(message).match(/\b(1min|5min|15min|30min|1h|4h|1day)\b/i);
   const sizeMatch = String(message).match(/\b(\d{2,3})\s*(candles?|bars?|data points?)\b/i);
 
-  // FAST PATH: return concise market signal without calling AI model
   if (symMatch && isMarketMessage(message) && !wantsDetailedTradeReason(message)) {
     try {
       const sym = symMatch[1].toUpperCase();
@@ -2040,7 +2828,6 @@ app.post("/chat", requireAuth, async (req, res) => {
       });
     } catch (err) {
       console.error("[/chat concise market path]", err.message);
-      // fall through to normal AI path if fast path fails
     }
   }
 
@@ -2074,7 +2861,9 @@ app.post("/chat", requireAuth, async (req, res) => {
           "- AI opinion",
           "Only explain structure, confidence, patterns, auction zones, or deeper reasons if the user asks why or requests full analysis.",
           "",
-        ].filter(Boolean).join("\n");
+        ]
+          .filter(Boolean)
+          .join("\n");
       }
     } catch (e) {
       console.error("[/chat market fetch]", e.message);
@@ -2130,9 +2919,7 @@ app.post("/chat", requireAuth, async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────────
-   PLAN
-────────────────────────────────────────────────────────────── */
+// ==================== PLAN ====================
 app.post("/plan", requireAuth, async (req, res) => {
   const { task, device_state = {}, memory = [] } = req.body || {};
   if (!task) return res.status(400).json({ error: "No task" });
@@ -2178,145 +2965,7 @@ app.post("/plan", requireAuth, async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────────
-   AUTOMATE
-────────────────────────────────────────────────────────────── */
-app.post("/automate", requireAuth, async (req, res) => {
-  const {
-    goal,
-    device_state = {},
-    memory = [],
-    history = [],
-    max_steps = 4,
-    mode = "tools",
-    retry_state = {},  // { tool: string, attempts: number, last_error: string }
-  } = req.body || {};
-
-  if (!goal) return res.status(400).json({ error: "No goal" });
-
-  // Build retry context hint for the AI
-  const retryHint =
-    retry_state?.tool && retry_state?.attempts > 0
-      ? `\n[RETRY CONTEXT] Last attempted tool: "${retry_state.tool}" failed ${retry_state.attempts} time(s). Last error: "${retry_state.last_error || "unknown"}". Try an alternative approach or verify the UI state first.`
-      : "";
-
-  const systemPrompt = buildAutomationSystemPrompt({ deviceState: device_state, memory }) + retryHint;
-
-  let messages = [
-    { role: "system", content: systemPrompt },
-    ...trimHistoryByChars(history, 10, 3500),
-    { role: "user", content: truncateText(goal, 3000) },
-  ];
-
-  const executedServerTools = [];
-  const pendingAndroidActions = [];
-  const failedTools = {}; // { toolName: { attempts, last_error } }
-
-  try {
-    for (let step = 0; step < Math.max(1, Math.min(max_steps, 8)); step++) {
-      const out = await groqChat({
-        model: pickModel({ mode }),
-        messages,
-        tools: AGENT_TOOLS,
-        tool_choice: "auto",
-        max_tokens: 1200,
-      });
-
-      const msg = out.choices[0].message;
-      const toolCalls = extractToolCalls(msg);
-
-      if (!toolCalls.length) {
-        return res.json({
-          done: pendingAndroidActions.length === 0,
-          assistant_text: msg.content || "",
-          pending_android_actions: pendingAndroidActions,
-          server_tool_results: executedServerTools,
-          failed_tools: failedTools,
-          retry_state: Object.keys(failedTools).length
-            ? { tool: Object.keys(failedTools).at(-1), ...Object.values(failedTools).at(-1) }
-            : null,
-          model_used: pickModel({ mode }),
-        });
-      }
-
-      messages.push({
-        role: "assistant",
-        content: msg.content || "",
-        tool_calls: msg.tool_calls,
-      });
-
-      for (const tc of toolCalls) {
-        const toolName = tc.function.name;
-        const args = tc.function.arguments || {};
-
-        if (isServerSideTool(toolName)) {
-          try {
-            const result = await runLocalTool(toolName, args);
-            executedServerTools.push({ tool: toolName, arguments: args, result });
-            messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(result) });
-          } catch (toolErr) {
-            // Track the failure
-            if (!failedTools[toolName]) failedTools[toolName] = { attempts: 0, last_error: "" };
-            failedTools[toolName].attempts++;
-            failedTools[toolName].last_error = toolErr.message;
-
-            const errResult = { ok: false, error: toolErr.message };
-            executedServerTools.push({ tool: toolName, arguments: args, result: errResult });
-            messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(errResult) });
-          }
-        } else {
-          // Android tool — register a Promise, Android app must call /automation-results
-          const callId = tc.id;
-          const deviceResult = await new Promise((resolve) => {
-            const timeout = setTimeout(() => {
-              pendingActions.delete(callId);
-              resolve({ status: "timeout", observation: "Device did not respond in 45s." });
-            }, 45000);
-
-            pendingActions.set(callId, {
-              resolve: (val) => { clearTimeout(timeout); resolve(val); },
-              tool: toolName,
-              arguments: args,
-            });
-          });
-
-          pendingAndroidActions.push({
-            id: callId,
-            tool: toolName,
-            arguments: args,
-            device_result: deviceResult,
-          });
-
-          messages.push({
-            role: "tool",
-            tool_call_id: callId,
-            content: JSON.stringify(deviceResult),
-          });
-        }
-      }
-    }
-
-    return res.json({
-      done: false,
-      assistant_text:
-        "Android actions required. Execute returned actions on device, then send updated device_state and history back to continue.",
-      pending_android_actions: pendingAndroidActions,
-      server_tool_results: executedServerTools,
-      failed_tools: failedTools,
-      retry_state: Object.keys(failedTools).length
-        ? { tool: Object.keys(failedTools).at(-1), ...Object.values(failedTools).at(-1) }
-        : null,
-      model_used: pickModel({ mode }),
-    });
-  } catch (err) {
-    console.error("[/automate]", err.message);
-    res.status(500).json({ error: "Automation failed", details: err.message });
-  }
-});
-
-/* ──────────────────────────────────────────────────────────────
-   MARKET ROUTES
-────────────────────────────────────────────────────────────── */
+// ==================== MARKET ROUTES ====================
 app.get("/market/quote", async (req, res) => {
   try {
     const symbol = String(req.query.symbol || "BTCUSD").toUpperCase();
@@ -2327,25 +2976,17 @@ app.get("/market/quote", async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────────
-   TRADE ENDPOINT — server calculates lot size, AI never does
-────────────────────────────────────────────────────────────── */
+// ==================== TRADE ENDPOINT ====================
 app.post("/trade", requireAuth, async (req, res) => {
-  const {
-    symbol,
-    action,           // "buy" or "sell"
-    risk_percent = 1, // AI sends this, never lot size
-    balance,          // pulled from MT5 bridge or passed by client
-    reason = "",      // AI must explain why it's entering
-    interval = "1h",
-  } = req.body || {};
+  const { symbol, action, risk_percent = 1, balance, reason = "", interval = "1h" } = req.body || {};
 
   if (!symbol || !action) return res.status(400).json({ error: "symbol and action required" });
-  if (!["buy", "sell"].includes(action)) return res.status(400).json({ error: "action must be buy or sell" });
-  if (!reason) return res.status(400).json({ error: "reason field required — AI must justify the trade" });
+  if (!["buy", "sell"].includes(action))
+    return res.status(400).json({ error: "action must be buy or sell" });
+  if (!reason)
+    return res.status(400).json({ error: "reason field required — AI must justify the trade" });
 
   try {
-    // Re-run analysis to get fresh entry/SL/TP
     const analysis = await analyzeSymbol(symbol, interval);
 
     if (analysis.news_filter?.blocked) {
@@ -2358,8 +2999,7 @@ app.post("/trade", requireAuth, async (req, res) => {
 
     if (!sl) return res.status(400).json({ error: "Could not determine stop loss from analysis" });
 
-    // Server calculates lot size — AI never touches this
-    const accountBalance = balance || 1000; // client should always send real balance
+    const accountBalance = balance || 1000;
     const lotSize = calculateLotSize({
       symbol,
       balance: accountBalance,
@@ -2368,7 +3008,6 @@ app.post("/trade", requireAuth, async (req, res) => {
       stopLoss: sl,
     });
 
-    // Send to MT5 bridge (paper mode if URL not set)
     const tradeResult = await sendToMT5Bridge({
       symbol: symbol.toUpperCase(),
       action,
@@ -2379,7 +3018,6 @@ app.post("/trade", requireAuth, async (req, res) => {
       reason,
     });
 
-    // Log to trade memory automatically
     addTradeMemory(symbol, {
       direction: action,
       pattern: analysis.patterns?.join(",") || "none",
@@ -2408,6 +3046,19 @@ app.post("/trade", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/memory/trade", requireAuth, (req, res) => {
+  const { symbol, outcome, pattern, direction, note } = req.body || {};
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  addTradeMemory(symbol, { outcome, pattern, direction, note });
+  res.json({ ok: true, memory_count: tradeMemory.get(symbol.toUpperCase())?.length });
+});
+
+app.get("/memory/trade", requireAuth, (req, res) => {
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  res.json({ symbol, entries: getTradeMemory(symbol) });
+});
+
 app.post("/market/batch", async (req, res) => {
   try {
     const { symbols = [] } = req.body || {};
@@ -2427,14 +3078,16 @@ app.all("/market/analyze", requireAuth, async (req, res) => {
     const body = req.body || {};
     const query = req.query || {};
 
-    const symbolRaw = req.method === "GET" ? query.symbol : (body.symbol ?? query.symbol);
+    const symbolRaw = req.method === "GET" ? query.symbol : body.symbol ?? query.symbol;
     if (!symbolRaw) {
       return res.status(400).json({ error: "Symbol is required" });
     }
 
     const symbol = String(symbolRaw).toUpperCase();
-    const interval = normalizeInterval(req.method === "GET" ? query.interval : (body.interval ?? query.interval ?? "1h"));
-    const outputsizeRaw = req.method === "GET" ? query.outputsize : (body.outputsize ?? query.outputsize);
+    const interval = normalizeInterval(
+      req.method === "GET" ? query.interval : body.interval ?? query.interval ?? "1h"
+    );
+    const outputsizeRaw = req.method === "GET" ? query.outputsize : body.outputsize ?? query.outputsize;
     const outputsize = outputsizeRaw ? Number(outputsizeRaw) : null;
 
     const data = await analyzeSymbol(symbol, interval, outputsize);
@@ -2445,9 +3098,7 @@ app.all("/market/analyze", requireAuth, async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────────
-   WEATHER ROUTE
-────────────────────────────────────────────────────────────── */
+// ==================== WEATHER ====================
 app.get("/weather", async (req, res) => {
   try {
     const city = String(req.query.city || "Lagos");
@@ -2458,9 +3109,7 @@ app.get("/weather", async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────────
-   TRANSCRIBE
-────────────────────────────────────────────────────────────── */
+// ==================== TRANSCRIBE ====================
 app.post("/transcribe", async (req, res) => {
   try {
     const { audio_base64, mime_type = "audio/webm" } = req.body || {};
@@ -2508,9 +3157,7 @@ app.post("/transcribe", async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────────
-   ERROR FALLBACK
-────────────────────────────────────────────────────────────── */
+// ==================== ERROR FALLBACK ====================
 app.use((err, _req, res, _next) => {
   console.error("[Unhandled Error]", err);
   res.status(500).json({
@@ -2519,9 +3166,29 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-/* ──────────────────────────────────────────────────────────────
-   START
-────────────────────────────────────────────────────────────── */
+// ==================== START ====================
 app.listen(PORT, () => {
-  console.log(`FRIT advanced server listening on :${PORT}`);
+  console.log(`
+╔══════════════════════════════════════════════════════════════════╗
+║                    🤖 FRIT Advanced AI Server                    ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Port: ${String(PORT).padEnd(55)}║
+║  Models:                                                          ║
+║    Vision: ${MODELS.vision.slice(0, 45).padEnd(45)}║
+║    Agent:  ${MODELS.agent.padEnd(50)}║
+║    Fast:   ${MODELS.fast.padEnd(50)}║
+║                                                                   ║
+║  Features:                                                        ║
+║    ✅ Voice/Wake Word System (Siri-like)                          ║
+║    ✅ Screen Casting (Electron-style)                             ║
+║    ✅ Agentic State Machine                                        ║
+║    ✅ Task Queue & Recovery                                        ║
+║    ✅ Market Analysis Engine                                       ║
+║    ✅ Trading System                                               ║
+║    ✅ Technical Indicators (RSI, MACD, EMA, etc.)                  ║
+║    ✅ News Filter                                                  ║
+║    ✅ MT5 Bridge                                                   ║
+║    ✅ 40+ Android Automation Tools                                 ║
+╚══════════════════════════════════════════════════════════════════╝
+  `);
 });
