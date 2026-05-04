@@ -8,9 +8,10 @@ import FormData from "form-data";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { FritSystems } from "./frit_systems.js"; // STEP 1: Added import
+import { FritSystems } from "./frit_systems.js";
+import { FcsClient } from "./fcs_client.js";
+import { DataBudgetManager } from "./data_budget_manager.js";
 dotenv.config();
-
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,6 +19,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ==================== ENVIRONMENT ====================
 const GROQ_API_KEY    = process.env.GROQ_API_KEY;
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
+const FCS_API_KEY     = process.env.FCS_API_KEY || "";
 const SANDBOX_URL     = process.env.SANDBOX_URL || "https://sandbox-production-839a.up.railway.app";
 const AUTH_TOKEN      = process.env.AUTH_TOKEN || "";
 const MT5_BRIDGE_URL  = process.env.MT5_BRIDGE_URL || "";
@@ -827,10 +829,20 @@ function gsriLotScale(riskScore) {
 }
 
 // ==================== ENHANCED SYSTEMS (STEP 2) ====================
+const fcs = FCS_API_KEY ? new FcsClient(FCS_API_KEY, { requestDelay: 6000 }) : null;
+const budget = new DataBudgetManager({
+  fcs_daily: 80,
+  td_daily: 400,
+  symbolPool: ["EURUSD","GBPUSD","USDJPY","AUDUSD","XAUUSD","BTCUSD","ETHUSD","SOLUSD"]
+});
+
 const frit = new FritSystems({
   fetchCandles, calcEMA, analyzeSymbol, cacheGet, cacheSet,
   checkNewsFilter, getGsriSnapshot, gsriLotScale, calculateLotSize,
   sendToMT5Bridge, addTradeMemory, getTradeMemory,
+  findSwings, calcBB,
+  fcsClient: fcs,
+  budgetManager: budget
 });
 
 if (process.env.AUTO_SCANNER === "true") {
@@ -1059,6 +1071,12 @@ const FRAME_BUFFER_SIZE = 10;
 app.get("/", (_req, res) => {
   res.json({ name: "FRIT LLM Orchestrator & Market Risk Engine", description: "AI brain for the FRIT Android app.", status: "online", endpoints: { core: ["/health", "/chat", "/automate", "/automation-results", "/plan"], market: ["/market/quote", "/market/batch", "/market/analyze", "/trade", "/gsri/status"], memory: ["/memory/trade"], screen: ["/screen/frame", "/screen/analyze-frame", "/screen/status"], transcribe: ["/transcribe"], utility: ["/weather"] } });
 });
+
+// ADD THIS NEW ROUTE ANYWHERE IN YOUR ROUTES SECTION:
+app.get("/systems/budget", requireAuth, (_req, res) => {
+  res.json(frit.budget?.getStatus() || { error: "Budget manager not initialized" });
+});
+
 app.get("/health", (_req, res) => {
   res.json({ status: "active", models: MODELS, twelve_data: !!TWELVE_DATA_KEY, mt5_bridge: !!MT5_BRIDGE_URL, sandbox_url: SANDBOX_URL, pending_android_callbacks: pendingAndroidCallbacks.size, frame_buffer: frameBuffer.length, cache_entries: _cache.size, uptime: Math.floor(process.uptime()) + "s" });
 });
