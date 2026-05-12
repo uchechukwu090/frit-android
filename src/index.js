@@ -680,10 +680,13 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const auctionSig = auctionSignal(price, auction);
   const score      = scoreSetup({ structure, volatility, rsi, macd, macdSig, hist, price, support, resistance, patterns, auctionSig, auction, mtf });
   let direction = "NEUTRAL";
-  if (rsi >= 70)               direction = "OVERBOUGHT";
-  else if (rsi <= 30)          direction = "OVERSOLD";
-  else if (score.bias === "bullish") direction = "BULLISH";
-  else if (score.bias === "bearish") direction = "BEARISH";
+  // NEW (fixed):
+  if (rsi >= 70 && score.bias === "bearish")      direction = "BEARISH"; // Overbought = sell
+  else if (rsi >= 70)                              direction = "OVERBOUGHT"; // Overbought but no bearish bias = caution
+  else if (rsi <= 30 && score.bias === "bullish")  direction = "BULLISH"; // Oversold = buy
+  else if (rsi <= 30)                              direction = "OVERSOLD"; // Oversold but no bullish bias = caution
+  else if (score.bias === "bullish")               direction = "BULLISH";
+  else if (score.bias === "bearish")               direction = "BEARISH";
   let strength = "WEAK";
   if (score.confidence >= 75) strength = "STRONG";
   else if (score.confidence >= 60) strength = "MODERATE";
