@@ -200,7 +200,7 @@ class CrashGSRIEngine {
     const T = returnsArrays[0].length;
     const means = returnsArrays.map(r => r.reduce((a, b) => a + b, 0) / T);
     const cov = [];
-    for (let i = 0; i < N; i++) { cov[i] = []; for (let j = 0; j < N; j++) { let sum = 0; for (let t = 0; t < T; t++) sum += (returnsArrays[i][t] - means[i]) * (returnsArrays[j][t] - means[j]); cov[i][j] = sum / (T - 1); } }
+    for (let i = 0; i < N; i++) { cov[i] = []; for (let j = 0; j < N; j++) { let sum = 0; for (let t = 0; t < T; t++) sum += (returnsArrays[i][t] - means[i]) * (returnsArrays[j][t] - means[j]); cov[i][j] = sum / T; } }
     return cov;
   }
   eigenvaluesSymmetric(matrix) {
@@ -238,7 +238,7 @@ class CrashGSRIEngine {
     const K = lambda1 / N;
     let tau = 0;
     if (this.history.length > 0) { const prevK = this.history[this.history.length - 1].K; tau = (K - prevK) / (Math.abs(prevK) + 1e-8); }
-    this.history.push({ K, concentration, normEntropy, tau, timestamp: Date.now() });
+    this.history.push({ K, concentration, norm_entropy: normEntropy, tau, timestamp: Date.now() });
     if (this.history.length > this.maxHistory) this.history.shift();
     let riskScore = 0;
     if (this.history.length > 10) {
@@ -273,10 +273,10 @@ class CrashGSRIEngine {
     const allCandles = {};
     await Promise.all(allSymbols.map(async sym => { try { const candles = await fetchCandlesFn(sym, "1h", 72); if (candles && candles.length >= 30) allCandles[sym] = candles; } catch (e) {} }));
     const availableSymbols = Object.keys(allCandles);
-    if (availableSymbols.length < 3) return { phase: "insufficient_data", risk_score: 0.5, concentration: 0, norm_entropy: 1, tau: 0, magnitude: 0, assets_analyzed: availableSymbols.length, timestamp: now, error: "Not enough assets" };
+    if (availableSymbols.length < 3) return { phase: "insufficient_data", risk_score: 0.5, concentration: 0, norm_entropy: 1, tau: 0, magnitude: 0, assets_analyzed: availableSymbols.length, timestamp: now };
     const lengths = availableSymbols.map(s => allCandles[s].length);
     const minLen = Math.min(...lengths);
-    const returnsArrays = availableSymbols.map(sym => { const candles = allCandles[sym]; const returns = []; for (let i = 1; i < minLen; i++) { const prev = candles[i - 1].close; const curr = candles[i].close; if (prev > 0) returns.push((curr - prev) / prev); } return returns; });
+    const returnsArrays = availableSymbols.map(sym => { const candles = allCandles[sym]; const returns = []; for (let i = 1; i < minLen; i++) { const prev = candles[i - 1].close; const curr = candles[i].close; returns.push((curr - prev) / prev); } return returns; });
     const returnLen = Math.min(...returnsArrays.map(r => r.length));
     const alignedReturns = returnsArrays.map(r => r.slice(-returnLen));
     const metrics = this.computeCrashMetrics(alignedReturns);
@@ -292,10 +292,10 @@ class CrashGSRIEngine {
         for (const [sym, analysis] of Object.entries(analysisResults)) {
           if (!analysis || analysis.error) continue;
           if (analysis.direction === "BULLISH" || analysis.direction === "NEUTRAL") {
-            signals.push({ type: "crash_short", symbol: sym, direction: "SELL", confidence: Math.round(crashMetrics.risk_score * 80), magnitude_estimate: `${(crashMetrics.magnitude * 100).toFixed(1)}%`, action: "ENTER_SHORT", reason: `Crash trigger — ${sym} elevated` });
+            signals.push({ type: "crash_short", symbol: sym, direction: "SELL", confidence: Math.round(crashMetrics.risk_score * 80), magnitude_estimate: `${(crashMetrics.magnitude * 100).toFixed(2)}%` });
           }
         }
-        if (signals.length === 0) signals.push({ type: "crash_short_basket", direction: "SELL", confidence: Math.round(crashMetrics.risk_score * 70), magnitude_estimate: `${(crashMetrics.magnitude * 100).toFixed(1)}%`, action: "ENTER_SHORT", reason: "Crash trigger — basket short" });
+        if (signals.length === 0) signals.push({ type: "crash_short_basket", direction: "SELL", confidence: Math.round(crashMetrics.risk_score * 70), magnitude_estimate: `${(crashMetrics.magnitude * 100).toFixed(2)}%` });
         break;
       case "crash": signals.push({ type: "crash_active", message: "Crash in progress — hold shorts", action: "HOLD_SHORT", confidence: Math.round(crashMetrics.risk_score * 60) }); break;
       case "recovery": signals.push({ type: "crash_recovery", message: "Crash recovery — exit shorts", action: "CLOSE_SHORTS", confidence: 65 }); break;
@@ -344,10 +344,10 @@ class EMAScanner {
     const crossBullish = Object.entries(crossovers).filter(([s, r]) => r.cross === "bullish_cross");
     const crossBearish = Object.entries(crossovers).filter(([s, r]) => r.cross === "bearish_cross");
     let trigger = null;
-    if (crossBullish.filter(([s]) => this.watchlist.forex.includes(s)).length >= 2) trigger = { direction: "bullish", type: "forex_crossover_confirmation", pairs: crossBullish.map(([s]) => s), confidence: Math.min(95, 55 + crossBullish.length * 10) };
-    if (crossBearish.filter(([s]) => this.watchlist.forex.includes(s)).length >= 2) trigger = { direction: "bearish", type: "forex_crossover_confirmation", pairs: crossBearish.map(([s]) => s), confidence: Math.min(95, 55 + crossBearish.length * 10) };
+    if (crossBullish.filter(([s]) => this.watchlist.forex.includes(s)).length >= 2) trigger = { direction: "bullish", type: "forex_crossover_confirmation", pairs: crossBullish.map(([s]) => s), confidence: 75 };
+    if (crossBearish.filter(([s]) => this.watchlist.forex.includes(s)).length >= 2) trigger = { direction: "bearish", type: "forex_crossover_confirmation", pairs: crossBearish.map(([s]) => s), confidence: 75 };
     const cryptoCrosses = [...crossBullish, ...crossBearish].filter(([s]) => this.watchlist.crypto.includes(s));
-    if (cryptoCrosses.length >= 2 && !trigger) trigger = { direction: cryptoCrosses[0][1].cross === "bullish_cross" ? "bullish" : "bearish", type: "crypto_crossover_confirmation", pairs: cryptoCrosses.map(([s]) => s), confidence: Math.min(90, 50 + cryptoCrosses.length * 12) };
+    if (cryptoCrosses.length >= 2 && !trigger) trigger = { direction: cryptoCrosses[0][1].cross === "bullish_cross" ? "bullish" : "bearish", type: "crypto_crossover_confirmation", pairs: cryptoCrosses.map(([s]) => s), confidence: 60 };
     let triggerScore = 0;
     if (Object.keys(crossovers).length > 0) triggerScore += 2;
     if (trigger) triggerScore += 2;
@@ -431,7 +431,7 @@ class PaperTradeLogger {
     const sym = String(trade.symbol || "UNKNOWN").toUpperCase();
     if (!this.trades.has(sym)) this.trades.set(sym, []);
     const entries = this.trades.get(sym);
-    const entry = { id: `${sym}_${Date.now()}`, symbol: sym, direction: trade.direction, entry: trade.entry, sl: trade.sl, tp: trade.tp, confidence: trade.confidence, lot_size: trade.lot_size, source: trade.source || "scanner", acp_confidence: trade.acp_confidence || null, crash_phase: trade.crash_phase || null, timestamp: Date.now(), outcome: "pending", closed_at: null, close_price: null, pnl_pips: null };
+    const entry = { id: `${sym}_${Date.now()}`, symbol: sym, direction: trade.direction, entry: trade.entry, sl: trade.sl, tp: trade.tp, confidence: trade.confidence, lot_size: trade.lot_size, source: trade.source, outcome: "pending", opened_at: Date.now() };
     entries.push(entry);
     if (entries.length > this.maxPerSymbol) entries.shift();
     return entry;
@@ -451,7 +451,7 @@ class PaperTradeLogger {
   getStats(symbol) {
     const entries = this.trades.get(String(symbol || "").toUpperCase()) || [];
     const resolved = entries.filter(e => e.outcome !== "pending");
-    return { total: entries.length, resolved: resolved.length, wins: resolved.filter(e => e.outcome === "win").length, losses: resolved.filter(e => e.outcome === "loss").length, breakeven: resolved.filter(e => e.outcome === "breakeven").length, win_rate: resolved.length > 0 ? resolved.filter(e => e.outcome === "win").length / resolved.length : 0, pending: entries.filter(e => e.outcome === "pending").length };
+    return { total: entries.length, resolved: resolved.length, wins: resolved.filter(e => e.outcome === "win").length, losses: resolved.filter(e => e.outcome === "loss").length, breakeven: resolved.filter(e => e.outcome === "breakeven").length };
   }
   getPendingTrades() { const pending = []; for (const [, entries] of this.trades.entries()) for (const e of entries) if (e.outcome === "pending") pending.push(e); return pending; }
   autoResolve(currentPrices) {
@@ -511,7 +511,7 @@ class EnhancedDecisionPipeline {
   async run(symbol, interval = "1h", options = {}) {
     const sym = String(symbol).toUpperCase();
     const startTime = Date.now();
-    if (this.scanner.isInCooldown(sym)) return { decision: "COOLDOWN", symbol: sym, reason: `Cooldown active`, cooldown_remaining_ms: this.scanner.cooldownMs - (Date.now() - (this.scanner.lastTrigger.get(sym) || 0)) };
+    if (this.scanner.isInCooldown(sym)) return { decision: "COOLDOWN", symbol: sym, reason: `Cooldown active`, cooldown_remaining_ms: this.scanner.cooldownMs - (Date.now() - (this.scanner.lastTrigger.get(sym) || Date.now())) };
 
     const crashMetrics = await this.crashGSRI.compute(this.fetchCandles);
     const crashSignals = this.crashGSRI.getCrashSignals(crashMetrics);
@@ -525,8 +525,8 @@ class EnhancedDecisionPipeline {
         const price = analysis.price; const atr = analysis.volatility?.atr || price * 0.01;
         const entry = price; const sl = price + atr * 1.5; const tp = price - atr * 2.5;
         const lotSize = this.calculateLotSize ? this.calculateLotSize({ symbol: sym, balance: 1000, riskPercent: 1, entry, stopLoss: sl }) : 0.01;
-        const decision = { decision: "SELL", source: "crash_gsri", symbol: sym, confidence: Math.round(crashMetrics.risk_score * 80), entry, sl: sl.toFixed(5), tp: tp.toFixed(5), lot_size: lotSize, crash_phase: crashMetrics.phase, crash_magnitude: crashMetrics.magnitude, acp: acpResult.acp, acp_bands: acpResult.bands, analysis, pipeline: "crash_gsri_pipeline", timestamp: Date.now(), elapsed_ms: Date.now() - startTime };
-        this.paperLogger.log({ symbol: sym, direction: "SELL", entry, sl, tp, confidence: decision.confidence, lot_size: lotSize, source: "crash_gsri", acp_confidence: acpResult.acp.confidence, crash_phase: crashMetrics.phase });
+        const decision = { decision: "SELL", source: "crash_gsri", symbol: sym, confidence: Math.round(crashMetrics.risk_score * 80), entry, sl: sl.toFixed(5), tp: tp.toFixed(5), lot_size: lotSize, crash_phase: crashMetrics.phase, risk_score: crashMetrics.risk_score };
+        this.paperLogger.log({ symbol: sym, direction: "SELL", entry, sl, tp, confidence: decision.confidence, lot_size: lotSize, source: "crash_gsri", acp_confidence: acpResult.acp.confidence, crash_metrics: crashMetrics });
         this.pipelineHistory.push(decision); if (this.pipelineHistory.length > this.maxHistory) this.pipelineHistory.shift();
         this.scanner.markTriggered(sym); return decision;
       }
@@ -537,7 +537,7 @@ class EnhancedDecisionPipeline {
 
     const analysis = await this.analyzeSymbol(sym, interval);
     if (!analysis || analysis.error || analysis.direction === "NEUTRAL") return { decision: "NO_TRADE", symbol: sym, reason: analysis?.error || "No clear edge", analysis };
-    if ((crashMetrics.phase === "crash" || crashMetrics.phase === "trigger") && analysis.direction === "BULLISH") return { decision: "NO_TRADE", symbol: sym, reason: `Long blocked during crash ${crashMetrics.phase}`, crash_phase: crashMetrics.phase, analysis };
+    if ((crashMetrics.phase === "crash" || crashMetrics.phase === "trigger") && analysis.direction === "BULLISH") return { decision: "NO_TRADE", symbol: sym, reason: `Long blocked during crash ${crashMetrics.phase}` };
 
     // FIX #5: Entry Quality Gate
     const direction = analysis.direction === "BULLISH" ? "BUY" : "SELL";
@@ -577,7 +577,7 @@ class EnhancedDecisionPipeline {
     } catch (e) { gsriMode = "normal"; }
 
     if (gsriMode === "blocked" && crashMetrics.phase !== "trigger") return { decision: "NO_TRADE", symbol: sym, reason: "GSRI high risk", gsri_mode: gsriMode };
-    if (finalConfidence < 30) return { decision: "NO_TRADE", symbol: sym, reason: `Confidence too low (${finalConfidence}%)`, engine_confidence: engineConfidence, acp_confidence: Math.round(acpConfidence * 100), acp: acpResult.acp };
+    if (finalConfidence < 30) return { decision: "NO_TRADE", symbol: sym, reason: `Confidence too low (${finalConfidence}%)`, engine_confidence: engineConfidence, acp_confidence: Math.round(acpConfidence * 100) };
 
     const price = analysis.price;
     const entry = parseFloat(analysis.trade_plan?.entry_zone?.split("-")[0]) || price;
@@ -585,10 +585,10 @@ class EnhancedDecisionPipeline {
     const tp = parseFloat(adjustedTP) || 0;
     const lotSize = this.calculateLotSize ? this.calculateLotSize({ symbol: sym, balance: options.balance || 1000, riskPercent: options.riskPercent || 1, entry, stopLoss: sl }) * gsriScale : 0.01;
 
-    const decision = { decision: direction, source: "enhanced_pipeline", symbol: sym, confidence: finalConfidence, entry, sl: sl.toFixed(5), tp: tp.toFixed(5), lot_size: Math.round(lotSize * 100) / 100, acp: acpResult.acp, acp_bands: acpResult.bands, acp_band_note: bandNote, crash_phase: crashMetrics.phase, crash_risk_score: crashMetrics.risk_score, gsri_mode: gsriMode, gsri_scale: gsriScale, engine_confidence: engineConfidence, direction_raw: analysis.direction, strength: analysis.strength, analysis, pipeline: "full_pipeline", timestamp: Date.now(), elapsed_ms: Date.now() - startTime };
+    const decision = { decision: direction, source: "enhanced_pipeline", symbol: sym, confidence: finalConfidence, entry, sl: sl.toFixed(5), tp: tp.toFixed(5), lot_size: Math.round(lotSize * 100) / 100, band_note: bandNote, gsri_mode: gsriMode };
 
-    this.paperLogger.log({ symbol: sym, direction, entry, sl, tp, confidence: finalConfidence, lot_size: Math.round(lotSize * 100) / 100, source: "enhanced_pipeline", acp_confidence: acpConfidence, crash_phase: crashMetrics.phase });
-    if (this.addTradeMemory) this.addTradeMemory(sym, { direction, pattern: analysis.patterns?.join(", ") || "none", outcome: "pending", note: `Pipeline: conf=${finalConfidence} acp_p=${acpResult.acp.p.toFixed(3)} acp_c=${acpResult.acp.c.toFixed(3)} crash=${crashMetrics.phase}` });
+    this.paperLogger.log({ symbol: sym, direction, entry, sl, tp, confidence: finalConfidence, lot_size: Math.round(lotSize * 100) / 100, source: "enhanced_pipeline", acp_confidence: acpConfidence, crash_metrics: crashMetrics });
+    if (this.addTradeMemory) this.addTradeMemory(sym, { direction, pattern: analysis.patterns?.join(", ") || "none", outcome: "pending", note: `Pipeline: conf=${finalConfidence} acp_p=${acpResult.acp.p.toFixed(3)}` });
     this.scanner.markTriggered(sym);
     this.pipelineHistory.push(decision); if (this.pipelineHistory.length > this.maxHistory) this.pipelineHistory.shift();
     return decision;
