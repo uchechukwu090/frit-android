@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
@@ -50,7 +50,6 @@ app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // ==================== MODELS (Mistral AI) ====================
-// Mistral models: https://docs.mistral.ai/getting-started/models/
 const MODELS = {
   vision:       process.env.MISTRAL_VISION_MODEL       || "pixtral-large-latest",
   agent:        process.env.MISTRAL_MODEL               || "mistral-medium-latest",
@@ -146,13 +145,12 @@ const MISTRAL_BASE = "https://api.mistral.ai/v1";
 async function mistralChat({ model, messages, tools = null, temperature = 0.3, max_tokens = 1600, tool_choice = "auto", retries = 3 }) {
   const body = { model, messages, temperature, max_tokens: Math.min(max_tokens, 32000) };
   if (tools?.length) {
-    // Mistral uses a slightly different tool format — convert from OpenAI format
     body.tools = tools.map(t => ({
       type: "function",
-      function: {
-        name: t.function.name,
-        description: t.function.description || "",
-        parameters: t.function.parameters || {},
+      "function": {
+        name: t["function"].name,
+        description: t["function"].description || "",
+        parameters: t["function"].parameters || {},
       },
     }));
     body.tool_choice = tool_choice;
@@ -180,7 +178,7 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
   throw lastError || new Error("Mistral API failed after retries");
 }
 
-// STT via Mistral Voxtral (replaces Groq Whisper — single ecosystem)
+// STT via Mistral Voxtral
 async function mistralTranscribe(audioBase64) {
   try {
     const base64Data = audioBase64.includes(",") ? audioBase64.split(",")[1] : audioBase64;
@@ -201,7 +199,6 @@ async function mistralTranscribe(audioBase64) {
     return data?.choices?.[0]?.message?.content?.trim() || "";
   } catch (e) {
     console.warn("[MistralTranscribe] Error:", e.message);
-    // Fallback to Groq Whisper if available
     if (process.env.GROQ_API_KEY) {
       try {
         const form = new FormData();
@@ -224,17 +221,16 @@ function extractToolCalls(msg) {
   return (msg?.tool_calls || []).map(tc => ({
     id:       tc.id,
     type:     tc.type,
-    function: {
-      name:          tc.function?.name,
-      arguments:     safeJsonParse(tc.function?.arguments || "{}", {}),
-      raw_arguments: tc.function?.arguments || "{}",
+    "function": {
+      name:          tc["function"]?.name,
+      arguments:     safeJsonParse(tc["function"]?.arguments || "{}", {}),
+      raw_arguments: tc["function"]?.arguments || "{}",
     },
   }));
 }
 
 // ==================== SANDBOX ====================
 async function runSandbox(args = {}) {
-  // Try local sandbox.js first (port 8790)
   try {
     const localRes = await fetch(`http://127.0.0.1:8790/sandbox/run`, {
       method: "POST",
@@ -246,8 +242,7 @@ async function runSandbox(args = {}) {
       const data = await localRes.json();
       return data;
     }
-  } catch (_) { /* local sandbox not running, fall back to remote */ }
-  // Fall back to remote sandbox
+  } catch (_) {}
   const res  = await fetch(`${SANDBOX_URL}/sandbox/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -543,7 +538,6 @@ function scoreSetup({ structure, price, support, resistance, patterns, auction, 
   let bull = 0, bear = 0;
   const atr = volatility?.atr || 1;
 
-  // ===== MARKET STRUCTURE (no indicators — pure price action) =====
   if (smcCrt?.structure) {
     const st = smcCrt.structure;
     if (st.trend === "uptrend")               { bull += 4; bear -= 1; }
@@ -552,65 +546,53 @@ function scoreSetup({ structure, price, support, resistance, patterns, auction, 
     else if (st.trend === "potential_reversal_down")  { bear += 2; }
   }
 
-  // ===== SMC+CRT SIGNAL (merged strategy) =====
   if (smcCrt) {
     const isBuy  = smcCrt.signal === "buy";
     const isSell = smcCrt.signal === "sell";
 
-    // Core signal weight (confidence-based)
     if (isBuy)  bull += Math.round(smcCrt.confidence / 8);
     if (isSell) bear += Math.round(smcCrt.confidence / 8);
 
-    // Entry found — significant
     if (smcCrt.entry) {
       if (isBuy)  { bull += 3; bear -= 1; }
       if (isSell) { bear += 3; bull -= 1; }
     }
 
-    // Order blocks present
     if (smcCrt.order_blocks?.bullish?.length > 0) bull += 1;
     if (smcCrt.order_blocks?.bearish?.length > 0) bear += 1;
 
-    // FVG present
     if (smcCrt.fvgs?.bullish?.length > 0)  bull += 1;
     if (smcCrt.fvgs?.bearish?.length > 0)  bear += 1;
 
-    // CHoCH (trend reversal signal)
     if (smcCrt.choch?.direction === "bullish") { bull += 3; if (isSell) bear -= 2; }
     if (smcCrt.choch?.direction === "bearish") { bear += 3; if (isBuy)  bull -= 2; }
 
-    // Liquidity sweeps
     const hasBullSweep = smcCrt.sweeps?.some(s => s.type === "bullish_sweep");
     const hasBearSweep = smcCrt.sweeps?.some(s => s.type === "bearish_sweep");
     if (hasBullSweep && isBuy)  bull += 2;
     if (hasBearSweep && isSell) bear += 2;
-    if (hasBullSweep && isSell) bear += 1; // sweep can add bearish pressure too
+    if (hasBullSweep && isSell) bear += 1;
     if (hasBearSweep && isBuy)  bull += 1;
 
-    // CRT premium (Candle Range Theory setup is high-conviction)
     if (smcCrt.crt) {
       if (isBuy)  { bull += 3; bear -= 2; }
       if (isSell) { bear += 3; bull -= 2; }
     }
   }
 
-  // ===== VOLUME PROFILE (POC / VAH / VAL — institutional footprint) =====
   if (auction && auctionSig) {
     if (auctionSig.bias === "bullish")      { bull += 3; bear -= 1; }
     else if (auctionSig.bias === "bearish") { bear += 3; bull -= 1; }
     else if (auctionSig.bias === "mild_bullish") bull += 1;
     else if (auctionSig.bias === "mild_bearish") bear += 1;
-    // POC proximity
     if (auction.poc && Math.abs(price - auction.poc) / ((auction.vah - auction.val) || 1) < 0.1) {
-      bull += 1; bear += 1; // equilibrium zone — both sides possible
+      bull += 1; bear += 1;
     }
   }
 
-  // ===== SUPPORT / RESISTANCE PROXIMITY =====
   if (price > support && (price - support) / (price || 1) < 0.003) bull += 2;
   if (price < resistance && (resistance - price) / (price || 1) < 0.003) bear += 2;
 
-  // ===== CANDLE PATTERNS AT KEY LEVELS =====
   const levels = [support, resistance];
   if (auction) levels.push(auction.poc, auction.vah, auction.val);
   const nearLevel = (p) => levels.some(lvl => lvl && Math.abs(p - lvl) <= atr * 0.5);
@@ -620,10 +602,8 @@ function scoreSetup({ structure, price, support, resistance, patterns, auction, 
     if (patterns.includes("indecision")) { bull -= 0.5; bear -= 0.5; }
   }
 
-  // ===== VOLATILITY CONTEXT =====
   if (volatility?.regime === "compressed") { bull -= 0.5; bear -= 0.5; }
 
-  // ===== MULTI-TIMEFRAME (4H bias) =====
   let mtfNote = "4H data unavailable";
   if (mtf) {
     if (mtf.trend === "up")   { bull += 2; bear -= 1; mtfNote = "4H trend UP — favors longs"; }
@@ -631,7 +611,6 @@ function scoreSetup({ structure, price, support, resistance, patterns, auction, 
     else mtfNote = "4H trend neutral";
   }
 
-  // ===== BIAS DETERMINATION =====
   let bias = "neutral";
   const diff = bull - bear;
   if (diff >= 2)  bias = "bullish";
@@ -705,7 +684,6 @@ async function getMTFBias(symbol) {
   try {
     const candles4h = await fetchCandles(sym, "4h", 100);
     if (!candles4h || candles4h.length < 50) return { trend: "neutral", structure: null };
-    // Use pure swing structure for MTF bias (no EMAs)
     const swings = findSwings(candles4h);
     const recentHighs = swings.highs.slice(-3);
     const recentLows  = swings.lows.slice(-3);
@@ -725,7 +703,7 @@ async function getMTFBias(symbol) {
   }
 }
 
-// ==================== MAIN ANALYSIS (SMC+CRT + Volume Profile) ====================
+// ==================== MAIN ANALYSIS ====================
 async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const sym    = String(symbol || "").toUpperCase();
   const iv     = normalizeInterval(interval);
@@ -745,7 +723,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const price = spot?.price ?? candles?.at(-1)?.close ?? 0;
   if (!candles || candles.length < 30) return { symbol: sym, price, source: spot?.source, analysis: "Insufficient candle data", candleCount: candles?.length ?? 0 };
 
-  // Pure SMC+CRT — no indicator calculations
   const { support, resistance } = calcSR(candles);
   const volatility = analyzeVolatility(candles, price);
   const patterns   = detectCandlePattern(candles);
@@ -763,7 +740,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const isCrypto  = CRYPTO_SET.has(sym);
   const dp        = isCrypto || sym === "XAUUSD" ? 2 : 5;
 
-  // Trade plan from SMC+CRT entry
   let trade_plan;
   const smcEntry = smcCrt?.entry;
   if (smcEntry) {
@@ -787,7 +763,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
     ? `No clear edge. ${smcReasons} ${auctionNote}`.trim()
     : `${direction} (${strength}) | ${smcReasons} | ${auctionNote}`.trim();
 
-  // SMC structure from the merged analysis
   const sc = smcCrt?.structure || {};
   const result = {
     symbol: sym, price, direction, strength, interval: iv, candleCount: candles.length, source: spot?.source ?? "binance",
@@ -973,7 +948,7 @@ function formatTradeMemoryForPrompt(symbol) {
   return `\nPast trade memory for ${symbol}:\n${lines.join("\n")}`;
 }
 
-// ==================== ENHANCED SYSTEMS (STEP 2) ====================
+// ==================== ENHANCED SYSTEMS ====================
 const frit = new FritSystems({
   fetchCandles, analyzeSymbol, cacheGet, cacheSet,
   checkNewsFilter, getGsriSnapshot, gsriLotScale, calculateLotSize,
@@ -988,52 +963,52 @@ if (process.env.AUTO_SCANNER === "true") {
 // ==================== ANDROID AGENT TOOLS ====================
 const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data", "analyze_market", "run_code", "wait_and_verify", "assert_text_visible"]);
 const AGENT_TOOLS = [
-  { type: "function", function: { name: "open_app", description: "Launch any installed app by name. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] } } },
-  { type: "function", function: { name: "open_url", description: "Open a full URL in the default browser.", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
-  { type: "function", function: { name: "press_back", description: "Press the Android back button. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "press_home", description: "Press the Android home button.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "open_recents", description: "Open the recent apps screen.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "open_notifications", description: "Open the notification shade.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_current_app", description: "Return the foreground package name and label.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_current_activity", description: "Return the current Android activity name.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "read_screen", description: "Read visible text and content descriptions from the screen.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "read_screen_structured", description: "Return a structured accessibility tree dump.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "find_element", description: "Find a UI element by text, hint, id, or class.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
-  { type: "function", function: { name: "take_screenshot", description: "Take a screenshot and return metadata.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "analyze_screenshot", description: "Analyze the last screenshot visually with the vision model.", parameters: { type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"] } } },
-  { type: "function", function: { name: "tap_button", description: "Tap an element by exact visible label. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
-  { type: "function", function: { name: "tap_coordinates", description: "Tap the screen at exact x/y coordinates. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
-  { type: "function", function: { name: "double_tap", description: "Double-tap by label or coordinates.", parameters: { type: "object", properties: { label: { type: "string" }, x: { type: "number" }, y: { type: "number" } } } } },
-  { type: "function", function: { name: "scroll", description: "Scroll the screen in a direction. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] } } } },
-  { type: "function", function: { name: "swipe", description: "Swipe using start and end coordinates. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { startX: { type: "number" }, startY: { type: "number" }, endX: { type: "number" }, endY: { type: "number" }, duration_ms: { type: "number" } }, required: ["startX", "startY", "endX", "endY"] } } },
-  { type: "function", function: { name: "drag_and_drop", description: "Drag from one coordinate to another.", parameters: { type: "object", properties: { startX: { type: "number" }, startY: { type: "number" }, endX: { type: "number" }, endY: { type: "number" }, duration_ms: { type: "number" } }, required: ["startX", "startY", "endX", "endY"] } } },
-  { type: "function", function: { name: "focus_field", description: "Focus a text field by label, hint, or content-desc.", parameters: { type: "object", properties: { field: { type: "string" } }, required: ["field"] } } },
-  { type: "function", function: { name: "type_text", description: "Type text into the focused or targeted field. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
-  { type: "function", function: { name: "clear_text", description: "Clear the focused or targeted input field.", parameters: { type: "object", properties: { field: { type: "string" } } } } },
-  { type: "function", function: { name: "paste_text", description: "Paste text via clipboard into a field.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
-  { type: "function", function: { name: "press_enter", description: "Press Enter / Done / Search on the keyboard.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "hide_keyboard", description: "Hide the soft keyboard.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "toggle_wifi", description: "Toggle Wi-Fi on or off.", parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] } } },
-  { type: "function", function: { name: "toggle_bluetooth", description: "Toggle Bluetooth on or off.", parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] } } },
-  { type: "function", function: { name: "set_volume", description: "Set media volume 0–100.", parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] } } },
-  { type: "function", function: { name: "set_brightness", description: "Set screen brightness 0–100.", parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] } } },
-  { type: "function", function: { name: "open_app_settings", description: "Open settings page for an app.", parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] } } },
-  { type: "function", function: { name: "grant_permission_if_prompted", description: "Handle Android permission prompts.", parameters: { type: "object", properties: { allow: { type: "boolean" } }, required: ["allow"] } } },
-  { type: "function", function: { name: "make_call", description: "Initiate a phone call.", parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" } } } } },
-  { type: "function", function: { name: "send_whatsapp", description: "Open WhatsApp for a contact and optional message.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] } } },
-  { type: "function", function: { name: "send_sms", description: "Open SMS composer for a contact.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] } } },
-  { type: "function", function: { name: "play_music", description: "Play music on Spotify or YouTube.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
-  { type: "function", function: { name: "navigate_to", description: "Open Maps and navigate to a destination.", parameters: { type: "object", properties: { destination: { type: "string" } }, required: ["destination"] } } },
-  { type: "function", function: { name: "take_photo", description: "Open camera and capture a photo.", parameters: { type: "object", properties: { front_camera: { type: "boolean" } } } } },
-  { type: "function", function: { name: "set_alarm", description: "Set an alarm.", parameters: { type: "object", properties: { label: { type: "string" }, time: { type: "string" } }, required: ["time"] } } },
-  { type: "function", function: { name: "set_timer", description: "Start a countdown timer.", parameters: { type: "object", properties: { duration: { type: "string" } }, required: ["duration"] } } },
-  { type: "function", function: { name: "search_web", description: "Search for current information on the web.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
-  { type: "function", function: { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
-  { type: "function", function: { name: "get_market_data", description: "Get live spot price for a forex/crypto symbol.", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
-  { type: "function", function: { name: "analyze_market", description: "Full market analysis: structure, indicators, auction, trade plan.", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, outputsize: { type: "number" } }, required: ["symbol"] } } },
-  { type: "function", function: { name: "run_code", description: "Execute Python or JavaScript in a secure sandbox.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" }, timeout_ms: { type: "number" } }, required: ["language", "code"] } } },
-  { type: "function", function: { name: "wait_and_verify", description: "Wait for Android to process an action, then automatically trigger a screen read. Use this instead of calling read_screen manually after taps.", parameters: { type: "object", properties: { delay_ms: { type: "number", default: 500 } }, required: [] } } },
-  { type: "function", function: { name: "assert_text_visible", description: "Check the last known device state for a string. Do NOT use read_screen for this. Use this to verify a previous action succeeded.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
+  { type: "function", "function": { name: "open_app", description: "Launch any installed app by name. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] } } },
+  { type: "function", "function": { name: "open_url", description: "Open a full URL in the default browser.", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
+  { type: "function", "function": { name: "press_back", description: "Press the Android back button. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "press_home", description: "Press the Android home button.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "open_recents", description: "Open the recent apps screen.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "open_notifications", description: "Open the notification shade.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "get_current_app", description: "Return the foreground package name and label.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "get_current_activity", description: "Return the current Android activity name.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "read_screen", description: "Read visible text and content descriptions from the screen.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "read_screen_structured", description: "Return a structured accessibility tree dump.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "find_element", description: "Find a UI element by text, hint, id, or class.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+  { type: "function", "function": { name: "take_screenshot", description: "Take a screenshot and return metadata.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "analyze_screenshot", description: "Analyze the last screenshot visually with the vision model.", parameters: { type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"] } } },
+  { type: "function", "function": { name: "tap_button", description: "Tap an element by exact visible label. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
+  { type: "function", "function": { name: "tap_coordinates", description: "Tap the screen at exact x/y coordinates. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
+  { type: "function", "function": { name: "double_tap", description: "Double-tap by label or coordinates.", parameters: { type: "object", properties: { label: { type: "string" }, x: { type: "number" }, y: { type: "number" } } } },
+  { type: "function", "function": { name: "scroll", description: "Scroll the screen in a direction. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] } } } },
+  { type: "function", "function": { name: "swipe", description: "Swipe using start and end coordinates. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { startX: { type: "number" }, startY: { type: "number" }, endX: { type: "number" }, endY: { type: "number" }, duration_ms: { type: "number" } }, required: ["startX", "startY", "endX", "endY"] } } },
+  { type: "function", "function": { name: "drag_and_drop", description: "Drag from one coordinate to another.", parameters: { type: "object", properties: { startX: { type: "number" }, startY: { type: "number" }, endX: { type: "number" }, endY: { type: "number" }, duration_ms: { type: "number" } }, required: ["startX", "startY", "endX", "endY"] } } },
+  { type: "function", "function": { name: "focus_field", description: "Focus a text field by label, hint, or content-desc.", parameters: { type: "object", properties: { field: { type: "string" } }, required: ["field"] } } },
+  { type: "function", "function": { name: "type_text", description: "Type text into the focused or targeted field. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
+  { type: "function", "function": { name: "clear_text", description: "Clear the focused or targeted input field.", parameters: { type: "object", properties: { field: { type: "string" } } } },
+  { type: "function", "function": { name: "paste_text", description: "Paste text via clipboard into a field.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
+  { type: "function", "function": { name: "press_enter", description: "Press Enter / Done / Search on the keyboard.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "hide_keyboard", description: "Hide the soft keyboard.", parameters: { type: "object", properties: {} } } },
+  { type: "function", "function": { name: "toggle_wifi", description: "Toggle Wi-Fi on or off.", parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] } } },
+  { type: "function", "function": { name: "toggle_bluetooth", description: "Toggle Bluetooth on or off.", parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] } } },
+  { type: "function", "function": { name: "set_volume", description: "Set media volume 0-100.", parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] } } },
+  { type: "function", "function": { name: "set_brightness", description: "Set screen brightness 0-100.", parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] } } },
+  { type: "function", "function": { name: "open_app_settings", description: "Open settings page for an app.", parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] } } },
+  { type: "function", "function": { name: "grant_permission_if_prompted", description: "Handle Android permission prompts.", parameters: { type: "object", properties: { allow: { type: "boolean" } }, required: ["allow"] } } },
+  { type: "function", "function": { name: "make_call", description: "Initiate a phone call.", parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" } } } },
+  { type: "function", "function": { name: "send_whatsapp", description: "Open WhatsApp for a contact and optional message.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] } } },
+  { type: "function", "function": { name: "send_sms", description: "Open SMS composer for a contact.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] } } },
+  { type: "function", "function": { name: "play_music", description: "Play music on Spotify or YouTube.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+  { type: "function", "function": { name: "navigate_to", description: "Open Maps and navigate to a destination.", parameters: { type: "object", properties: { destination: { type: "string" } }, required: ["destination"] } } },
+  { type: "function", "function": { name: "take_photo", description: "Open camera and capture a photo.", parameters: { type: "object", properties: { front_camera: { type: "boolean" } } } },
+  { type: "function", "function": { name: "set_alarm", description: "Set an alarm.", parameters: { type: "object", properties: { label: { type: "string" }, time: { type: "string" } }, required: ["time"] } } },
+  { type: "function", "function": { name: "set_timer", description: "Start a countdown timer.", parameters: { type: "object", properties: { duration: { type: "string" } }, required: ["duration"] } } },
+  { type: "function", "function": { name: "search_web", description: "Search for current information on the web.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+  { type: "function", "function": { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
+  { type: "function", "function": { name: "get_market_data", description: "Get live spot price for a forex/crypto symbol.", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
+  { type: "function", "function": { name: "analyze_market", description: "Full market analysis: structure, indicators, auction, trade plan.", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, outputsize: { type: "number" } }, required: ["symbol"] } } },
+  { type: "function", "function": { name: "run_code", description: "Execute Python or JavaScript in a secure sandbox.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" }, timeout_ms: { type: "number" } }, required: ["language", "code"] } } },
+  { type: "function", "function": { name: "wait_and_verify", description: "Wait for Android to process an action, then automatically trigger a screen read. Use this instead of calling read_screen manually after taps.", parameters: { type: "object", properties: { delay_ms: { type: "number", default: 500 } }, required: [] } } },
+  { type: "function", "function": { name: "assert_text_visible", description: "Check the last known device state for a string. Do NOT use read_screen for this. Use this to verify a previous action succeeded.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
 ];
 
 // ==================== LOCAL TOOL EXECUTION ====================
@@ -1122,7 +1097,7 @@ async function handleAutomationRequest({ goal, device_state = {}, memory = [], h
   const agentState = { deviceState: { ...device_state } };
   const taskType         = determineTaskType(goal);
   const toolNames        = getToolsForTask(goal);
-  const tools            = AGENT_TOOLS.filter(t => toolNames.includes(t.function.name) || SERVER_SIDE_TOOLS.has(t.function.name));
+  const tools            = AGENT_TOOLS.filter(t => toolNames.includes(t["function"].name) || SERVER_SIDE_TOOLS.has(t["function"].name));
   const systemPrompt     = buildAutomationSystemPrompt({ deviceState: agentState.deviceState, memory });
   let messages = [{ role: "system", content: systemPrompt }, ...trimHistoryByChars(history, 10, 3500), { role: "user", content: truncateText(goal, 3000) }];
   const serverToolResults  = [];
@@ -1137,8 +1112,8 @@ async function handleAutomationRequest({ goal, device_state = {}, memory = [], h
     if (!toolCalls.length) return { done: true, assistant_text: lastAssistantText, server_tool_results: serverToolResults, android_actions: androidActions, steps_completed: step };
     messages.push({ role: "assistant", content: lastAssistantText, tool_calls: msg.tool_calls });
     for (const tc of toolCalls) {
-      const name = tc.function.name;
-      const args = tc.function.arguments || {};
+      const name = tc["function"].name;
+      const args = tc["function"].arguments || {};
       if (SERVER_SIDE_TOOLS.has(name)) {
         try {
           const result = await runLocalTool(name, args, agentState);
@@ -1156,8 +1131,8 @@ async function handleAutomationRequest({ goal, device_state = {}, memory = [], h
         try {
           const deviceResult = await waitForAndroid(tc.id);
           if (deviceResult.observation) {
-            if (typeof deviceResult.observation === 'string' && deviceResult.observation.length > 20) agentState.deviceState.screen_text = deviceResult.observation;
-            if (deviceResult.data && typeof deviceResult.data === 'object') agentState.deviceState.screen_summary = JSON.stringify(deviceResult.data).slice(0, 1000);
+            if (typeof deviceResult.observation === "string" && deviceResult.observation.length > 20) agentState.deviceState.screen_text = deviceResult.observation;
+            if (deviceResult.data && typeof deviceResult.data === "object") agentState.deviceState.screen_summary = JSON.stringify(deviceResult.data).slice(0, 1000);
           }
           androidActions.push({ id: tc.id, tool: name, arguments: args, device_result: deviceResult });
           messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(deviceResult) });
@@ -1274,13 +1249,12 @@ app.get("/market/quote", async (req, res) => { try { const symbol = String(req.q
 app.post("/market/batch", async (req, res) => { try { const { symbols = [] } = req.body || {}; if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" }); res.json(await fetchMarketPrices(symbols.map(s => String(s).toUpperCase()))); } catch (err) { res.status(500).json({ error: "Batch fetch failed", details: err.message }); } });
 app.all("/market/analyze", requireAuth, async (req, res) => { try { const body = req.body || {}; const query = req.query || {}; const sym = req.method === "GET" ? query.symbol : body.symbol ?? query.symbol; if (!sym) return res.status(400).json({ error: "symbol required" }); const symbol = String(sym).toUpperCase(); const interval = normalizeInterval(req.method === "GET" ? query.interval : body.interval ?? query.interval ?? "1h"); const outputsize = (req.method === "GET" ? query.outputsize : body.outputsize ?? query.outputsize) ? Number(req.method === "GET" ? query.outputsize : body.outputsize ?? query.outputsize) : null; res.json(await analyzeSymbol(symbol, interval, outputsize)); } catch (err) { console.error("[/market/analyze]", err.message); res.status(500).json({ error: "Analysis failed", details: err.message }); } });
 
-// ==================== TRADE ENDPOINT (STEP 4: ENHANCED) ====================
+// ==================== TRADE ENDPOINT ====================
 app.post("/trade", requireAuth, async (req, res) => {
   const { symbol, action, risk_percent = 1, balance, reason = "", interval = "1h", pipeline = "original" } = req.body || {};
   if (!symbol || !action) return res.status(400).json({ error: "symbol and action required" });
   if (!["buy", "sell"].includes(action)) return res.status(400).json({ error: "action must be buy or sell" });
 
-  // ===== ENHANCED PIPELINE MODE =====
   if (pipeline === "enhanced") {
     try {
       const result = await frit.analyze(symbol, interval, { balance: balance || 1000, riskPercent: risk_percent });
@@ -1303,7 +1277,6 @@ app.post("/trade", requireAuth, async (req, res) => {
     }
   }
 
-  // ===== ORIGINAL PIPELINE =====
   if (!reason) return res.status(400).json({ error: "reason required — AI must justify every trade" });
   try {
     const gsriSnap  = await getGsriSnapshot();
@@ -1338,7 +1311,7 @@ app.get("/memory/trade", requireAuth, (req, res) => { const symbol = String(req.
 app.get("/weather", async (req, res) => { try { const city = String(req.query.city || "Lagos"); const result = await getWeather(city); res.json({ city, result }); } catch (err) { res.status(500).json({ error: "Weather failed", details: err.message }); } });
 app.post("/transcribe", async (req, res) => { try { const { audio_base64, mime_type = "audio/webm" } = req.body || {}; if (!audio_base64) return res.status(400).json({ error: "audio_base64 required" }); const text = await mistralTranscribe(audio_base64); if (!text) return res.status(500).json({ error: "Transcription failed" }); res.json({ text, model_used: MODELS.voxtral }); } catch (err) { console.error("[/transcribe]", err.message); res.status(500).json({ error: "Transcription failed", details: err.message }); } });
 
-// ==================== ENHANCED PIPELINE ROUTES (STEP 3) ====================
+// ==================== ENHANCED PIPELINE ROUTES ====================
 app.post("/enhanced/analyze", requireAuth, async (req, res) => {
   const { symbol, interval = "1h", balance, riskPercent } = req.body || {};
   if (!symbol) return res.status(400).json({ error: "symbol required" });
@@ -1397,5 +1370,30 @@ app.use((err, _req, res, _next) => {
 
 // ==================== START ====================
 app.listen(PORT, () => {
-  console.log(`╔══════════════════════════════════════════════════════════════════╗ ║ 🤖 FRIT — SMC+CRT Trading Engine & Mistral AI Orchestrator ║ ╠══════════════════════════════════════════════════════════════════╣ ║ Port : ${String(PORT).padEnd(55)}║ ║ ║ ║ Pure SMC+CRT (no indicator lag): ║ ║ ✅ Candle Range Theory (CRT — range sweep + close-back + MSS) ║ ║ ✅ Smart Money Concepts (Order Blocks, FVG, CHoCH, Liquidity) ║ ║ ✅ Market Structure (HH/HL, LH/LL, BOS) ║ ║ ✅ Volume Profile (POC, VAH, VAL — institutional footprint) ║ ║ ✅ GSRI systemic risk overlay (blocks trades on alert) ║ ║ ✅ News filter (FF calendar — 30 min blackout) ║ ║ ✅ Multi-timeframe confirmation (4H swing structure) ║ ║ ║ ║ Single Mistral ecosystem: ║ ║ ✅ Mistral Medium 3.5 — chat + agentic + vision ║ ║ ✅ Voxtral Mini — STT (replaces Groq Whisper) ║ ║ ✅ Voxtral TTS — text-to-speech / voice cloning ║ ║ ║ ║ Infrastructure: ║ ║ ✅ Lot size engine (per-pair pip math) ║ ║ ✅ MT5 bridge (live) or paper mode ║ ║ ✅ Code sandbox (Python/JS via Sandbox service) ║ ║ ✅ Android automation (State Machine: Verify-Act) ║ ║ ✅ Screen frame ingestion → vision analysis ║ ║ ║ ║ Requires Android app: ║ ║ 📱 Device control (tap, scroll, type, open) ║ ║ 📱 Wake-word detection + audio capture ║ ╚══════════════════════════════════════════════════════════════════╝`);
+  console.log(`
+╔══════════════════════════════════════════════════════════════════╗
+║  FRIT — SMC+CRT Trading Engine & Mistral AI Orchestrator        ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Port : ${String(PORT).padEnd(55)}║
+║                                                                  ║
+║  Pure SMC+CRT (no indicator lag):                                ║
+║  - Candle Range Theory (CRT)                                     ║
+║  - Smart Money Concepts (OB, FVG, CHoCH, Liquidity)             ║
+║  - Market Structure (HH/HL, LH/LL, BOS)                         ║
+║  - Volume Profile (POC, VAH, VAL)                                ║
+║  - GSRI systemic risk overlay                                    ║
+║  - News filter (FF calendar — 30 min blackout)                   ║
+║  - Multi-timeframe confirmation (4H swing structure)             ║
+║                                                                  ║
+║  Single Mistral ecosystem:                                       ║
+║  - Mistral Medium — chat + agentic + vision                      ║
+║  - Voxtral Mini — STT                                            ║
+║                                                                  ║
+║  Infrastructure:                                                 ║
+║  - Lot size engine (per-pair pip math)                           ║
+║  - MT5 bridge (live) or paper mode                               ║
+║  - Code sandbox (Python/JS)                                      ║
+║  - Android automation (State Machine: Verify-Act)                ║
+║  - Screen frame ingestion -> vision analysis                     ║
+╚══════════════════════════════════════════════════════════════════╝`);
 });
