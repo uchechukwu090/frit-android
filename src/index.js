@@ -20,7 +20,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const MISTRAL_MODEL   = process.env.MISTRAL_MODEL || "mistral-medium-latest";
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
-const SANDBOX_URL     = process.env.SANDBOX_URL || "https://sandbox-production-839a.up.railway.app";
+const SANDBOX_URL     = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
 const AUTH_TOKEN      = process.env.AUTH_TOKEN || "";
 const MT5_BRIDGE_URL  = process.env.MT5_BRIDGE_URL || "";
 
