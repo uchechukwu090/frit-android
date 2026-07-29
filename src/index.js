@@ -1402,9 +1402,30 @@ app.get("/health", (_req, res) => {
   });
 });
 
+// ==================== TRADE INTENT DETECTION ====================
+let globalLastDeviceState = {};
+
+function detectTradeIntent(message) {
+  const text = String(message || "").toLowerCase();
+  return /\b(open|execute|place|put|enter|trade now|do it|go ahead)\s+(trade|order|position|deal|transaction)\b/i.test(text)
+    || /\b(open|execute|place|put|enter)\s+(this|that|the)\s+(trade|order)\b/i.test(text)
+    || /\b(open|execute)\s+in\s+mt5\b/i.test(text);
+}
+
+function buildTradeGoal({ symbol, direction, entry, sl, tp, interval = "1h" }) {
+  const action = direction.toLowerCase() === "buy" ? "BUY" : "SELL";
+  return `Open MetaTrader 5 app. Wait for it to load (use wait_and_verify).
+Navigate to the ${symbol} chart on ${interval} timeframe (use tap on symbols list, type text, select).
+Wait for the chart to load (use wait_and_verify and read_screen to confirm).
+Place a ${action} order with entry ${entry}, stop loss ${sl}, take profit ${tp}.
+If there is a confirmation dialog, tap "Confirm" or "Place Order".
+After placing, read the screen to confirm the order is placed and report the result.
+Do not skip any verification steps.`;
+}
+
 // ==================== CHAT ====================
 app.post("/chat", requireAuth, async (req, res) => {
-  const { message, history = [], memory = [], screen_context, mode = "auto" } = req.body || {};
+  const { message, history = [], memory = [], screen_context, mode = "auto", device_state } = req.body || {};
   if (!message) return res.status(400).json({ error: "No message" });
   const safeHistory = trimHistoryByChars(history, 8, 3200);
   const safeMemory = summarizeMemory(memory, 6, 700);
@@ -1416,41 +1437,90 @@ app.post("/chat", requireAuth, async (req, res) => {
   const ivMatch = String(message).match(/\b(1min|5min|15min|30min|1h|4h|1day)\b/i);
   const sizeMatch = String(message).match(/\b(\d{2,3})\s*(candles?|bars?|data points?)\b/i);
 
-  if (symMatch && isMarketMessage(message) && !wantsDetailedTradeReason(message)) {
+  let analysis = null;
+
+  if (symMatch && isMarketMessage(message)) {
     try {
       const sym = symMatch[1].toUpperCase();
       const iv = ivMatch?.[1]?.toLowerCase() || "1h";
       const sz = sizeMatch ? parseInt(sizeMatch[1], 10) : null;
-      const analysis = await analyzeSymbol(sym, iv, sz);
+      analysis = await analyzeSymbol(sym, iv, sz);
+    } catch (err) { console.error("[chat market fetch]", err.message); }
+  }
+
+  const wantsExecute = detectTradeIntent(message);
+
+  if (wantsExecute && analysis && !analysis.error) {
+    const direction = analysis.direction.toLowerCase();
+    const action = direction === "bullish" ? "buy" : "sell";
+    const entry = analysis.trade_plan?.entry_zone?.split("-")[0]?.trim() || analysis.price;
+    const sl = analysis.trade_plan?.invalidation;
+    const tp = analysis.trade_plan?.tp1;
+    const interval = analysis.interval || "1h";
+    const symbol = analysis.symbol;
+
+    if (!sl || !tp) {
       return res.json({
-        text: formatConciseSignal(analysis),
-        model_used: "local_market_formatter",
-        concise_signal: analysis.concise_signal || null,
-        full_analysis_available: true,
+        text: "I cannot execute the trade because stop loss or take profit is missing. Please check the analysis and try again.",
+        analysis,
       });
-    } catch (err) { console.error("[chat concise market path]", err.message); }
+    }
+
+    const goal = buildTradeGoal({ symbol, direction: action, entry, sl, tp, interval });
+    const deviceState = device_state || globalLastDeviceState || {};
+
+    try {
+      const automationResult = await handleAutomationRequest({
+        goal,
+        device_state: deviceState,
+        memory: safeMemory,
+        history: safeHistory,
+        max_steps: 15,
+        mode: "auto",
+      });
+
+      const stepsSummary = automationResult.android_actions.map((a, i) =>
+        `Step ${i + 1}: ${a.tool} -> ${a.device_result?.observation || "done"}`
+      ).join("\n");
+
+      const finalText = `Trade execution initiated!\n\n${automationResult.assistant_text || "Automation completed."}\n\nSteps:\n${stepsSummary}`;
+
+      return res.json({
+        text: finalText,
+        automation: automationResult,
+        analysis,
+        model_used: automationResult.model_used || model,
+      });
+    } catch (err) {
+      console.error("[chat automation]", err.message);
+      return res.json({
+        text: `I tried to automate the trade but encountered an error: ${err.message}. Here is the analysis instead:\n\n${formatConciseSignal(analysis)}`,
+        analysis,
+      });
+    }
+  }
+
+  if (symMatch && isMarketMessage(message) && !wantsDetailedTradeReason(message) && analysis && !analysis.error) {
+    return res.json({
+      text: formatConciseSignal(analysis),
+      model_used: "local_market_formatter",
+      concise_signal: analysis.concise_signal || null,
+      full_analysis_available: true,
+    });
   }
 
   let liveData = "";
-  if (symMatch) {
-    try {
-      const sym = symMatch[1].toUpperCase();
-      const iv = ivMatch?.[1]?.toLowerCase() || "1h";
-      const sz = sizeMatch ? parseInt(sizeMatch[1], 10) : null;
-      const a = await analyzeSymbol(sym, iv, sz);
-      if (!a.error) {
-        const auctionLine = a.auction ? `Auction: POC=${a.auction.poc} VAH=${a.auction.vah} VAL=${a.auction.val} | ${a.auction.note}` : "";
-        liveData = [
-          "",
-          "== LIVE MARKET DATA (fetched now) ==",
-          a.summary,
-          `Signal: ${a.concise_signal?.direction} | Entry ${a.concise_signal?.entry} | SL ${a.concise_signal?.sl} | TP ${a.concise_signal?.tp}`,
-          auctionLine,
-          `AI Opinion: ${a.concise_signal?.ai_opinion || ""}`,
-          "INSTRUCTION: Respond with Direction, Entry, SL, TP, AI Opinion only unless the user explicitly asks for reasons or full analysis.",
-        ].filter(Boolean).join("\n");
-      }
-    } catch (e) { console.error("[chat market fetch]", e.message); }
+  if (analysis && !analysis.error) {
+    const auctionLine = analysis.auction ? `Auction: POC=${analysis.auction.poc} VAH=${analysis.auction.vah} VAL=${analysis.auction.val} | ${analysis.auction.note}` : "";
+    liveData = [
+      "",
+      "== LIVE MARKET DATA (fetched now) ==",
+      analysis.summary,
+      `Signal: ${analysis.concise_signal?.direction} | Entry ${analysis.concise_signal?.entry} | SL ${analysis.concise_signal?.sl} | TP ${analysis.concise_signal?.tp}`,
+      auctionLine,
+      `AI Opinion: ${analysis.concise_signal?.ai_opinion || ""}`,
+      "INSTRUCTION: Respond with Direction, Entry, SL, TP, AI Opinion only unless the user explicitly asks for reasons or full analysis.",
+    ].filter(Boolean).join("\n");
   }
 
   const systemPrompt = [
@@ -1541,10 +1611,13 @@ app.post("/plan", requireAuth, async (req, res) => {
 });
 
 app.post("/screen/frame", requireAuth, (req, res) => {
-  const { frameData, timestamp, width, height } = req.body || {};
+  const { frameData, timestamp, width, height, current_app, screen_text, current_activity } = req.body || {};
   if (!frameData) return res.status(400).json({ error: "frameData required" });
   frameBuffer.push({ data: frameData, timestamp: timestamp || Date.now(), width, height });
   if (frameBuffer.length > FRAME_BUFFER_SIZE) frameBuffer.shift();
+  if (current_app || screen_text || current_activity) {
+    globalLastDeviceState = { ...globalLastDeviceState, current_app, screen_text, current_activity, updatedAt: Date.now() };
+  }
   res.json({ status: "received", buffered: frameBuffer.length });
 });
 
