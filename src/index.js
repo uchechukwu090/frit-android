@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
@@ -136,6 +136,43 @@ function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {
     if (simple.includes(taskType)) return MODELS.fast;
   }
   return MODELS.conversation;
+}
+
+// Runtime fallback chains: if the primary model for a role fails (e.g. Groq
+// free-tier rate limit / 429 exhausted after retries), drop to the next
+// available provider instead of throwing "brain disconnected" up to the client.
+// Order per role: primary -> Gemini Flash (if key present) -> Mistral text model.
+function buildFallbackChain(primary) {
+  const chain = [primary];
+  if (GEMINI_API_KEY && primary !== "gemini-2.0-flash") chain.push("gemini-2.0-flash");
+  if (MISTRAL_MODEL && primary !== MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
+  return [...new Set(chain)];
+}
+
+const FALLBACK_CHAINS = {
+  agent: buildFallbackChain(MODELS.agent),
+  tools: buildFallbackChain(MODELS.tools),
+  conversation: buildFallbackChain(MODELS.conversation),
+  fast: buildFallbackChain(MODELS.fast),
+};
+
+// Same signature as mistralChat, but walks a role's fallback chain on failure
+// (e.g. Groq rate limit exhausted) instead of bubbling the error straight up.
+async function chatWithFallback(role, { messages, tools = null, tool_choice = "auto", temperature, max_tokens }) {
+  const chain = FALLBACK_CHAINS[role] || [MODELS[role] || MODELS.conversation];
+  let lastErr;
+  for (let i = 0; i < chain.length; i++) {
+    const model = chain[i];
+    try {
+      const out = await mistralChat({ model, messages, tools, tool_choice, temperature, max_tokens });
+      if (i > 0) console.warn(`[chatWithFallback] role=${role} recovered on fallback model ${model} (primary failed)`);
+      return out;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[chatWithFallback] role=${role} model=${model} failed: ${err.message}`);
+    }
+  }
+  throw lastErr || new Error(`All models failed for role "${role}"`);
 }
 
 // ======================= IN-MEMORY CACHE =======================
@@ -387,7 +424,7 @@ async function verifyLastStep(session, ledger, toolResults, deviceState) {
       "Did the subtask's expected outcome appear on screen?",
       'Reply with ONLY a JSON object like {"verified": true, "reason": "..."} where verified is true only if the outcome is clearly visible.',
     ].join("\n");
-    const out = await mistralChat({ model: MODELS.fast, messages: [{ role: "user", content: prompt }], temperature: 0, max_tokens: 150 });
+    const out = await chatWithFallback("fast", { messages: [{ role: "user", content: prompt }], temperature: 0, max_tokens: 150 });
     const text = out.choices?.[0]?.message?.content || "";
     const parsed = safeJsonParse(text.match(/\{[\s\S]*\}/)?.[0] || "", null);
     if (parsed && typeof parsed.verified === "boolean") {
@@ -482,9 +519,15 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
 
   const hasImage = !!(deviceStateForPrompt.user_image && steps.length === 0);
   const modelToUse = pickModel({ hasImage, mode: opts.mode || "auto", taskType: "automation" });
+  // Route through the fallback chain for whichever role this resolved to, so a
+  // Groq rate limit (e.g. llama-3.3-70b-versatile) doesn't kill the whole turn.
+  const modelRole = modelToUse === MODELS.agent ? "agent"
+    : modelToUse === MODELS.fast ? "fast"
+    : modelToUse === MODELS.tools ? "tools"
+    : "conversation";
 
   for (let iter = 0; iter <= MAX_SERVER_TOOL_LOOP; iter++) {
-    const out = await mistralChat({ model: modelToUse, messages: fullMessages, tools: AGENT_TOOLS });
+    const out = await chatWithFallback(modelRole, { messages: fullMessages, tools: AGENT_TOOLS });
     const msg = out.choices[0].message;
     lastAssistantText = msg.content || "";
     lastToolCalls = extractToolCalls(msg);
@@ -522,8 +565,16 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
 
   const done = androidPending.length === 0;
 
+  // A ledger only represents a real task if something in it is actually
+  // active/pending/attention. A plain chat turn (e.g. "hi") produces zero
+  // Android tool calls too, but there's no task to "complete" — so we must
+  // not force the ledger to "done"/"completed" in that case.
+  const hadActiveTask = ledger.some(
+    t => t.status === "active" || t.status === "pending" || t.status === "attention"
+  );
+
   // ---- 5. Ledger + session status on completion ----
-  if (done) {
+  if (done && hadActiveTask) {
     if (verification && !verification.verified) {
       markSubtask(ledger, "attention", verification.reason);
     } else {
@@ -537,9 +588,11 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
       }
     }
   }
-  const sessionStatus = done
-    ? (ledger.some(t => t.status === "failed") ? "needs_attention" : "completed")
-    : "waiting_for_client";
+  const sessionStatus = !hadActiveTask
+    ? "chatting"
+    : done
+      ? (ledger.some(t => t.status === "failed") ? "needs_attention" : "completed")
+      : "waiting_for_client";
 
   db.prepare("UPDATE agent_sessions SET status = ?, task_ledger = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(
     sessionStatus, JSON.stringify(ledger), sessionId
@@ -564,8 +617,7 @@ app.post("/agent/start", requireAuth, async (req, res) => {
 
   try {
     // Initial Plan / Ledger creation
-    const planOut = await mistralChat({
-      model: MODELS.fast,
+    const planOut = await chatWithFallback("fast", {
       messages: [
         { role: "system", content: "Break the user's goal into an ordered JSON list of subtasks: [{\"seq\": 1, \"description\": \"...\", \"status\": \"pending\"}]" },
         { role: "user", content: goal }
