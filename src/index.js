@@ -1,15 +1,19 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
 import FormData from "form-data";
+import Database from "better-sqlite3";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { FritSystems } from "./frit_systems.js";
 import { analyzeSMC_CRT } from "./smc_crt_strategy.js";
+import { MTFStrategyEngine } from "./strategy/engine.js";
+import { TradeTaskScheduler } from "./strategy/scheduler.js";
+import { PositionMonitor } from "./strategy/position_monitor.js";
 
 dotenv.config();
 
@@ -17,26 +21,79 @@ const app = express();
 const PORT = Number(process.env.PORT || 8787);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// ========================= PERSISTENCE (SQLite) =====================
+const db = new Database(join(__dirname, "../frit.db"));
+db.pragma("journal_mode = WAL");
+
+// Initialize Tables
+db.exec(`
+  CREATE TABLE IF NOT EXISTS agent_sessions (
+    id TEXT PRIMARY KEY,
+    goal TEXT,
+    status TEXT DEFAULT 'pending',
+    task_ledger TEXT,
+    last_device_state TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS agent_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    step_n INTEGER,
+    role TEXT,
+    content TEXT,
+    tool_calls TEXT,
+    tool_results TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(session_id) REFERENCES agent_sessions(id)
+  );
+  CREATE TABLE IF NOT EXISTS trade_memory (
+    symbol TEXT,
+    direction TEXT,
+    pattern TEXT,
+    outcome TEXT,
+    note TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// Migrations — older frit.db files predate these columns and CREATE TABLE IF
+// NOT EXISTS won't add them to an existing table.
+const sessionCols = db.prepare("PRAGMA table_info(agent_sessions)").all().map(c => c.name);
+if (!sessionCols.includes("last_device_state")) {
+  db.exec("ALTER TABLE agent_sessions ADD COLUMN last_device_state TEXT");
+}
+if (!sessionCols.includes("memory")) {
+  db.exec("ALTER TABLE agent_sessions ADD COLUMN memory TEXT");
+}
+const stepCols = db.prepare("PRAGMA table_info(agent_steps)").all().map(c => c.name);
+if (!stepCols.includes("tool_call_id")) {
+  db.exec("ALTER TABLE agent_steps ADD COLUMN tool_call_id TEXT");
+}
+
 // ========================= ENVIRONMENT ==============================
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
-const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-medium-latest";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const HAS_GROQ = !!GROQ_API_KEY;
+const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || "";
 
 // ========================== VALIDATION =============================
-if (!MISTRAL_API_KEY) {
-  console.error("[FATAL] MISTRAL_API_KEY missing — set MISTRAL_API_KEY in .env");
+if (!AUTH_TOKEN) {
+  console.error("[FATAL] AUTH_TOKEN missing — mandatory for agentic security!");
   process.exit(1);
 }
-if (!AUTH_TOKEN) {
-  console.warn("[WARN] AUTH_TOKEN not set — all endpoints are unprotected!");
+if (!HAS_GROQ && !GEMINI_API_KEY && !MISTRAL_API_KEY) {
+  console.error("[FATAL] All provider keys missing — set at least one in .env");
+  process.exit(1);
 }
 
 // ========================== MIDDLEWARE ==============================
 function requireAuth(req, res, next) {
-  if (!AUTH_TOKEN) return next();
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (token !== AUTH_TOKEN) return res.status(401).json({ error: "Unauthorized" });
@@ -44,20 +101,22 @@ function requireAuth(req, res, next) {
 }
 
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ limit: "10mb", extended: true }));
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ limit: "20mb", extended: true }));
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
+app.use(cors({ origin: "*" }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// ======================= MODELS (Mistral AI) =======================
+// ======================= MODELS =======================
 const MODELS = {
-  vision: process.env.MISTRAL_VISION_MODEL || "pixtral-large-latest",
-  agent: process.env.MISTRAL_MODEL || "mistral-medium-latest",
-  conversation: process.env.MISTRAL_MODEL || "mistral-medium-latest",
-  tools: process.env.MISTRAL_MODEL || "mistral-medium-latest",
-  fast: process.env.MISTRAL_FAST_MODEL || "mistral-small-latest",
+  vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-2.0-flash" : "pixtral-large-latest"),
+  agent: process.env.AGENT_MODEL || (HAS_GROQ ? "groq:llama-3.3-70b-versatile" : (GEMINI_API_KEY ? "gemini-2.0-flash" : "mistral-large-latest")),
+  conversation: process.env.CONVERSATION_MODEL || (HAS_GROQ ? "groq:llama-3.1-8b-instant" : (GEMINI_API_KEY ? "gemini-2.0-flash" : "mistral-large-latest")),
+  tools: process.env.TOOLS_MODEL || (HAS_GROQ ? "groq:llama-3.3-70b-versatile" : (GEMINI_API_KEY ? "gemini-2.0-flash" : "mistral-large-latest")),
+  coding: process.env.CODING_MODEL || (HAS_GROQ ? "groq:qwen/qwen3.6-27b" : "codestral-latest"),
+  fast: process.env.FAST_MODEL || (HAS_GROQ ? "groq:llama-3.1-8b-instant" : (GEMINI_API_KEY ? "gemini-2.0-flash" : "mistral-small-latest")),
   voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || "voxtral-mini-transcribe-realtime",
+  local: process.env.LOCAL_MODEL || "gemma-3n-e2b", // on-device offline fallback (Android), not called here
 };
 
 function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {}) {
@@ -120,81 +179,142 @@ function summarizeMemory(memory = [], maxItems = 6, maxChars = 700) {
   return picked;
 }
 
-function trimHistoryByChars(history = [], maxMessages = 8, maxChars = 3200) {
-  const arr = Array.isArray(history) ? history.slice(-maxMessages) : [];
-  const out = [];
-  let used = 0;
-  for (let i = arr.length - 1; i >= 0; i--) {
-    const msg = arr[i];
-    let content = msg?.content ?? "";
-    if (Array.isArray(content)) content = content.map(p => typeof p?.text === "string" ? p.text : "").join(" ");
-    const s = truncateText(String(content), 900);
-    const cost = s.length + 40;
-    if (used + cost > maxChars) continue;
-    out.unshift({ role: msg.role, content: s });
-    used += cost;
-  }
-  return out;
-}
-
-function maybeTrimScreenContext(ctx, maxChars = 350000) {
-  if (!ctx || typeof ctx !== "string") return null;
-  return ctx.length <= maxChars ? ctx : null;
-}
-
 function buildMemoryBlock(memory = []) {
   const compact = summarizeMemory(memory, 6, 700);
   if (!compact.length) return "";
   return `User memory:\n${compact.join("\n")}`;
 }
 
-// ========================= MISTRAL AI API ===========================
+// ========================= PROVIDER ADAPTERS ===========================
 const MISTRAL_BASE = "https://api.mistral.ai/v1";
 
-async function mistralChat({
-  model,
-  messages,
-  tools = null,
-  temperature = 0.3,
-  max_tokens = 1600,
-  tool_choice = "auto",
-  retries = 3,
-}) {
+async function geminiChat({ model, messages, tools = null, temperature = 0.7, max_tokens = 2048 }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const contents = messages.map(m => {
+    let parts = [];
+    if (typeof m.content === "string") {
+      parts = [{ text: m.content }];
+    } else if (Array.isArray(m.content)) {
+      parts = m.content.map(p => {
+        if (p.type === "text") return { text: p.text };
+        if (p.type === "image_url") {
+          const b64 = p.image_url.url.split(",")[1] || p.image_url.url;
+          return { inline_data: { mime_type: "image/jpeg", data: b64 } };
+        }
+        return null;
+      }).filter(Boolean);
+    }
+
+    if (m.tool_calls) {
+      m.tool_calls.forEach(tc => {
+        parts.push({
+          functionCall: {
+            name: tc.function.name,
+            args: typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments
+          }
+        });
+      });
+    }
+
+    if (m.role === "tool") {
+      return {
+        role: "function",
+        parts: [{
+          functionResponse: {
+            name: m.name || m.tool_call_id, // Gemini expects the function name here often
+            response: { content: m.content }
+          }
+        }]
+      };
+    }
+
+    return { role: m.role === "assistant" ? "model" : "user", parts };
+  });
+
   const body = {
-    model,
-    messages,
-    temperature,
-    max_tokens: Math.min(max_tokens, 32000),
+    contents,
+    generationConfig: { maxOutputTokens: max_tokens, temperature }
   };
+
+  if (tools?.length) {
+    body.tools = [{
+      function_declarations: tools.map(t => ({
+        name: t.function.name,
+        description: t.function.description,
+        parameters: t.function.parameters
+      }))
+    }];
+  }
+
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+
+  const candidate = data.candidates?.[0];
+  const msgContent = candidate?.content;
+  const parts = msgContent?.parts || [];
+
+  let text = "";
+  const tool_calls = [];
+
+  parts.forEach(p => {
+    if (p.text) text += p.text;
+    if (p.functionCall) {
+      tool_calls.push({
+        id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        type: "function",
+        function: {
+          name: p.functionCall.name,
+          arguments: JSON.stringify(p.functionCall.args)
+        }
+      });
+    }
+  });
+
+  return { choices: [{ message: { content: text, tool_calls: tool_calls.length ? tool_calls : undefined } }] };
+}
+
+// Resolve which provider a model string belongs to.
+// "groq:..."  -> Groq (OpenAI-compatible /chat/completions, supports tool calls)
+// "gemini-*"  -> Gemini native generateContent (vision; tools unsupported here)
+// otherwise    -> Mistral (OpenAI-compatible chat completions, supports tool calls)
+function resolveProvider(model) {
+  if (typeof model === "string" && model.startsWith("groq:")) return "groq";
+  if (typeof model === "string" && model.startsWith("gemini")) return "gemini";
+  return "mistral";
+}
+
+async function mistralChat({ model, messages, tools = null, temperature = 0.3, max_tokens = 1600, tool_choice = "auto", retries = 3 }) {
+  const provider = resolveProvider(model);
+  if (provider === "gemini") return geminiChat({ model, messages, temperature, max_tokens });
+
+  const base = provider === "groq" ? "https://api.groq.com/openai/v1/chat/completions" : `${MISTRAL_BASE}/chat/completions`;
+  const apiKey = provider === "groq" ? GROQ_API_KEY : MISTRAL_API_KEY;
+  const cleanModel = provider === "groq" ? model.slice(5) : model;
+
+  const body = { model: cleanModel, messages, temperature, max_tokens };
   if (tools?.length) {
     body.tools = tools.map(t => ({
       type: "function",
-      function: {
-        name: t.function.name,
-        description: t.function.description || "",
-        parameters: t.function.parameters || {},
-      },
+      function: { name: t.function.name, description: t.function.description, parameters: t.function.parameters },
     }));
     body.tool_choice = tool_choice;
   }
+
   let lastError;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(`${MISTRAL_BASE}/chat/completions`, {
+      const res = await fetch(base, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${MISTRAL_API_KEY}`,
-          "Content-Type": "application/json",
-        },
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       const data = await res.json();
       if (!res.ok) {
         lastError = new Error(data?.message || data?.error?.message || JSON.stringify(data));
-        if (res.status === 429) {
-          await new Promise(r => setTimeout(r, attempt * 2000));
-          continue;
-        }
+        const retryable = res.status === 429 || (res.status === 400 && /tool_use_failed|Failed to call a function/i.test(lastError.message));
+        if (retryable && attempt < retries) { await new Promise(r => setTimeout(r, attempt * 2000)); continue; }
         throw lastError;
       }
       return data;
@@ -203,8 +323,295 @@ async function mistralChat({
       if (attempt < retries) await new Promise(r => setTimeout(r, attempt * 1000));
     }
   }
-  throw lastError || new Error("Mistral API failed after retries");
+  throw lastError || new Error(`${provider} API failed after retries`);
 }
+
+// ==================== CORE AGENT LOOP ENGINE ====================
+// ONE loop. The brain plans against a persisted ledger; server-side tools
+// (run_code, search_web, market data, ...) execute HERE and feed back into the
+// same brain turn; only Android-UI actions are returned as pending_actions for
+// the phone edge. Every resume verifies the last action batch with a cheap
+// second model and updates the ledger (done / failed / re-plan).
+const MAX_SERVER_TOOL_LOOP = 8;
+
+function getActiveSubtask(ledger) {
+  if (!Array.isArray(ledger) || !ledger.length) return null;
+  return ledger.find(t => t.status === "active")
+      || ledger.find(t => t.status === "pending")
+      || ledger.find(t => t.status === "attention");
+}
+
+function markSubtask(ledger, status, note) {
+  const t = getActiveSubtask(ledger);
+  if (t) { t.status = status; if (note) t.note = note; }
+  return t;
+}
+
+function getLastFailureNote(ledger) {
+  if (!Array.isArray(ledger)) return "";
+  const failed = ledger.find(t => t.status === "failed");
+  return failed?.note ? `"${failed.description}" — ${failed.note}` : "";
+}
+
+function formatTradeMemoryForGoal(goal = "") {
+  const found = new Set();
+  const m = String(goal).match(/\b(EURUSD|GBPUSD|USDJPY|AUDUSD|XAUUSD|USDCHF|USDCAD|NZDUSD|GBPJPY|EURJPY|EURGBP|BTCUSD|ETHUSD|SOLUSD|BNBUSD|XRPUSD|DOGEUSD|ADAUSD|BTC|ETH|SOL|BNB|XRP|DOGE|ADA)\b/gi);
+  if (!m) return "";
+  for (const sym of m) found.add(sym.toUpperCase());
+  return [...found].map(s => formatTradeMemoryForPrompt(s)).join("\n");
+}
+
+// Independent cheap-model grader: "did the expected outcome appear on screen?"
+async function verifyLastStep(session, ledger, toolResults, deviceState) {
+  try {
+    const subtask = getActiveSubtask(ledger) || { description: session.goal || "the task" };
+    const screenText = String(deviceState?.screen_text || deviceState?.raw || "").slice(0, 1400);
+    const actions = (toolResults || []).map(r => {
+      const raw = r.content;
+      if (raw == null) return "";
+      if (typeof raw === "string") {
+        try { return JSON.stringify(JSON.parse(raw)).slice(0, 300); } catch { return raw.slice(0, 300); }
+      }
+      return JSON.stringify(raw).slice(0, 300);
+    }).filter(Boolean).join(" | ");
+    const prompt = [
+      "You are a UI verification model for a phone automation agent.",
+      `The current subtask is: ${subtask.description}`,
+      `The agent just performed these actions and got these results: ${actions || "(none)"}`,
+      `The current screen text is: ${screenText || "(no screen text available)"}`,
+      "Did the subtask's expected outcome appear on screen?",
+      'Reply with ONLY a JSON object like {"verified": true, "reason": "..."} where verified is true only if the outcome is clearly visible.',
+    ].join("\n");
+    const out = await mistralChat({ model: MODELS.fast, messages: [{ role: "user", content: prompt }], temperature: 0, max_tokens: 150 });
+    const text = out.choices?.[0]?.message?.content || "";
+    const parsed = safeJsonParse(text.match(/\{[\s\S]*\}/)?.[0] || "", null);
+    if (parsed && typeof parsed.verified === "boolean") {
+      return { verified: parsed.verified, reason: String(parsed.reason || "").slice(0, 200) };
+    }
+    return { verified: !/(did not|not visible|not found|failed|error|unable)/i.test(text), reason: text.slice(0, 150) };
+  } catch (e) {
+    console.warn("[verifyLastStep]", e.message);
+    return null;
+  }
+}
+
+async function runAgentStep(sessionId, toolResults = null, deviceState = null, opts = {}) {
+  const session = db.prepare("SELECT * FROM agent_sessions WHERE id = ?").get(sessionId);
+  if (!session) throw new Error("Session not found");
+
+  if (deviceState) {
+    db.prepare("UPDATE agent_sessions SET last_device_state = ? WHERE id = ?").run(JSON.stringify(deviceState), sessionId);
+  }
+
+  const steps = db.prepare("SELECT * FROM agent_steps WHERE session_id = ? ORDER BY step_n ASC").all(sessionId);
+  const messages = steps.map(s => ({
+    role: s.role,
+    content: s.content,
+    ...(s.tool_calls ? { tool_calls: JSON.parse(s.tool_calls) } : {}),
+    ...(s.role === "tool" ? { tool_call_id: s.tool_call_id || `legacy_tool_${s.id}` } : {}),
+  }));
+
+  const ledger = JSON.parse(session.task_ledger || "[]");
+  const memory = session.memory ? safeJsonParse(session.memory, []) : (Array.isArray(opts.memory) ? opts.memory : []);
+
+  // ---- 1. Append Android tool results (this is a resume) ----
+  if (toolResults) {
+    for (const res of toolResults) {
+      const content = JSON.stringify(res.content);
+      messages.push({ role: "tool", tool_call_id: res.tool_call_id, name: res.tool, content });
+      db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_call_id) VALUES (?, ?, ?, ?, ?)").run(
+        sessionId, messages.length, "tool", content, res.tool_call_id || null
+      );
+    }
+  }
+
+  // ---- 2. Verification of the last action batch (independent second model) ----
+  let verification = null;
+  if (toolResults && deviceState) {
+    verification = await verifyLastStep(session, ledger, toolResults, deviceState);
+    if (verification) {
+      const active = getActiveSubtask(ledger);
+      if (active && active.status !== "done" && active.status !== "failed") {
+        if (verification.verified) {
+          active.status = "done";
+          active.note = `verified: ${verification.reason}`;
+        } else {
+          active.fail_count = (active.fail_count || 0) + 1;
+          active.note = `verification failed (${active.fail_count}x): ${verification.reason}`;
+          if (active.fail_count >= 2) active.status = "failed";
+        }
+      }
+    }
+  }
+
+  // ---- 3. Build system prompt (device state + memory + ledger + trade memory) ----
+  const activeSubtask = getActiveSubtask(ledger);
+  const deviceStateForPrompt = deviceState || (session.last_device_state ? safeJsonParse(session.last_device_state, {}) : {});
+  const systemPrompt = buildAutomationSystemPrompt({
+    deviceState: deviceStateForPrompt,
+    memory,
+    ledger,
+    goal: session.goal,
+    tradeMemory: formatTradeMemoryForGoal(session.goal),
+    verification,
+    lastFailure: getLastFailureNote(ledger),
+  }) + `\n\nCURRENT OBJECTIVE: ${activeSubtask?.description || session.goal}`;
+
+  const fullMessages = [{ role: "system", content: systemPrompt }, ...messages];
+
+  // If there's a user-attached image in deviceState, add it to the conversation context
+  if (deviceStateForPrompt.user_image && steps.length === 0) {
+    fullMessages.push({
+      role: "user",
+      content: [
+        { type: "text", text: "I've attached an image for this task." },
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${deviceStateForPrompt.user_image}` } }
+      ]
+    });
+  }
+
+  // ---- 4. Brain loop — server-side tools execute here, Android tools return ----
+  let lastAssistantText = "";
+  let lastToolCalls = [];
+  let androidPending = [];
+
+  const hasImage = !!(deviceStateForPrompt.user_image && steps.length === 0);
+  const modelToUse = pickModel({ hasImage, mode: opts.mode || "auto", taskType: "automation" });
+
+  for (let iter = 0; iter <= MAX_SERVER_TOOL_LOOP; iter++) {
+    const out = await mistralChat({ model: modelToUse, messages: fullMessages, tools: AGENT_TOOLS });
+    const msg = out.choices[0].message;
+    lastAssistantText = msg.content || "";
+    lastToolCalls = extractToolCalls(msg);
+
+    db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_calls) VALUES (?, ?, ?, ?, ?)").run(
+      sessionId, fullMessages.length, "assistant", lastAssistantText, lastToolCalls.length ? JSON.stringify(msg.tool_calls) : null
+    );
+    fullMessages.push({ role: "assistant", content: lastAssistantText, tool_calls: msg.tool_calls });
+
+    const serverCalls = lastToolCalls.filter(tc => SERVER_SIDE_TOOLS.has(tc.function.name));
+    const androidCalls = lastToolCalls.filter(tc => !SERVER_SIDE_TOOLS.has(tc.function.name));
+
+    if (serverCalls.length && iter < MAX_SERVER_TOOL_LOOP) {
+      for (const tc of serverCalls) {
+        const name = tc.function.name;
+        const args = tc.function.arguments || {};
+        let result;
+        try {
+          result = await runLocalTool(name, args, { deviceState: deviceStateForPrompt });
+        } catch (err) {
+          result = { ok: false, error: err.message };
+        }
+        const content = JSON.stringify(result);
+        fullMessages.push({ role: "tool", tool_call_id: tc.id, name: name, content });
+        db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_call_id) VALUES (?, ?, ?, ?, ?)").run(
+          sessionId, fullMessages.length, "tool", content, tc.id
+        );
+      }
+      continue; // feed results back to the brain
+    }
+
+    androidPending = androidCalls;
+    break;
+  }
+
+  const done = androidPending.length === 0;
+
+  // ---- 5. Ledger + session status on completion ----
+  if (done) {
+    if (verification && !verification.verified) {
+      markSubtask(ledger, "attention", verification.reason);
+    } else {
+      const active = getActiveSubtask(ledger);
+      if (active && active.status !== "done" && active.status !== "failed") {
+        active.status = "done";
+        active.note = "completed";
+      }
+      for (const t of ledger) {
+        if (t.status === "pending" || t.status === "attention") { t.status = "done"; t.note = t.note || "folded into completed run"; }
+      }
+    }
+  }
+  const sessionStatus = done
+    ? (ledger.some(t => t.status === "failed") ? "needs_attention" : "completed")
+    : "waiting_for_client";
+
+  db.prepare("UPDATE agent_sessions SET status = ?, task_ledger = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(
+    sessionStatus, JSON.stringify(ledger), sessionId
+  );
+
+  return {
+    sessionId,
+    assistant_text: lastAssistantText,
+    pending_actions: androidPending.map(tc => ({ id: tc.id, tool: tc.function.name, arguments: tc.function.arguments })),
+    done,
+    ledger,
+    verification,
+  };
+}
+
+// ==================== AGENT ROUTES ====================
+app.post("/agent/start", requireAuth, async (req, res) => {
+  const { goal, device_state, memory } = req.body;
+  if (!goal) return res.status(400).json({ error: "Goal required" });
+
+  const sessionId = `sess_${Date.now()}`;
+
+  try {
+    // Initial Plan / Ledger creation
+    const planOut = await mistralChat({
+      model: MODELS.fast,
+      messages: [
+        { role: "system", content: "Break the user's goal into an ordered JSON list of subtasks: [{\"seq\": 1, \"description\": \"...\", \"status\": \"pending\"}]" },
+        { role: "user", content: goal }
+      ]
+    });
+
+    let ledger = [];
+    try {
+      const parsed = JSON.parse(planOut.choices[0].message.content.match(/\[.*\]/s)[0]);
+      ledger = (Array.isArray(parsed) ? parsed : []).map((t, i) => ({
+        seq: t.seq ?? i + 1,
+        description: String(t.description || t.task || goal),
+        status: t.status || "pending",
+      }));
+    } catch (e) {
+      ledger = [{ seq: 1, description: goal, status: "pending" }];
+    }
+
+    const safeMemory = Array.isArray(memory) ? memory : [];
+    db.prepare("INSERT INTO agent_sessions (id, goal, task_ledger, last_device_state, memory) VALUES (?, ?, ?, ?, ?)").run(
+      sessionId, goal, JSON.stringify(ledger), JSON.stringify(device_state || {}), JSON.stringify(safeMemory)
+    );
+
+    const result = await runAgentStep(sessionId, null, device_state, { memory: safeMemory });
+    res.json(result);
+  } catch (err) {
+    console.error("[agent/start]", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/agent/resume", requireAuth, async (req, res) => {
+  const { sessionId, tool_results, device_state } = req.body;
+  if (!sessionId || !tool_results) return res.status(400).json({ error: "sessionId and tool_results required" });
+
+  try {
+    const result = await runAgentStep(sessionId, tool_results, device_state);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/agent/status", requireAuth, (req, res) => {
+  const { sessionId } = req.query;
+  const session = db.prepare("SELECT * FROM agent_sessions WHERE id = ?").get(sessionId);
+  if (!session) return res.status(404).json({ error: "Not found" });
+
+  const steps = db.prepare("SELECT * FROM agent_steps WHERE session_id = ? ORDER BY step_n ASC").all(sessionId);
+  res.json({ session, steps });
+});
 
 // STT via Mistral Voxtral (fallback: Groq Whisper, then OpenAI Whisper)
 async function mistralTranscribe(audioBase64) {
@@ -963,31 +1370,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   return result;
 }
 
-// ==================== MARKET MESSAGE HELPERS ====================
-function isMarketMessage(message = "") {
-  const text = String(message || "").toLowerCase();
-  return (/\b(eurusd|gbpusd|usdjpy|audusd|xauusd|usdchf|usdcad|nzdusd|gbpjpy|eurjpy|eurgbp|btcusd|ethusd|solusd|bnbusd|xrpusd|dogeusd|adausd|btc|eth|sol|bnb|xrp|doge|ada|usdngn)\b/i.test(text)
-    || /\b(price|analysis|signal|buy|sell|entry|tp|sl|market)\b/i.test(text));
-}
-
-function wantsDetailedTradeReason(message = "") {
-  return ["why", "reason", "explain", "full analysis", "show structure", "details", "detailed", "breakdown", "confidence", "pattern", "strategy", "regime"]
-    .some(k => String(message).toLowerCase().includes(k));
-}
-
-function formatConciseSignal(analysis) {
-  if (!analysis || analysis.error) return analysis?.error || "No market data available.";
-  const cs = analysis.concise_signal || {};
-  return [
-    `${analysis.symbol} ${String(analysis.interval || "").toUpperCase()}`.trim(),
-    `Direction: ${cs.direction || analysis.direction || "NEUTRAL"}`,
-    `Entry: ${cs.entry || analysis.trade_plan?.entry_zone || "N/A"}`,
-    `SL: ${cs.sl || analysis.trade_plan?.invalidation || "N/A"}`,
-    `TP: ${cs.tp || analysis.trade_plan?.tp1 || "N/A"}`,
-    `AI Opinion: ${cs.ai_opinion || analysis.ai_opinion || "No strong edge right now."}`,
-  ].join("\n");
-}
-
 // =================== WEB SEARCH + WEATHER ===================
 async function webSearch(query) {
   try {
@@ -1112,7 +1494,30 @@ function gsriLotScale(riskScore) {
 }
 
 // ==================== TRADE MEMORY ====================
+// SQLite-backed (survives restarts) with an in-memory Map as the read cache.
 const tradeMemory = new Map();
+
+// Load existing rows from the trade_memory table into the map at boot.
+(function loadTradeMemory() {
+  try {
+    const rows = db.prepare("SELECT * FROM trade_memory ORDER BY rowid ASC").all();
+    for (const r of rows) {
+      const sym = String(r.symbol || "").toUpperCase();
+      if (!tradeMemory.has(sym)) tradeMemory.set(sym, []);
+      const ts = new Date(String(r.timestamp).replace(" ", "T")).getTime() || Date.now();
+      tradeMemory.get(sym).push({
+        direction: r.direction || null,
+        pattern: r.pattern || null,
+        outcome: r.outcome || null,
+        note: r.note || null,
+        timestamp: ts,
+      });
+    }
+    if (rows.length) console.log(`[TradeMemory] loaded ${rows.length} row(s) from SQLite`);
+  } catch (e) {
+    console.warn("[TradeMemory] load failed:", e.message);
+  }
+})();
 
 function addTradeMemory(symbol, entry) {
   const sym = String(symbol || "").toUpperCase();
@@ -1120,6 +1525,13 @@ function addTradeMemory(symbol, entry) {
   const entries = tradeMemory.get(sym);
   entries.push({ ...entry, timestamp: Date.now() });
   if (entries.length > 20) entries.splice(0, entries.length - 20);
+  try {
+    db.prepare("INSERT INTO trade_memory (symbol, direction, pattern, outcome, note) VALUES (?, ?, ?, ?, ?)").run(
+      sym, entry.direction || null, entry.pattern || null, entry.outcome || null, entry.note || null
+    );
+  } catch (e) {
+    console.warn("[TradeMemory] persist failed:", e.message);
+  }
 }
 
 function getTradeMemory(symbol, limit = 5) {
@@ -1144,62 +1556,116 @@ const frit = new FritSystems({
   sendToMT5Bridge, addTradeMemory, getTradeMemory,
 });
 
+// ==================== POSITION MONITOR ====================
+// Additive paper-position state machine. Watches positions registered by the
+// daily trade scheduler and /trade; auto-resolves TP/SL via spot polling; logs
+// the outcome to trade_memory + the paper logger. Never places orders itself.
+const positionMonitor = new PositionMonitor({
+  getPrice: async (sym) => { const s = await fetchSpotPrice(sym); return s?.price ?? null; },
+  db,
+  intervalMs: 60_000,
+  onResolve: (pos) => {
+    addTradeMemory(pos.symbol, {
+      direction: pos.action,
+      pattern: "position_monitor",
+      outcome: pos.outcome,
+      note: `Auto-resolved ${pos.outcome}: ${pos.note || ""} (source=${pos.source})`,
+    });
+    if (pos.paper_trade_id) {
+      try {
+        const closed = frit.paperLogger.resolve(pos.paper_trade_id, pos.outcome === "win" ? "win" : "loss", pos.close_price);
+        if (closed) console.log(`[PositionMonitor] paper trade ${pos.paper_trade_id} closed as ${pos.outcome}`);
+      } catch (e) { console.warn("[PositionMonitor] paperLogger.resolve failed:", e.message); }
+    }
+  },
+});
+positionMonitor.start();
+
+// ==================== MTF STRATEGY ENGINE (v1) ====================
+// Multi-timeframe directional engine — default brain for /trade enhanced and
+// /enhanced/analyze. Runs on Twelve Data free tier (8 credits/min) with its
+// own cache + rate budget. See docs/STRATEGY.md.
+const mtfStrategy = new MTFStrategyEngine({
+  fetchCandles,
+  checkNewsFilter,
+  calculateLotSize,
+  addTradeMemory,
+});
+
+// Recurring "everyday analyze XAUUSD" tasks — paper-first by design.
+const tradeScheduler = new TradeTaskScheduler({
+  engine: mtfStrategy,
+  executor: async ({ symbol, action, lotSize, entry, sl, tp, reason }) => {
+    const result = await sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason });
+    if (result.status !== "failed" && sl && tp) {
+      try {
+        positionMonitor.register({ symbol, action, lotSize, entry, sl, tp, source: "scheduler", reason });
+      } catch (e) { console.warn("[PositionMonitor] scheduler register failed:", e.message); }
+    }
+    return result;
+  },
+});
+if (process.env.TRADE_TASKS === "true") {
+  tradeScheduler.start();
+  console.log("[FRIT] Trade task scheduler started (TRADE_TASKS=true)");
+}
+
 if (process.env.AUTO_SCANNER === "true") {
   frit.startScanner(2 * 60 * 1000);
   console.log("[FRIT] Autonomous scanner started");
 }
 
 // ==================== ANDROID AGENT TOOLS ====================
+// Contract: tools in SERVER_SIDE_TOOLS execute HERE (inside runAgentStep).
+// Everything else in AGENT_TOOLS is returned to the Android app as a
+// pending_action and executed by IntegrationCoordinator.executeEdgeTool().
+// run_command / write_file / run_sandbox_code are deliberately NOT advertised:
+// they stay gated behind DEV_TOOLS_ENABLED=false on the client.
 const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data",
   "analyze_market", "run_code", "wait_and_verify", "assert_text_visible"
 ]);
 
 const AGENT_TOOLS = [
-  { type: "function", function: { name: "open_app", description: "Launch any installed app by name. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] } } },
-  { type: "function", function: { name: "open_url", description: "Open a full URL in the default browser.", parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
-  { type: "function", function: { name: "press_back", description: "Press the Android back button. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "press_home", description: "Press the Android home button.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "open_recents", description: "Open the recent apps screen.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "open_notifications", description: "Open the notification shade.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_current_app", description: "Return the foreground package name and label.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_current_activity", description: "Return the current Android activity name.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "read_screen", description: "Read visible text and content descriptions from the screen.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "read_screen_structured", description: "Return a structured accessibility tree dump.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "find_element", description: "Find a UI element by text, hint, id, or class.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
-  { type: "function", function: { name: "take_screenshot", description: "Take a screenshot and return metadata.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "analyze_screenshot", description: "Analyze the last screenshot visually with the vision model.", parameters: { type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"] } } },
-  { type: "function", function: { name: "tap_button", description: "Tap an element by exact visible label. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
-  { type: "function", function: { name: "tap_coordinates", description: "Tap the screen at exact x/y coordinates. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
-  { type: "function", function: { name: "double_tap", description: "Double-tap by label or coordinates.", parameters: { type: "object", properties: { label: { type: "string" }, x: { type: "number" }, y: { type: "number" } } } } },
-  { type: "function", function: { name: "scroll", description: "Scroll the screen in a direction. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] } } } } },
-  { type: "function", function: { name: "swipe", description: "Swipe using start and end coordinates. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { startX: { type: "number" }, startY: { type: "number" }, endX: { type: "number" }, endY: { type: "number" }, duration_ms: { type: "number" } }, required: ["startX", "startY", "endX", "endY"] } } },
-  { type: "function", function: { name: "drag_and_drop", description: "Drag from one coordinate to another.", parameters: { type: "object", properties: { startX: { type: "number" }, startY: { type: "number" }, endX: { type: "number" }, endY: { type: "number" }, duration_ms: { type: "number" } }, required: ["startX", "startY", "endX", "endY"] } } },
-  { type: "function", function: { name: "focus_field", description: "Focus a text field by label, hint, or content-desc.", parameters: { type: "object", properties: { field: { type: "string" } }, required: ["field"] } } },
-  { type: "function", function: { name: "type_text", description: "Type text into the focused or targeted field. MANDATORY: You must immediately follow this action with 'read_screen' or 'read_screen_structured' to verify the UI state changed before taking the next step.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
-  { type: "function", function: { name: "clear_text", description: "Clear the focused or targeted input field.", parameters: { type: "object", properties: { field: { type: "string" } } } } },
-  { type: "function", function: { name: "paste_text", description: "Paste text via clipboard into a field.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
-  { type: "function", function: { name: "press_enter", description: "Press Enter / Done / Search on the keyboard.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "hide_keyboard", description: "Hide the soft keyboard.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "toggle_wifi", description: "Toggle Wi-Fi on or off.", parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] } } },
-  { type: "function", function: { name: "toggle_blue_tooth", description: "Toggle Bluetooth on or off.", parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] } } },
-  { type: "function", function: { name: "set_volume", description: "Set media volume 0-100.", parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] } } },
-  { type: "function", function: { name: "open_app_settings", description: "Open settings page for an app.", parameters: { type: "object", properties: { app_name: { type: "string" } }, required: ["app_name"] } } },
-  { type: "function", function: { name: "grant_permission_if_prompted", description: "Handle Android permission prompts.", parameters: { type: "object", properties: { allow: { type: "boolean" } }, required: ["allow"] } } },
-  { type: "function", function: { name: "make_call", description: "Initiate a phone call.", parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" } } } } },
-  { type: "function", function: { name: "send_whatsapp", description: "Open WhatsApp for a contact and optional message.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] } } },
-  { type: "function", function: { name: "send_sms", description: "Open SMS composer for a contact.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name"] } } },
-  { type: "function", function: { name: "play_music", description: "Play music on Spotify or YouTube.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
-  { type: "function", function: { name: "navigate_to", description: "Open Maps and navigate to a destination.", parameters: { type: "object", properties: { destination: { type: "string" } }, required: ["destination"] } } },
-  { type: "function", function: { name: "take_photo", description: "Open camera and capture a photo.", parameters: { type: "object", properties: { front_camera: { type: "boolean" } } } } },
-  { type: "function", function: { name: "set_alarm", description: "Set an alarm.", parameters: { type: "object", properties: { label: { type: "string" }, time: { type: "string" } }, required: ["time"] } } },
+  // ---- Phone/UI control (executed on Android) ----
+  { type: "function", function: { name: "open_app", description: "Launch any installed app by name or package. Always verify afterwards with read_screen.", parameters: { type: "object", properties: { app_name: { type: "string" }, package: { type: "string" } } } } },
+  { type: "function", function: { name: "read_screen", description: "Read visible text from the screen. Use this frequently to observe state and verify the result of every action.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "read_screen_structured", description: "Return exact coordinates of UI elements. Essential for precise clicking.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "tap_button", description: "Tap a button by its visible label/text.", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
+  { type: "function", function: { name: "tap_element", description: "Tap a UI element by its text label (same as tap_button).", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
+  { type: "function", function: { name: "tap_coordinates", description: "Tap specific x/y coordinates. Use when text-based tapping fails.", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
+  { type: "function", function: { name: "type_text", description: "Type text into the focused input field.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
+  { type: "function", function: { name: "scroll", description: "Scroll the UI in a direction.", parameters: { type: "object", properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] } }, required: ["direction"] } } },
+  { type: "function", function: { name: "go_back", description: "Press the Android back button.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "press_back", description: "Press the Android back button (alias of go_back).", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "press_home", description: "Go to the home screen.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "get_current_app", description: "Return the name of the currently focused app.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "get_current_activity", description: "Return the current Android activity/class.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "take_screenshot", description: "Capture the current screen for later analysis.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "analyze_screenshot", description: "Send the last screenshot to a vision model for UI analysis.", parameters: { type: "object", properties: { prompt: { type: "string" } } } } },
+  { type: "function", function: { name: "set_volume", description: "Set media/alarm volume level (0-100).", parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] } } },
+
+  // ---- Communication & daily-life tasks (general-purpose) ----
+  { type: "function", function: { name: "send_whatsapp", description: "Open a WhatsApp chat with a contact (by name) and draft a message. Then verify and send via UI.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name", "message"] } } },
+  { type: "function", function: { name: "send_sms", description: "Open the SMS composer to a contact with a message. Then verify and send via UI.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name", "message"] } } },
+  { type: "function", function: { name: "make_call", description: "Place a phone call to a contact.", parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" } }, required: ["contact_name"] } } },
+  { type: "function", function: { name: "set_alarm", description: "Set an alarm at a given time.", parameters: { type: "object", properties: { time: { type: "string" }, label: { type: "string" } }, required: ["time"] } } },
   { type: "function", function: { name: "set_timer", description: "Start a countdown timer.", parameters: { type: "object", properties: { duration: { type: "string" } }, required: ["duration"] } } },
-  { type: "function", function: { name: "search_web", description: "Search for current information on the web.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+  { type: "function", function: { name: "play_music", description: "Play music or media by query.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+  { type: "function", function: { name: "navigate_to", description: "Open navigation/GPS to a destination.", parameters: { type: "object", properties: { destination: { type: "string" } }, required: ["destination"] } } },
+  { type: "function", function: { name: "take_photo", description: "Open the camera app for a photo.", parameters: { type: "object", properties: { front_camera: { type: "boolean" } } } } },
+
+  // ---- Server-side tools (execute on the server) ----
+  { type: "function", function: { name: "run_code", description: "Execute Python/JS code for math, data parsing, or logic tasks. Essential for complex multi-step reasoning.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" } }, required: ["language", "code"] } } },
+  { type: "function", function: { name: "search_web", description: "Browse the internet for real-time information.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
-  { type: "function", function: { name: "get_market_data", description: "Get live spot price for a forex/crypto symbol.", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
-  { type: "function", function: { name: "analyze_market", description: "Full market analysis: structure, indicators, auction, trade plan.", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, outputsize: { type: "number" } }, required: ["symbol"] } } },
-  { type: "function", function: { name: "run_code", description: "Execute Python or JavaScript in a secure sandbox.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" }, timeout_ms: { type: "number" } }, required: ["language", "code"] } } },
-  { type: "function", function: { name: "wait_and_verify", description: "Wait for Android to process an action, then automatically trigger a screen read. Use this instead of calling read_screen manually after taps.", parameters: { type: "object", properties: { delay_ms: { type: "number", default: 500 } }, required: [] } } },
-  { type: "function", function: { name: "assert_text_visible", description: "Check the last known device state for a string. Do NOT use read_screen for this. Use this to verify a previous action succeeded.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
+  { type: "function", function: { name: "get_market_data", description: "Fetch live spot prices for one or more symbols (e.g. XAUUSD, BTCUSD).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
+  { type: "function", function: { name: "analyze_market", description: "Run the FRIT SMC+CRT market analysis on a symbol (returns direction, entry, SL, TP, confidence).", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, outputsize: { type: "number" } }, required: ["symbol"] } } },
+  { type: "function", function: { name: "get_market_quote", description: "Fetch a quick market quote for a symbol.", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
+  { type: "function", function: { name: "get_acp_status", description: "Get the Automated Conviction Proxy for a symbol (direction, confidence, paper-trade win rate, crash regime).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
+  { type: "function", function: { name: "get_gsri_status", description: "Get the GSRI risk snapshot.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "get_systems_status", description: "Get overall server system status.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "wait_and_verify", description: "Wait a moment before verifying state (use after actions that take time).", parameters: { type: "object", properties: { delay_ms: { type: "number" } } } } },
+  { type: "function", function: { name: "assert_text_visible", description: "Verify that text is visible on the last screen state.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
 ];
 
 // ==================== LOCAL TOOL EXECUTION ====================
@@ -1227,22 +1693,44 @@ async function runLocalTool(name, args = {}, agentState = null) {
 }
 
 // ==================== AUTOMATION SYSTEM PROMPT ====================
-function buildAutomationSystemPrompt({ deviceState, memory }) {
+function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = "", tradeMemory = "", verification = null, lastFailure = "" }) {
   const deviceStateText = buildDeviceStateBlock(deviceState);
   const memoryText = buildMemoryBlock(summarizeMemory(memory, 6, 700));
+  const ledgerText = Array.isArray(ledger) && ledger.length
+    ? `\nTask ledger (tracked server-side — subtasks are marked done/failed automatically):\n${ledger.map(t => `- [${t.status}] ${t.description}${t.note ? ` — ${t.note}` : ""}`).join("\n")}`
+    : "";
+  const verifyText = verification
+    ? `\nVERIFICATION OF LAST ACTION (from an independent verifier model): ${JSON.stringify(verification)}${verification.verified ? "" : " — if not verified, self-correct with a DIFFERENT approach."}`
+    : "";
+  const failureText = lastFailure
+    ? `\nNOTE — a previous attempt failed: ${lastFailure}. If you are retrying, use a DIFFERENT approach.`
+    : "";
   return [
-    "You are FRIT, an Android device-control agent operating a State Machine.",
-    "CRITICAL RULE: The UI is asynchronous. You cannot assume an action succeeded until you read the state.",
-    "THE STRICT EXECUTION LOOP:",
-    "1. Plan Step (e.g., 'Tap Settings')",
-    "2. Execute Action (Call tool)",
-    "3. VERIFY STATE (You MUST call 'wait_and_verify' -> 'read_screen' or 'assert_text_visible')",
-    "4. If state matches expectation -> Go to Step 1 for next action.",
-    "5. If state does NOT match -> Recover (e.g., try tap_coordinates, scroll, or press_back).",
-    "NEVER chain more than ONE physical action (tap/type/swipe) without a verification step in between.",
-    "NEVER guess what is on the screen. If you are unsure, call read_screen.",
+    "You are FRIT, an autonomous Android AI Agent. You operate the phone exactly like a human: observing the screen, planning, acting, and verifying.",
+    "CRITICAL RULE: YOU MUST BE AGENTIC AND PERSISTENT.",
+    "1. OBSERVE: Use 'read_screen' or 'read_screen_structured' to see what's on screen.",
+    "2. ANALYZE: If you don't see what you need, ANALYZE why. Maybe the app isn't open? Maybe you need to scroll?",
+    "3. ACT: Decide on ONE next step (tap, type, scroll, go_back, press_home).",
+    "4. VERIFY: Immediately call 'read_screen' again to see the result of your action. Did it work? If not, self-correct.",
+    "",
+    "TIPS FOR FULL AUTONOMY:",
+    "- To open any app: If not visible, press_home -> click search bar or use 'open_app'.",
+    "- To find a specific button: Use 'read_screen_structured' to get exact coordinates if text-matching fails.",
+    "- If a tool fails: Don't give up. Try a different approach (e.g., tap_coordinates instead of tap_button).",
+    "- Run Code: Use 'run_code' for complex logic, math, or data processing. Don't guess calculations.",
+    "- Browse: Use 'search_web' to find information.",
+    "- Market/trading tasks: analysis happens HERE on the server, NOT on the phone. Call 'analyze_market' or 'get_market_data' FIRST and read the returned direction/entry/SL/TP. Only use the phone (open_app MetaTrader5, tap, type) to EXECUTE an order after the analysis is complete.",
+    "",
+    "Your Goal is to finish the user's task COMPLETELY. If it takes 10 steps, do 10 steps.",
+    "",
+    goal ? `\nOverall goal: ${truncateText(goal, 500)}` : "",
+    ledgerText,
+    verifyText,
+    failureText,
+    "",
     "Device state:",
     deviceStateText,
+    tradeMemory ? `\n${tradeMemory}` : "",
     memoryText ? `\n${memoryText}` : "",
   ].filter(Boolean).join("\n");
 }
@@ -1261,133 +1749,6 @@ function buildDeviceStateBlock(ds = {}) {
   return parts.length ? parts.join("\n") : "No device state provided.";
 }
 
-// ==================== AUTOMATION HANDLER ====================
-function determineTaskType(goal) {
-  const text = String(goal || "").toLowerCase();
-  if (/(?:open|launch|start)s+(?:app|camera|whatsapp|browser|chrome)/i.test(text)) return "app_navigation";
-  if (/(?:send|write|message|text|email)/i.test(text)) return "messaging";
-  if (/(?:photo|picture|camera|screenshot)/i.test(text)) return "camera";
-  if (/(?:trade|buy|sell|market|forex|crypto)/i.test(text)) return "trading";
-  if (/(?:call|phone|dial)/i.test(text)) return "calling";
-  if (/(?:navigate|direction|map|go to)/i.test(text)) return "navigation";
-  if (/(?:search|find|look up|what is)/i.test(text)) return "search";
-  if (/(?:code|calculate|compute|script)/i.test(text)) return "coding";
-  return "general";
-}
-
-function getToolsForTask(goal) {
-  const text = String(goal || "").toLowerCase();
-  const core = ["press_back", "press_home", "open_recents", "open_notifications", "open_app",
-    "open_url", "read_screen", "read_screen_structured", "find_element", "tap_button",
-    "tap_coordinates", "scroll", "swipe", "search_web", "get_weather"
-  ];
-  const selected = [...core];
-  if (/(?:text|type|search|input|write)/i.test(text)) selected.push("focus_field", "type_text", "clear_text", "paste_text", "press_enter", "hide_keyboard");
-  if (/(?:call|whatsapp|sms|send)/i.test(text)) selected.push("make_call", "send_whatsapp", "send_sms");
-  if (/(?:photo|camera|screenshot)/i.test(text)) selected.push("take_photo", "take_screenshot", "analyze_screenshot");
-  if (/(?:trade|buy|sell|market|forex|crypto)/i.test(text)) selected.push("get_market_data", "analyze_market");
-  if (/(?:music|play|song|spotify)/i.test(text)) selected.push("play_music");
-  if (/(?:code|calculate|compute|python|javascript)/i.test(text)) selected.push("run_code");
-  if (/(?:wifi|bluetooth|volume|brightness|settings|permission)/i.test(text)) selected.push("toggle_wifi", "toggle_blue_tooth", "set_volume", "set_brightness", "open_app_settings", "grant_permission_if_prompted");
-  return [...new Set(selected)];
-}
-
-const pendingAndroidCallbacks = new Map();
-
-function waitForAndroid(callback, timeoutMs = 60000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pendingAndroidCallbacks.delete(callback);
-      reject(new Error(`Android timeout (${timeoutMs / 1000}s) for callback ${callback}`));
-    }, timeoutMs);
-    pendingAndroidCallbacks.set(callback, { resolve, reject, timer });
-  });
-}
-
-function resolveAndroid(callback, result) {
-  const cb = pendingAndroidCallbacks.get(callback);
-  if (cb) {
-    clearTimeout(cb.timer);
-    pendingAndroidCallbacks.delete(callback);
-    cb.resolve(result);
-    return true;
-  }
-  return false;
-}
-
-async function handleAutomationRequest({ goal, device_state = {}, memory = [], history = [], max_steps = 8, mode = "auto" }) {
-  const agentState = { deviceState: { ...device_state } };
-  const taskType = determineTaskType(goal);
-  const toolNames = getToolsForTask(goal);
-  const tools = AGENT_TOOLS.filter(t => toolNames.includes(t.function.name) || SERVER_SIDE_TOOLS.has(t.function.name));
-  const systemPrompt = buildAutomationSystemPrompt({ deviceState: agentState.deviceState, memory });
-  let messages = [
-    { role: "system", content: systemPrompt },
-    ...trimHistoryByChars(history, 10, 3500),
-    { role: "user", content: truncateText(goal, 3000) },
-  ];
-  const serverToolResults = [];
-  const androidActions = [];
-  const failedTools = {};
-  let lastAssistantText = "";
-
-  for (let step = 0; step < Math.max(1, Math.min(max_steps, 10)); step++) {
-    const out = await mistralChat({
-      model: pickModel({ mode, taskType }),
-      messages,
-      tools,
-      tool_choice: "auto",
-      max_tokens: 1500,
-    });
-    const msg = out.choices[0].message;
-    const toolCalls = extractToolCalls(msg);
-    lastAssistantText = msg.content || "";
-    if (!toolCalls.length) {
-      return { done: true, assistant_text: lastAssistantText, server_tool_results: serverToolResults, android_actions: androidActions, steps_completed: step };
-    }
-    messages.push({ role: "assistant", content: lastAssistantText, tool_calls: msg.tool_calls });
-
-    for (const tc of toolCalls) {
-      const name = tc.function.name;
-      const args = tc.function.arguments || {};
-      if (SERVER_SIDE_TOOLS.has(name)) {
-        try {
-          const result = await runLocalTool(name, args, agentState);
-          serverToolResults.push({ tool: name, arguments: args, result });
-          messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(result) });
-        } catch (err) {
-          if (!failedTools[name]) failedTools[name] = { attempts: 0, last_error: "" };
-          failedTools[name].attempts++;
-          failedTools[name].last_error = err.message;
-          const errResult = { ok: false, error: err.message };
-          serverToolResults.push({ tool: name, arguments: args, result: errResult });
-          messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(errResult) });
-        }
-      } else {
-        try {
-          const deviceResult = await waitForAndroid(tc.id);
-          if (deviceResult.observation) {
-            if (typeof deviceResult.observation === "string" && deviceResult.observation.length > 20)
-              agentState.deviceState.screen_text = deviceResult.observation;
-            if (deviceResult.data && typeof deviceResult.data === "object")
-              agentState.deviceState.screen_summary = JSON.stringify(deviceResult.data).slice(0, 1000);
-          }
-          androidActions.push({ id: tc.id, tool: name, arguments: args, device_result: deviceResult });
-          messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(deviceResult) });
-        } catch (timeoutErr) {
-          const timeoutResult = { status: "timeout", observation: "Android app did not respond within 60s" };
-          androidActions.push({ id: tc.id, tool: name, arguments: args, device_result: timeoutResult });
-          messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(timeoutResult) });
-          if (!failedTools[name]) failedTools[name] = { attempts: 0, last_error: "" };
-          failedTools[name].attempts++;
-          failedTools[name].last_error = timeoutErr.message;
-        }
-      }
-    }
-  }
-  return { done: false, assistant_text: lastAssistantText, server_tool_results: serverToolResults, android_actions: androidActions, failed_tools: failedTools, model_used: pickModel({ mode, taskType }) };
-}
-
 // ==================== SCREEN FRAME INGESTION ====================
 const frameBuffer = [];
 const FRAME_BUFFER_SIZE = 10;
@@ -1399,15 +1760,18 @@ app.get("/", (_req, res) => {
     description: "Pure SMC+CRT + Volume Profile + GSRI — no indicators. Single Mistral API ecosystem.",
     status: "online",
     endpoints: {
-      core: ["/health", "/chat", "/automate", "/automation-results", "/plan"],
+      core: ["/health", "/agent/start", "/agent/resume", "/agent/status"],
       market: ["/market/quote", "/market/batch", "/market/analyze", "/trade", "/gsri/status"],
+      positions: ["/positions", "/positions/status", "/positions/resolve"],
       scanner: ["/scanner/scan", "/scanner/control", "/scanner/status", "/smc/status"],
       memory: ["/memory/trade"],
       screen: ["/screen/frame", "/screen/analyze-frame", "/screen/status"],
       transcribe: ["/transcribe"],
-      utility: ["/weather"],
-    },
-  });
+      tools: ["/tools/search", "/acp/status"],
+    utility: ["/weather"],
+    sandbox: ["/sandbox/run"],
+  },
+});
 });
 
 app.get("/health", (_req, res) => {
@@ -1417,386 +1781,18 @@ app.get("/health", (_req, res) => {
     twelve_data: !!TWELVE_DATA_KEY,
     mt5_bridge: !!MT5_BRIDGE_URL,
     sandbox_url: SANDBOX_URL,
-    pending_android_callbacks: pendingAndroidCallbacks.size,
     frame_buffer: frameBuffer.length,
     cache_entries: _cache.size,
     uptime: Math.floor(process.uptime()) + "s",
   });
 });
 
-// ==================== CHAT SESSION STORE (for IntegrationCoordinator tool-call loop) ====================
-const chatSessions = new Map();
-
-function getSessionByToolId(toolCallId) {
-  for (const [sessionId, session] of chatSessions) {
-    const toolIds = session.toolCallIds || [];
-    if (toolIds.includes(toolCallId)) return { sessionId, ...session };
-  }
-  return null;
-}
-
-// ==================== TRADE INTENT DETECTION ====================
-let globalLastDeviceState = {};
-
-function detectTradeIntent(message) {
-  const text = String(message || "").toLowerCase();
-  return /\b(open|execute|place|put|enter|trade now|do it|go ahead)\s+(trade|order|position|deal|transaction)\b/i.test(text)
-    || /\b(open|execute|place|put|enter)\s+(this|that|the)\s+(trade|order)\b/i.test(text)
-    || /\b(open|execute)\s+in\s+mt5\b/i.test(text);
-}
-
-function buildTradeGoal({ symbol, direction, entry, sl, tp, interval = "1h" }) {
-  const action = direction.toLowerCase() === "buy" ? "BUY" : "SELL";
-  return `Open MetaTrader 5 app. Wait for it to load (use wait_and_verify).
-Navigate to the ${symbol} chart on ${interval} timeframe (use tap on symbols list, type text, select).
-Wait for the chart to load (use wait_and_verify and read_screen to confirm).
-Place a ${action} order with entry ${entry}, stop loss ${sl}, take profit ${tp}.
-If there is a confirmation dialog, tap "Confirm" or "Place Order".
-After placing, read the screen to confirm the order is placed and report the result.
-Do not skip any verification steps.`;
-}
-
-// ==================== CHAT ====================
-app.post("/chat", requireAuth, async (req, res) => {
-  const { message, history = [], memory = [], screen_context, mode = "auto", device_state } = req.body || {};
-  if (!message) return res.status(400).json({ error: "No message" });
-  const safeHistory = trimHistoryByChars(history, 8, 3200);
-  const safeMemory = summarizeMemory(memory, 6, 700);
-  const safeScreenCtx = maybeTrimScreenContext(screen_context);
-  const hasImage = !!safeScreenCtx;
-  const model = pickModel({ hasImage, mode });
-
-  const symMatch = String(message).match(/\b(EURUSD|GBPUSD|USDJPY|AUDUSD|XAUUSD|USDCHF|USDCAD|NZDUSD|GBPJPY|EURJPY|EURGBP|BTCUSD|ETHUSD|SOLUSD|BNBUSD|XRPUSD|DOGEUSD|ADAUSD|BTC|ETH|SOL|BNB|XRP|DOGE|ADA|USDNGN)\b/i);
-  const ivMatch = String(message).match(/\b(1min|5min|15min|30min|1h|4h|1day)\b/i);
-  const sizeMatch = String(message).match(/\b(\d{2,3})\s*(candles?|bars?|data points?)\b/i);
-
-  let analysis = null;
-
-  if (symMatch && isMarketMessage(message)) {
-    try {
-      const sym = symMatch[1].toUpperCase();
-      const iv = ivMatch?.[1]?.toLowerCase() || "1h";
-      const sz = sizeMatch ? parseInt(sizeMatch[1], 10) : null;
-      analysis = await analyzeSymbol(sym, iv, sz);
-    } catch (err) { console.error("[chat market fetch]", err.message); }
-  }
-
-  const wantsExecute = detectTradeIntent(message);
-
-  if (wantsExecute && analysis && !analysis.error) {
-    const direction = analysis.direction.toLowerCase();
-    const action = direction === "bullish" ? "buy" : "sell";
-    const entry = analysis.trade_plan?.entry_zone?.split("-")[0]?.trim() || analysis.price;
-    const sl = analysis.trade_plan?.invalidation;
-    const tp = analysis.trade_plan?.tp1;
-    const interval = analysis.interval || "1h";
-    const symbol = analysis.symbol;
-
-    if (!sl || !tp) {
-      return res.json({
-        text: "I cannot execute the trade because stop loss or take profit is missing. Please check the analysis and try again.",
-        analysis,
-      });
-    }
-
-    const goal = buildTradeGoal({ symbol, direction: action, entry, sl, tp, interval });
-    const deviceState = device_state || globalLastDeviceState || {};
-
-    try {
-      // Call Mistral ONCE with automation tools — returns tool_calls for IntegrationCoordinator loop
-      const taskType = "trading";
-      const toolNames = getToolsForTask(goal);
-      const tools = AGENT_TOOLS.filter(t => toolNames.includes(t.function.name) || SERVER_SIDE_TOOLS.has(t.function.name));
-
-      const automationSystemPrompt = buildAutomationSystemPrompt({ deviceState, memory: safeMemory });
-      const msgs = [
-        { role: "system", content: automationSystemPrompt },
-        ...trimHistoryByChars(safeHistory, 4, 2000),
-        { role: "user", content: truncateText(goal, 3000) },
-      ];
-
-      const out = await mistralChat({
-        model: pickModel({ mode: "auto", taskType }),
-        messages: msgs,
-        tools,
-        tool_choice: "auto",
-        max_tokens: 1500,
-      });
-
-      const msg = out.choices[0].message;
-      const toolCalls = extractToolCalls(msg);
-
-      // Store session so /automation-results can continue the conversation
-      const sessionId = `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      chatSessions.set(sessionId, {
-        messages: [...msgs, { role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls }],
-        tools,
-        toolCallIds: toolCalls.map(tc => tc.id),
-        model: pickModel({ mode: "auto", taskType }),
-      });
-      setTimeout(() => chatSessions.delete(sessionId), 5 * 60 * 1000);
-
-      return res.json({
-        text: msg.content || `Initiating ${action.toUpperCase()} ${symbol} trade...`,
-        tool_calls: msg.tool_calls || [],
-        analysis,
-        session_id: sessionId,
-        trade_goal: goal,
-      });
-    } catch (err) {
-      console.error("[chat automation]", err.message);
-      return res.json({
-        text: `I prepared the analysis but couldn't start automation: ${err.message}. You can use the analysis to trade manually.`,
-        analysis,
-      });
-    }
-  }
-
-  if (symMatch && isMarketMessage(message) && !wantsDetailedTradeReason(message) && analysis && !analysis.error) {
-    return res.json({
-      text: formatConciseSignal(analysis),
-      model_used: "local_market_formatter",
-      concise_signal: analysis.concise_signal || null,
-      full_analysis_available: true,
-    });
-  }
-
-  let liveData = "";
-  if (analysis && !analysis.error) {
-    const auctionLine = analysis.auction ? `Auction: POC=${analysis.auction.poc} VAH=${analysis.auction.vah} VAL=${analysis.auction.val} | ${analysis.auction.note}` : "";
-    liveData = [
-      "",
-      "== LIVE MARKET DATA (fetched now) ==",
-      analysis.summary,
-      `Signal: ${analysis.concise_signal?.direction} | Entry ${analysis.concise_signal?.entry} | SL ${analysis.concise_signal?.sl} | TP ${analysis.concise_signal?.tp}`,
-      auctionLine,
-      `AI Opinion: ${analysis.concise_signal?.ai_opinion || ""}`,
-      "INSTRUCTION: Respond with Direction, Entry, SL, TP, AI Opinion only unless the user explicitly asks for reasons or full analysis.",
-    ].filter(Boolean).join("\n");
-  }
-
-  const systemPrompt = [
-    "You are FRIT, a sharp AI assistant and professional trading analyst.",
-    "When live market data is provided, use it directly. Do not guess.",
-    "For trading replies, be concise by default — only show full reasoning when explicitly asked.",
-    liveData,
-    symMatch ? formatTradeMemoryForPrompt(symMatch[1].toUpperCase()) : "",
-    buildMemoryBlock(safeMemory),
-  ].filter(Boolean).join("\n");
-
-  const userContent = hasImage
-    ? [{ type: "text", text: truncateText(message, 4000) }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${safeScreenCtx}` } }]
-    : truncateText(message, 4000);
-
-  try {
-    const out = await mistralChat({
-      model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...safeHistory,
-        { role: "user", content: userContent },
-      ],
-      max_tokens: 1600,
-    });
-    res.json({
-      text: out.choices[0].message.content,
-      model_used: model,
-      payload_guard: {
-        screen_context_used: !!safeScreenCtx,
-        memory_items_used: safeMemory.length,
-        history_messages_used: safeHistory.length,
-      },
-    });
-  } catch (err) {
-    console.error("[chat]", err.message);
-    res.status(500).json({ error: "AI request failed", details: err.message });
-  }
-});
-
-// ==================== AUTOMATE (for SubAgentOrchestrator.agenticLoop) ====================
-app.post("/automate", requireAuth, async (req, res) => {
-  const { goal, device_state = {}, memory = [], screen_context } = req.body || {};
-  if (!goal) return res.status(400).json({ error: "goal required" });
-
-  try {
-    // Extract action_history from device_state (as sent by SubAgentOrchestrator)
-    const actionHistory = device_state?.action_history;
-    const cleanDeviceState = { ...device_state };
-    delete cleanDeviceState.action_history;
-    delete cleanDeviceState.structured_ui;
-
-    // Build conversation
-    const taskType = determineTaskType(goal);
-    const toolNames = getToolsForTask(goal);
-    const tools = AGENT_TOOLS.filter(t => toolNames.includes(t.function.name) || SERVER_SIDE_TOOLS.has(t.function.name));
-
-    const systemPrompt = buildAutomationSystemPrompt({ deviceState: cleanDeviceState, memory });
-    const messages = [{ role: "system", content: systemPrompt }];
-
-    // Replay action history as tool responses (so Mistral knows what's been done)
-    if (Array.isArray(actionHistory) && actionHistory.length > 0) {
-      for (const action of actionHistory) {
-        messages.push({
-          role: "tool",
-          tool_call_id: `prev_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          content: JSON.stringify(action.result || { ok: true }),
-        });
-      }
-    }
-
-    messages.push({ role: "user", content: truncateText(goal, 3000) });
-
-    // Call Mistral once
-    const out = await mistralChat({
-      model: pickModel({ mode: "auto", taskType }),
-      messages,
-      tools,
-      tool_choice: "auto",
-      max_tokens: 1500,
-    });
-
-    const msg = out.choices[0].message;
-    const toolCalls = extractToolCalls(msg);
-    const assistantText = msg.content || "";
-
-    if (!toolCalls.length) {
-      return res.json({ done: true, assistant_text: assistantText, pending_android_actions: [], pending_server_tools: [] });
-    }
-
-    // Separate into server-side and Android-side
-    const pendingServerTools = [];
-    const pendingAndroidActions = [];
-
-    for (const tc of toolCalls) {
-      const name = tc.function.name;
-      const args = tc.function.arguments || {};
-      if (SERVER_SIDE_TOOLS.has(name)) {
-        try {
-          const result = await runLocalTool(name, args, { deviceState: cleanDeviceState });
-          pendingServerTools.push({ name, arguments: args, result });
-        } catch (err) {
-          pendingServerTools.push({ name, arguments: args, result: { ok: false, error: err.message } });
-        }
-      } else {
-        pendingAndroidActions.push({ tool: name, arguments: args });
-      }
-    }
-
-    res.json({
-      done: false,
-      assistant_text: assistantText,
-      pending_android_actions: pendingAndroidActions,
-      pending_server_tools: pendingServerTools,
-    });
-  } catch (err) {
-    console.error("[automate]", err.message);
-    res.status(500).json({ error: "Automation failed", details: err.message });
-  }
-});
-
-app.post("/automation-results", requireAuth, async (req, res) => {
-  const { callId, status, observation, tool_results, original_query } = req.body || {};
-
-  // Format 1: Legacy callback resolution (callId from handleAutomationRequest)
-  if (callId) {
-    const resolved = resolveAndroid(callId, { status: status || "ok", observation: observation || "" });
-    return res.json({ success: resolved, callId });
-  }
-
-  // Format 2: IntegrationCoordinator chat tool-call loop
-  if (tool_results) {
-    try {
-      const results = Array.isArray(tool_results) ? tool_results : [];
-      if (!results.length) return res.json({ text: "No tool results provided.", tool_calls: [] });
-
-      // Find session by any tool_call_id in the results
-      let session = null;
-      let sessionId = null;
-      for (const tr of results) {
-        const found = getSessionByToolId(tr.tool_call_id);
-        if (found) { session = found; sessionId = found.sessionId; break; }
-      }
-
-      if (!session) {
-        return res.json({ text: "Session expired or not found. Please send your request again.", tool_calls: [] });
-      }
-
-      // Append tool results as tool response messages
-      for (const tr of results) {
-        session.messages.push({
-          role: "tool",
-          tool_call_id: tr.tool_call_id,
-          content: typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content),
-        });
-      }
-
-      // Call Mistral to continue
-      const out = await mistralChat({
-        model: session.model || pickModel({ mode: "auto", taskType: "general" }),
-        messages: session.messages,
-        tools: session.tools || [],
-        tool_choice: "auto",
-        max_tokens: 1500,
-      });
-
-      const msg = out.choices[0].message;
-      const toolCalls = extractToolCalls(msg);
-
-      // Update session with new tool call IDs
-      session.toolCallIds = toolCalls.map(tc => tc.id);
-      session.messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
-
-      return res.json({
-        text: msg.content || "",
-        tool_calls: msg.tool_calls || [],
-        done: toolCalls.length === 0,
-      });
-    } catch (err) {
-      console.error("[/automation-results chat loop]", err.message);
-      return res.json({ text: `Error continuing conversation: ${err.message}`, tool_calls: [] });
-    }
-  }
-
-  return res.status(400).json({ error: "Either callId or tool_results required" });
-});
-
-app.post("/plan", requireAuth, async (req, res) => {
-  const { task, device_state = {}, memory = [] } = req.body || {};
-  if (!task) return res.status(400).json({ error: "task required" });
-  const prompt = [
-    "You are a planner for an Android AI agent.",
-    "Return a concise numbered plan only. Do not execute tools.",
-    "Include verification steps after major navigation actions.",
-    "Include fallback steps for likely failure points.",
-    "",
-    "Goal: ",
-    truncateText(task, 2000),
-    "",
-    "Device state: ",
-    buildDeviceStateBlock(device_state),
-    buildMemoryBlock(summarizeMemory(memory, 6, 700)),
-  ].filter(Boolean).join("\n");
-  try {
-    const out = await mistralChat({
-      model: MODELS.fast,
-      messages: [{ role: "system", content: "You create precise Android automation plans." }, { role: "user", content: prompt }],
-      max_tokens: 700,
-    });
-    res.json({ plan: out.choices[0].message.content, model_used: MODELS.fast });
-  } catch (err) {
-    console.error("[plan]", err.message);
-    res.status(500).json({ error: "Planning failed", details: err.message });
-  }
-});
 
 app.post("/screen/frame", requireAuth, (req, res) => {
   const { frameData, timestamp, width, height, current_app, screen_text, current_activity } = req.body || {};
   if (!frameData) return res.status(400).json({ error: "frameData required" });
   frameBuffer.push({ data: frameData, timestamp: timestamp || Date.now(), width, height });
   if (frameBuffer.length > FRAME_BUFFER_SIZE) frameBuffer.shift();
-  if (current_app || screen_text || current_activity) {
-    globalLastDeviceState = { ...globalLastDeviceState, current_app, screen_text, current_activity, updatedAt: Date.now() };
-  }
   res.json({ status: "received", buffered: frameBuffer.length });
 });
 
@@ -1887,8 +1883,12 @@ app.post("/trade", requireAuth, async (req, res) => {
 
   if (pipeline === "enhanced") {
     try {
-      const result = await frit.analyze(symbol, interval, { balance: balance || 1000, riskPercent: risk_percent });
-      if (result.decision === "NO_TRADE" || result.decision === "COOLDOWN") {
+      const strategy = String(req.body?.strategy || "mtf").toLowerCase();
+      const result = strategy === "smc_crt"
+        ? await frit.analyze(symbol, interval, { balance: balance || 1000, riskPercent: risk_percent })
+        : await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
+
+      if (["NO_TRADE", "WAIT", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
         return res.status(200).json({ status: "blocked", ...result });
       }
       const tradeResult = await sendToMT5Bridge({
@@ -1898,22 +1898,44 @@ app.post("/trade", requireAuth, async (req, res) => {
         entry: result.entry,
         sl: result.sl,
         tp: result.tp,
-        reason: reason || `SMC+CRT pipeline: conf=${result.confidence}% sig=${result.smc_crt?.signal || "?"} crash=${result.crash_phase}`,
+        reason: reason || `MTF v1 pipeline: conf=${result.confidence}% regime=${result.regime?.trend} struct=${result.structure?.trend} zone=${result.entry_ctx?.zone}`,
       });
+
+      // Additive: watch this position until TP/SL is hit (paper-first by design).
+      let position = null;
+      if (tradeResult.status !== "failed" && result.sl && result.tp) {
+        try {
+          position = positionMonitor.register({
+            symbol: symbol.toUpperCase(),
+            action: result.decision === "BUY" ? "buy" : "sell",
+            lotSize: result.lot_size,
+            entry: result.entry,
+            sl: result.sl,
+            tp: result.tp,
+            source: strategy === "smc_crt" ? "smc_crt_pipeline" : "mtf_v1",
+            reason: reason || `conf=${result.confidence}%`,
+          });
+        } catch (e) { console.warn("[PositionMonitor] /trade register failed:", e.message); }
+      }
+
       return res.json({
         status: "submitted",
-        pipeline: "smc_crt",
+        pipeline: strategy === "smc_crt" ? "smc_crt" : "mtf_v1",
         symbol: symbol.toUpperCase(),
         action: result.decision === "BUY" ? "buy" : "sell",
         lotSize: result.lot_size,
         entry: result.entry,
         sl: result.sl,
         tp: result.tp,
+        tp2: result.tp2,
+        rr: result.rr,
         confidence: result.confidence,
-        smc_crt: result.smc_crt,
-        crash_phase: result.crash_phase,
-        gsri_mode: result.gsri_mode,
+        regime: result.regime,
+        structure: result.structure,
+        entry_ctx: result.entry_ctx,
+        guards: result.guards,
         mt5_result: tradeResult,
+        position_id: position?.id ?? null,
       });
     } catch (err) {
       console.error("[/trade enhanced]", err.message);
@@ -1961,6 +1983,23 @@ app.post("/trade", requireAuth, async (req, res) => {
 
     addTradeMemory(symbol, { direction: action, pattern: analysis.patterns?.join(", ") || "none", outcome: "pending", note: reason });
 
+    // Additive: watch this position until TP/SL is hit.
+    let position = null;
+    if (tradeResult.status !== "failed" && sl && tp) {
+      try {
+        position = positionMonitor.register({
+          symbol: symbol.toUpperCase(),
+          action,
+          lotSize,
+          entry,
+          sl,
+          tp,
+          source: "trade",
+          reason,
+        });
+      } catch (e) { console.warn("[PositionMonitor] /trade register failed:", e.message); }
+    }
+
     res.json({
       status: "submitted",
       symbol: symbol.toUpperCase(),
@@ -1977,11 +2016,29 @@ app.post("/trade", requireAuth, async (req, res) => {
       analysis_confidence: analysis.confidence,
       mtf_note: analysis.mtf?.note,
       gsri: { score: gsriScore, alert: gsriAlert, scale: gsriScale, date: gsriDate },
+      position_id: position?.id ?? null,
     });
   } catch (err) {
     console.error("[/trade]", err.message);
     res.status(500).json({ error: "Trade failed", details: err.message });
   }
+});
+
+// ==================== POSITIONS (PositionMonitor) ====================
+// Read-only + manual-resolve views over the additive position state machine.
+app.get("/positions", requireAuth, (_req, res) => {
+  res.json({ positions: positionMonitor.list(100) });
+});
+
+app.get("/positions/status", requireAuth, (_req, res) => {
+  res.json(positionMonitor.status());
+});
+
+app.post("/positions/resolve", requireAuth, (req, res) => {
+  const { id, outcome, close_price, note } = req.body || {};
+  if (!id) return res.status(400).json({ error: "id required" });
+  const result = positionMonitor.resolve(id, outcome, close_price ?? null, note || "");
+  res.json(result.ok ? result : { ok: false, error: result.error });
 });
 
 app.get("/gsri/status", requireAuth, async (req, res) => {
@@ -2034,17 +2091,110 @@ app.post("/transcribe", async (req, res) => {
   }
 });
 
+app.post("/sandbox/run", requireAuth, async (req, res) => {
+  try {
+    const result = await runSandbox(req.body);
+    res.json(result);
+  } catch (err) {
+    console.error("[/sandbox/run]", err.message);
+    res.status(500).json({ error: "Sandbox execution failed", details: err.message });
+  }
+});
+
+// ==================== WEB SEARCH & CONVICTION PROXY ====================
+// /tools/search — raw web-search endpoint used by the agent brain (search_web tool)
+// and by any client that wants real-time info without going through the LLM.
+app.post("/tools/search", requireAuth, async (req, res) => {
+  const { query } = req.body || {};
+  if (!query) return res.status(400).json({ error: "query required" });
+  try {
+    const data = await webSearch(String(query));
+    res.json({ ok: true, query, data });
+  } catch (err) {
+    console.error("[/tools/search]", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// /acp/status — Automated Conviction Proxy: a lightweight composite of every
+// signal the server already computes for a symbol (engine analysis + paper
+// track record + crash regime). Lets the brain/UI gauge conviction cheaply.
+app.get("/acp/status", requireAuth, async (req, res) => {
+  const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
+  try {
+    const analysis = await analyzeSymbol(sym, "1h", null);
+    const stats = frit.paperLogger.getStats(sym);
+    const gsri = frit.crashGSRI.getCached() || {};
+    const smc = frit.scanner.getLatestScan()?.results?.[sym] || null;
+    res.json({
+      symbol: sym,
+      direction: analysis.direction || "UNKNOWN",
+      confidence: analysis.confidence ?? null,
+      price: analysis.price ?? null,
+      strength: analysis.strength ?? null,
+      smc_signal: analysis.smc_crt?.signal ?? (smc ? smc.signal : null),
+      smc_confidence: smc ? smc.confidence : null,
+      paper_trades: stats ? { wins: stats.wins, losses: stats.losses, pending: stats.pending, win_rate: stats.win_rate } : null,
+      crash_regime: gsri.phase || "unknown",
+      crash_risk_score: gsri.risk_score ?? null,
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    console.error("[/acp/status]", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ==================== ENHANCED PIPELINE ROUTES ====================
 app.post("/enhanced/analyze", requireAuth, async (req, res) => {
-  const { symbol, interval = "1h", balance, riskPercent } = req.body || {};
+  const { symbol, interval = "1h", balance, riskPercent, strategy } = req.body || {};
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   try {
-    const result = await frit.analyze(symbol, interval, { balance, riskPercent });
+    const useMtf = String(strategy || "mtf").toLowerCase() !== "smc_crt";
+    const result = useMtf
+      ? await mtfStrategy.analyze(symbol, { interval, balance, riskPercent })
+      : await frit.analyze(symbol, interval, { balance, riskPercent });
     res.json(result);
   } catch (err) {
     console.error("[/enhanced/analyze]", err.message);
     res.status(500).json({ error: "Enhanced analysis failed", details: err.message });
   }
+});
+
+// Full multi-timeframe directional report — "build with directions".
+app.get("/market/strategy", requireAuth, async (req, res) => {
+  try {
+    const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
+    const result = await mtfStrategy.analyze(sym, {});
+    res.json(result);
+  } catch (err) {
+    console.error("[/market/strategy]", err.message);
+    res.status(500).json({ error: "Strategy analysis failed", details: err.message });
+  }
+});
+
+// Strategy engine status: cache + Twelve Data free-tier budget + last run.
+app.get("/strategy/status", requireAuth, async (req, res) => {
+  res.json({ ...mtfStrategy.cacheStatus(), scheduler: tradeScheduler.status() });
+});
+
+// Recurring trade tasks ("everyday analyze XAUUSD and place orders").
+app.post("/tasks/trade-schedule", requireAuth, async (req, res) => {
+  try {
+    const { symbol, time, riskPercent, balance, action } = req.body || {};
+    if (action === "stop") { tradeScheduler.stop(); return res.json({ ok: true, message: "Scheduler stopped" }); }
+    if (action === "start") { tradeScheduler.start(); return res.json({ ok: true, message: "Scheduler started" }); }
+    if (action === "remove") { return res.json({ ok: tradeScheduler.remove(symbol) }); }
+    const task = tradeScheduler.add({ symbol, time, riskPercent, balance });
+    tradeScheduler.start();
+    res.json({ ok: true, ...task });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/tasks/trade-schedule", requireAuth, (_req, res) => {
+  res.json(tradeScheduler.status());
 });
 
 app.post("/scanner/scan", requireAuth, async (req, res) => {
