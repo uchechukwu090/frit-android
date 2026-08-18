@@ -89,6 +89,9 @@ const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
 const MISTRAL_FAST_MODEL = process.env.MISTRAL_FAST_MODEL || "mistral-small-latest";
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
+// The sandbox service requires its own auth token. The AI never sees this —
+// the server attaches it when forwarding run_code calls.
+const SANDBOX_AUTH = process.env.SANDBOX_AUTH || "";
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || "";
 
@@ -738,9 +741,52 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
 }
 
 // ==================== AGENT ROUTES ====================
+// ==================== CHAT VS TASK PRE-ROUTER ====================
+// Pure chat (greetings, small talk, thanks, opinions) must NEVER enter the
+// agentic loop — that's what made "hi" produce tool calls. One cheap call to
+// the fast model classifies AND answers, so a greeting costs a single turn.
+const CHAT_ROUTER_PROMPT = `You are FRIT's message router. Decide whether the user's message is casual conversation or a real task.
+
+CONVERSATION means: greetings, small talk, thanks, "how are you", identity/opinion questions, jokes, or simple questions that need NO tools, NO phone actions, NO data fetching, NO code and NO search. Answer those briefly and warmly.
+
+TASK means: the user wants something DONE — real information retrieved (weather, market prices, analysis, web research, news), code written/run, a file or webpage created, an app opened or controlled on the phone, a message/call/alarm, a trade, or any multi-step work that needs tools.
+
+Reply with EXACTLY ONE line in this exact format:
+CONVERSATION <your brief, friendly reply>
+or
+TASK`;
+
+async function routeChatOrTask(goal, history = []) {
+  const msgs = [
+    { role: "system", content: CHAT_ROUTER_PROMPT },
+    ...(Array.isArray(history) ? history.slice(-8) : []).map(m => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: String(m.content || ""),
+    })),
+    { role: "user", content: String(goal || "") },
+  ];
+  const out = await chatWithFallback("fast", { messages: msgs, temperature: 0, max_tokens: 220 });
+  const text = String(out?.choices?.[0]?.message?.content || "").trim();
+  if (/^CONVERSATION\b/i.test(text)) {
+    const reply = text.replace(/^CONVERSATION\b/i, "").trim();
+    return { isTask: false, reply: reply || "Hey! What can I help you with?" };
+  }
+  return { isTask: true };
+}
+
 app.post("/agent/start", requireAuth, async (req, res) => {
-  const { goal, device_state, memory } = req.body;
+  const { goal, device_state, memory, history } = req.body;
   if (!goal) return res.status(400).json({ error: "Goal required" });
+
+  // Fast pre-route: pure conversation never touches the agentic loop.
+  try {
+    const routed = await routeChatOrTask(goal, Array.isArray(history) ? history : []);
+    if (!routed.isTask) {
+      return res.json({ done: true, assistant_text: routed.reply });
+    }
+  } catch (_) {
+    // Router failed — fall through to the agent loop rather than erroring out.
+  }
 
   const sessionId = `sess_${Date.now()}`;
 
@@ -889,11 +935,18 @@ function extractToolCalls(msg) {
 }
 
 // ========================= SANDBOX ==============================
+// Attach the sandbox's own auth token (SANDBOX_AUTH from Render env) so the
+// AI can run code without the user configuring anything. If unset we still
+// try without auth (local/dev sandboxes may not require one).
+function sandboxAuthHeaders() {
+  return SANDBOX_AUTH ? { "Content-Type": "application/json", Authorization: `Bearer ${SANDBOX_AUTH}` } : { "Content-Type": "application/json" };
+}
+
 async function runSandbox(args = {}) {
   try {
     const localRes = await fetch("http://127.0.0.1:8790/sandbox/run", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: sandboxAuthHeaders(),
       body: JSON.stringify(args),
       signal: AbortSignal.timeout(4000),
     });
@@ -904,7 +957,7 @@ async function runSandbox(args = {}) {
   } catch (_) {}
   const res = await fetch(`${SANDBOX_URL}/sandbox/run`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: sandboxAuthHeaders(),
     body: JSON.stringify(args),
   });
   const data = await res.json();
@@ -1830,7 +1883,7 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "take_photo", description: "Open the camera app for a photo.", parameters: { type: "object", properties: { front_camera: { type: "boolean" } } } } },
 
   // ---- Server-side tools (execute on the server) ----
-  { type: "function", function: { name: "run_code", description: "Execute Python/JS code for math, data parsing, backtesting, or logic tasks. Runs in a real sandbox — if your code writes a file (e.g. matplotlib chart to 'chart.png', a CSV, an HTML report) into its working directory, that file is captured and returned to the user as a visual/downloadable artifact. Prefer producing a file for anything the user would want to see or keep (charts, tables, reports) rather than just printing numbers.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" } }, required: ["language", "code"] } } },
+  { type: "function", function: { name: "run_code", description: "Execute Python/JS code server-side in a real sandbox (NO phone needed). Use it for: writing code, building webpages (write a .html file), math, data parsing, backtesting, charting, reports, file creation. If your code writes a file (e.g. matplotlib chart to 'chart.png', a CSV, 'index.html') into its working directory, that file is captured and returned to the user as a visual/downloadable artifact. ALWAYS use this instead of the phone for anything computational or for building files/webpages.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" } }, required: ["language", "code"] } } },
   { type: "function", function: { name: "search_web", description: "Deep web research spanning DuckDuckGo, Bing and Brave. Returns a real ranked result list (titles, URLs, snippets), NOT one abstract. Supports search-dorking operators: site:, intitle:, inurl:, filetype:, -keyword, \"exact phrase\". Call multiple times with refined queries for multi-angle research.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
   { type: "function", function: { name: "get_market_data", description: "Fetch live spot prices for one or more symbols (e.g. XAUUSD, BTCUSD).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
@@ -1919,6 +1972,9 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- You only have the tools explicitly provided to you in this request (open_app, read_screen, tap_button, type_text, run_code, search_web, get_market_data, analyze_market, send_whatsapp, make_call, etc.). Never assume a capability exists beyond that list — e.g. there is no generic 'send_message' or 'call_contact' tool, use the exact tool names you were given.",
     "",
     "TIPS FOR FULL AUTONOMY:",
+    "- CHOOSE THE RIGHT TOOL: match the problem to the cheapest correct tool. Code/webpages/files/charts/math/backtesting → 'run_code' (server-side sandbox). Facts/news/research → 'search_web'. Weather → 'get_weather'. Market prices/analysis → 'get_market_data'/'analyze_market'. Phone app control → device tools (open_app, tap, type).",
+    "- NEVER write or run code on the phone. Do not open IDE apps (PyCharm, etc.) on the device to build code — the phone is only for UI actions on OTHER apps. Code always goes through 'run_code' on the server, and any file it produces is returned to the user automatically.",
+    "- If the user asks for something that can be DONE server-side (a webpage, a chart, a report, a calculation, a search), do it with the server-side tool — never invent a phone workflow for it.",
     "- To open any app: If not visible, press_home -> click search bar or use 'open_app'.",
     "- To find a specific button: Use 'read_screen_structured' to get exact coordinates if text-matching fails.",
     "- If a tool fails: Don't give up. Try a different approach (e.g., tap_coordinates instead of tap_button).",
@@ -2010,6 +2066,7 @@ app.get("/health", (_req, res) => {
     twelve_data: !!TWELVE_DATA_KEY,
     mt5_bridge: !!MT5_BRIDGE_URL,
     sandbox_url: SANDBOX_URL,
+    sandbox_auth: !!SANDBOX_AUTH,
     frame_buffer: frameBuffer.length,
     cache_entries: _cache.size,
     uptime: Math.floor(process.uptime()) + "s",
