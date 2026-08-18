@@ -13,3 +13,9 @@ android/*.keystore
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Runtime sqlite DB (trade memory, positions) — regenerated locally, ephemeral on Render
+frit.db
+frit.db-shm
+frit.db-wal
+*.db-journal
