@@ -9,7 +9,6 @@ import Database from "better-sqlite3";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { analyzeSMC_CRT } from "./smc_crt_strategy.js";
 import { MTFStrategyEngine } from "./strategy/engine.js";
 import { TradeTaskScheduler } from "./strategy/scheduler.js";
 import { PositionMonitor } from "./strategy/position_monitor.js";
@@ -644,6 +643,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
       androidCalls.push(tc);
     }
 
+    const isLastIter = iter === MAX_SERVER_TOOL_LOOP;
     if (badAppCalls.length) {
       for (const tc of badAppCalls) {
         const content = JSON.stringify({
@@ -652,42 +652,57 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
         });
         fullMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.function.name, content });
       }
-      if (iter < MAX_SERVER_TOOL_LOOP) continue; // let the model self-correct
+      if (!isLastIter) continue; // let the model self-correct
+      // If it's the last iter, we fall through and the serverCalls block (or the final break)
+      // will handle the summary turn if needed.
     }
 
-    if (serverCalls.length && iter < MAX_SERVER_TOOL_LOOP) {
-      for (const tc of serverCalls) {
-        const name = tc.function.name;
-        const args = tc.function.arguments || {};
-        let result;
-        try {
-          result = await runLocalTool(name, args, { deviceState: deviceStateForPrompt });
-        } catch (err) {
-          result = { ok: false, error: err.message };
+    if (serverCalls.length || (badAppCalls.length && isLastIter)) {
+      if (serverCalls.length) {
+        for (const tc of serverCalls) {
+          const name = tc.function.name;
+          const args = tc.function.arguments || {};
+          let result;
+          try {
+            result = await runLocalTool(name, args, { deviceState: deviceStateForPrompt });
+          } catch (err) {
+            result = { ok: false, error: err.message };
+          }
+          // run_code can produce real files (charts, CSVs, backtest reports).
+          // Collect them for the client response, but strip the raw base64
+          // out of what goes back into the model's own context — feeding
+          // megabytes of encoded image data into every subsequent LLM call
+          // would blow the token budget for no benefit (the model can't see
+          // images this way anyway; it only needs to know a file was made).
+          if (name === "run_code" && Array.isArray(result?.data?.artifacts) && result.data.artifacts.length) {
+            for (const art of result.data.artifacts) turnArtifacts.push(art);
+            result = {
+              ...result,
+              data: {
+                ...result.data,
+                artifacts: result.data.artifacts.map(a => ({ name: a.name, mime: a.mime, size: a.size, note: "file generated — returned to client separately, not inlined here" })),
+              },
+            };
+          }
+          const content = JSON.stringify(result);
+          fullMessages.push({ role: "tool", tool_call_id: tc.id, name: name, content });
+          db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_call_id) VALUES (?, ?, ?, ?, ?)").run(
+            sessionId, fullMessages.length, "tool", content, tc.id
+          );
         }
-        // run_code can produce real files (charts, CSVs, backtest reports).
-        // Collect them for the client response, but strip the raw base64
-        // out of what goes back into the model's own context — feeding
-        // megabytes of encoded image data into every subsequent LLM call
-        // would blow the token budget for no benefit (the model can't see
-        // images this way anyway; it only needs to know a file was made).
-        if (name === "run_code" && Array.isArray(result?.data?.artifacts) && result.data.artifacts.length) {
-          for (const art of result.data.artifacts) turnArtifacts.push(art);
-          result = {
-            ...result,
-            data: {
-              ...result.data,
-              artifacts: result.data.artifacts.map(a => ({ name: a.name, mime: a.mime, size: a.size, note: "file generated — returned to client separately, not inlined here" })),
-            },
-          };
-        }
-        const content = JSON.stringify(result);
-        fullMessages.push({ role: "tool", tool_call_id: tc.id, name: name, content });
-        db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_call_id) VALUES (?, ?, ?, ?, ?)").run(
-          sessionId, fullMessages.length, "tool", content, tc.id
-        );
       }
-      continue; // feed results back to the brain
+
+      if (isLastIter) {
+        // execute them anyway, then force a final summary turn with tool_choice:"none"
+        const finalOut = await chatWithFallback(modelRole, { messages: fullMessages, tools: AGENT_TOOLS, tool_choice: "none" });
+        lastAssistantText = finalOut.choices[0].message.content || "";
+        db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_calls) VALUES (?, ?, ?, ?, ?)").run(
+          sessionId, fullMessages.length, "assistant", lastAssistantText, null
+        );
+        fullMessages.push({ role: "assistant", content: lastAssistantText });
+      } else {
+        continue; // feed results back to the brain
+      }
     }
 
     androidPending = androidCalls;
@@ -1291,43 +1306,9 @@ function analyzeVolatility(candles, price) {
 }
 
 // ==================== SCORING + TRADE PLAN ====================
-function scoreSetup({ structure, price, support, resistance, patterns, auction, auctionSig, mtf, smcCrt, volatility }) {
+function scoreSetup({ price, support, resistance, patterns, auction, auctionSig, mtf, volatility }) {
   let bull = 0, bear = 0;
   const atr = volatility?.atr || 1;
-
-  if (smcCrt?.structure) {
-    const st = smcCrt.structure;
-    if (st.trend === "uptrend") { bull += 4; bear -= 1; }
-    else if (st.trend === "downtrend") { bear += 4; bull -= 1; }
-    else if (st.trend === "potential_reversal_up") { bull += 2; }
-    else if (st.trend === "potential_reversal_down") { bear += 2; }
-  }
-  if (smcCrt) {
-    const isBuy = smcCrt.signal === "buy";
-    const isSell = smcCrt.signal === "sell";
-    if (isBuy) bull += Math.round(smcCrt.confidence / 8);
-    if (isSell) bear += Math.round(smcCrt.confidence / 8);
-    if (smcCrt.entry) {
-      if (isBuy) { bull += 3; bear -= 1; }
-      if (isSell) { bear += 3; bull -= 1; }
-    }
-    if (smcCrt.order_blocks?.bullish?.length > 0) bull += 1;
-    if (smcCrt.order_blocks?.bearish?.length > 0) bear += 1;
-    if (smcCrt.fvgs?.bullish?.length > 0) bull += 1;
-    if (smcCrt.fvgs?.bearish?.length > 0) bear += 1;
-    if (smcCrt.choch?.direction === "bullish") { bull += 3; if (isSell) bear -= 2; }
-    if (smcCrt.choch?.direction === "bearish") { bear += 3; if (isBuy) bull -= 2; }
-    const hasBullSweep = smcCrt.sweeps?.some(s => s.type === "bullish_sweep");
-    const hasBearSweep = smcCrt.sweeps?.some(s => s.type === "bearish_sweep");
-    if (hasBullSweep && isBuy) bull += 2;
-    if (hasBearSweep && isSell) bear += 2;
-    if (hasBullSweep && isSell) bear += 1;
-    if (hasBearSweep && isBuy) bull += 1;
-    if (smcCrt.crt) {
-      if (isBuy) { bull += 3; bear -= 2; }
-      if (isSell) { bear += 3; bull -= 2; }
-    }
-  }
 
   if (auction && auctionSig) {
     if (auctionSig.bias === "bullish") { bull += 3; bear -= 1; }
@@ -1515,8 +1496,7 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const patterns = detectCandlePattern(candles);
   const auction = calcAuction(candles);
   const auctionSig = auctionSignal(price, auction);
-  const smcCrt = analyzeSMC_CRT(candles, price, volatility.atr, auction);
-  const score = scoreSetup({ price, support, resistance, patterns, auction, auctionSig, mtf, smcCrt, volatility });
+  const score = scoreSetup({ price, support, resistance, patterns, auction, auctionSig, mtf, volatility });
 
   let direction = "NEUTRAL";
   if (score.bias === "bullish") direction = "BULLISH";
@@ -1527,30 +1507,22 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const isCrypto = CRYPTO_SET.has(sym);
   const dp = isCrypto || sym === "XAUUSD" ? 2 : 5;
 
-  let trade_plan;
-  const smcEntry = smcCrt?.entry;
-  if (smcEntry) {
-    trade_plan = {
-      entry_zone: `${smcEntry.price.toFixed(dp)}`,
-      invalidation: smcEntry.invalidation.toFixed(dp),
-      tp1: smcEntry.tp1.toFixed(dp),
-      tp2: smcEntry.tp2.toFixed(dp),
-      risk_state: "acceptable",
-      method: smcEntry.type,
-      reason: smcEntry.reason,
-    };
-  } else {
-    trade_plan = buildTradePlan({ bias: score.bias, price, support, resistance, atr: volatility.atr, dp });
-    trade_plan.method = "none";
-  }
+  const trade_plan = buildTradePlan({ bias: score.bias, price, support, resistance, atr: volatility.atr, dp });
+  trade_plan.method = "none";
 
   const auctionNote = auctionSig.note ? `Auction: ${auctionSig.note}` : "";
-  const smcReasons = smcCrt?.reasons?.length > 0 ? `SMC+CRT: ${smcCrt.reasons.join(";")}` : "";
   const aiOpinion = direction === "NEUTRAL"
-    ? `No clear edge. ${smcReasons} ${auctionNote}`.trim()
-    : `${direction} ${strength} | ${smcReasons} | ${auctionNote}`.trim();
+    ? `No clear edge. ${auctionNote}`.trim()
+    : `${direction} ${strength} | ${auctionNote}`.trim();
 
-  const sc = smcCrt?.structure || {};
+  // Structure now comes from local swing detection (was smcCrt.structure).
+  const structSwings = findSwings(candles, 3);
+  const sHighs = structSwings.highs.slice(-2), sLows = structSwings.lows.slice(-2);
+  const structTrend = (sHighs.length === 2 && sLows.length === 2)
+    ? (sHighs.at(-1).price > sHighs.at(-2).price && sLows.at(-1).price > sLows.at(-2).price ? "uptrend"
+      : sHighs.at(-1).price < sHighs.at(-2).price && sLows.at(-1).price < sLows.at(-2).price ? "downtrend" : "ranging")
+    : "ranging";
+  const sc = { trend: structTrend };
   const result = {
     symbol: sym,
     price,
@@ -1564,8 +1536,8 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
     confidence: score.confidence,
     structure: {
       trend: sc.trend || "ranging",
-      last_swing_high: smcCrt?.last_swing_high ? +smcCrt.last_swing_high.toFixed(dp) : null,
-      last_swing_low: smcCrt?.last_swing_low ? +smcCrt.last_swing_low.toFixed(dp) : null,
+      last_swing_high: structSwings.highs.at(-1)?.price ? +structSwings.highs.at(-1).price.toFixed(dp) : null,
+      last_swing_low: structSwings.lows.at(-1)?.price ? +structSwings.lows.at(-1).price.toFixed(dp) : null,
     },
     volatility: { atr: +volatility.atr.toFixed(dp), regime: volatility.regime },
     patterns,
@@ -1590,27 +1562,7 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
     mtf: { trend: mtf?.trend || "unknown", note: score.mtf_note },
     news_filter: { blocked: false },
     ai_opinion: aiOpinion,
-    smc_crt: smcCrt ? {
-      signal: smcCrt.signal,
-      confidence: smcCrt.confidence,
-      structure: sc,
-      order_blocks: smcCrt.order_blocks,
-      fvgs: smcCrt.fvgs,
-      sweeps: smcCrt.sweeps,
-      choch: smcCrt.choch,
-      crt: smcCrt.crt,
-      volume_profile: smcCrt.volume_profile,
-      entry: smcCrt.entry ? {
-        type: smcCrt.entry.type,
-        price: +smcCrt.entry.price.toFixed(dp),
-        invalidation: +smcCrt.entry.invalidation.toFixed(dp),
-        tp1: +smcCrt.entry.tp1.toFixed(dp),
-        tp2: +smcCrt.entry.tp2.toFixed(dp),
-        reason: smcCrt.entry.reason,
-      } : null,
-      reasons: smcCrt.reasons,
-    } : null,
-    summary: `${sym} @${price.toFixed(dp)} | ${direction}(${strength}) | Conf:${score.confidence} | Structure:${sc.trend || "?"}(4H:${mtf?.trend || "?"}) | SMC:${smcCrt?.signal || "none"}(${smcCrt?.confidence || 0}) | VP:${auctionSig.position.replace("_", " ")} POC:${auction?.poc.toFixed(dp) || "?"} VAH:${auction?.vah.toFixed(dp) || "?"} VAL:${auction?.val.toFixed(dp) || "?"} | S:${support.toFixed(dp)} R:${resistance.toFixed(dp)} [${candles.length} ${iv}]`,
+    summary: `${sym} @${price.toFixed(dp)} | ${direction}(${strength}) | Conf:${score.confidence} | Structure:${sc.trend || "?"}(4H:${mtf?.trend || "?"}) | VP:${auctionSig.position.replace("_", " ")} POC:${auction?.poc.toFixed(dp) || "?"} VAH:${auction?.vah.toFixed(dp) || "?"} VAL:${auction?.val.toFixed(dp) || "?"} | S:${support.toFixed(dp)} R:${resistance.toFixed(dp)} [${candles.length} ${iv}]`,
   };
   cacheSet(ck, result, 60000);
   return result;
@@ -1889,6 +1841,7 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "get_market_data", description: "Fetch live spot prices for one or more symbols (e.g. XAUUSD, BTCUSD).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "analyze_market", description: "Run the MTFStrategyEngine multi-timeframe analysis on a symbol (returns regime, structure, direction/decision, entry, SL, TP, confidence).", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, balance: { type: "number" }, risk_percent: { type: "number" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_market_quote", description: "Fetch a quick market quote for a symbol.", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
+  { type: "function", function: { name: "place_mt5_trade", description: "Place a real market order on MetaTrader 5 via the phone's MT5 agent. Use this after market analysis confirms a high-confidence entry signal.", parameters: { type: "object", properties: { symbol: { type: "string" }, action: { type: "string", enum: ["BUY", "SELL"] }, volume: { type: "number" }, sl: { type: "number" }, tp: { type: "number" } }, required: ["symbol", "action", "volume"] } } },
   { type: "function", function: { name: "get_acp_status", description: "Get the Automated Conviction Proxy for a symbol (direction, confidence, SMC signal, crash regime).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_gsri_status", description: "Get the GSRI risk snapshot.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "get_systems_status", description: "Get overall server system status.", parameters: { type: "object", properties: {} } } },
@@ -1957,6 +1910,13 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
   return [
     "You are FRIT, an autonomous Android AI Agent. You operate the phone exactly like a human: observing the screen, planning, acting, and verifying.",
     "CRITICAL RULE: YOU MUST BE AGENTIC AND PERSISTENT.",
+    "",
+    "# FRIT Mobile Agent Execution Mindset:",
+    "- UI Asynchrony: Android UIs do not refresh instantly. After executing a structural tap or typing text, always assume an animation or network lag of 300-800ms.",
+    "- Flaky Element Matching: Resource IDs change between app updates, and text labels may contain leading/trailing whitespaces. Always use fuzzy substring matching if an exact match fails.",
+    "- Coordination Safety: Never issue raw coordinates (tap_coordinates) unless element-based text anchors (tap_element, tap_button) are entirely absent from the structured screen dump. Bounding boxes shift based on device display scaling and DPI variations.",
+    "- Recovery: If an execution path blocks or fields are missing, do not hallucinate success. Tap go_back, re-examine the screen text structure, or call take_screenshot to confirm the visual layer.",
+    "",
     "1. OBSERVE: Use 'read_screen' or 'read_screen_structured' to see what's on screen.",
     "2. ANALYZE: If you don't see what you need, ANALYZE why. Maybe the app isn't open? Maybe you need to scroll?",
     "3. ACT: Decide on ONE next step (tap, type, scroll, go_back, press_home).",
@@ -2435,8 +2395,6 @@ app.get("/acp/status", requireAuth, async (req, res) => {
       confidence: analysis.confidence ?? null,
       price: analysis.price ?? null,
       strength: analysis.strength ?? null,
-      smc_signal: analysis.smc_crt?.signal ?? null,
-      smc_confidence: analysis.smc_crt?.confidence ?? null,
       paper_trades: null,
       crash_regime: gsriObj.Crash_Phase || "unknown",
       crash_risk_score: gsriObj.Risk_Score ?? null,
