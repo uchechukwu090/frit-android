@@ -180,7 +180,23 @@ function buildFallbackChain(primary) {
   return [...new Set(chain)];
 }
 
+function buildVisionFallbackChain(primary) {
+  const chain = [primary];
+  if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
+  if (HAS_GROQ) {
+    // Qwen 3.x series on Groq are multimodal (vision-capable)
+    chain.push("groq:qwen/qwen3.8-27b");
+    chain.push("groq:qwen/qwen3.6-27b");
+    chain.push("groq:llama-3.2-90b-vision-preview");
+    chain.push("groq:llama-3.2-11b-vision-preview");
+  }
+  // Pixtral is Mistral's high-capability vision model
+  if (MISTRAL_API_KEY) chain.push("pixtral-large-latest");
+  return [...new Set(chain)];
+}
+
 const FALLBACK_CHAINS = {
+  vision: buildVisionFallbackChain(MODELS.vision),
   agent: buildFallbackChain(MODELS.agent),
   tools: buildFallbackChain(MODELS.tools),
   conversation: buildFallbackChain(MODELS.conversation),
@@ -598,7 +614,8 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
   const modelToUse = pickModel({ hasImage, mode: opts.mode || "auto", taskType: "automation" });
   // Route through the fallback chain for whichever role this resolved to, so a
   // Groq rate limit (e.g. openai/gpt-oss-120b) doesn't kill the whole turn.
-  const modelRole = modelToUse === MODELS.agent ? "agent"
+  const modelRole = modelToUse === MODELS.vision ? "vision"
+    : modelToUse === MODELS.agent ? "agent"
     : modelToUse === MODELS.fast ? "fast"
     : modelToUse === MODELS.tools ? "tools"
     : "conversation";
@@ -2048,8 +2065,7 @@ app.post("/screen/analyze-frame", requireAuth, async (req, res) => {
   // arbitrary screenshot) pass frameData directly instead of pre-buffering it.
   if (frameData) {
     try {
-      const out = await mistralChat({
-        model: MODELS.vision,
+      const out = await chatWithFallback("vision", {
         messages: [{
           role: "user",
           content: [
@@ -2067,8 +2083,7 @@ app.post("/screen/analyze-frame", requireAuth, async (req, res) => {
   if (!frameBuffer.length) return res.status(400).json({ error: "No frames in buffer. Android app must send frames first via /screen/frame." });
   const frame = frameIndex >= 0 && frameIndex < frameBuffer.length ? frameBuffer[frameIndex] : frameBuffer.at(-1);
   try {
-    const out = await mistralChat({
-      model: MODELS.vision,
+    const out = await chatWithFallback("vision", {
       messages: [{
         role: "user",
         content: [
