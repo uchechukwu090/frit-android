@@ -23,7 +23,7 @@ export class PositionMonitor {
     this.getPrice = deps.getPrice;
     this.db = deps.db;
     this.onResolve = deps.onResolve || null;
-    this._intervalMs = deps.intervalMs || 60_000;
+    this._intervalMs = deps.intervalMs || 180_000;
     this._timer = null;
     this._lastTick = null;
     this._ensureTable();
@@ -119,8 +119,41 @@ export class PositionMonitor {
   async _tick() {
     this._lastTick = new Date().toISOString();
     const rows = this.db.prepare("SELECT * FROM positions WHERE status='MONITORING'").all();
+    if (!rows.length) return; // Zero API calls when no positions are active!
+
+    // Group positions by symbol so we only fetch 1 price per symbol (protect Twelve Data free tier)
+    const symbols = [...new Set(rows.map(r => r.symbol))];
+    const prices = new Map();
+    for (const sym of symbols) {
+      try {
+        const p = await this.getPrice(sym);
+        if (p != null && isFinite(p) && p > 0) prices.set(sym, p);
+      } catch (err) {
+        console.warn(`[PositionMonitor] Price fetch failed for ${sym}:`, err.message);
+      }
+    }
+
     for (const pos of rows) {
-      try { await this._check(pos); } catch (e) { console.error(`[PositionMonitor] check error ${pos.id}:`, e.message); }
+      const price = prices.get(pos.symbol);
+      if (price == null) continue;
+      try {
+        const action = String(pos.action).toLowerCase();
+        let outcome = null;
+        if (action === "buy") {
+          if (pos.tp != null && price >= pos.tp) outcome = "win";
+          else if (pos.sl != null && price <= pos.sl) outcome = "loss";
+        } else {
+          if (pos.tp != null && price <= pos.tp) outcome = "win";
+          else if (pos.sl != null && price >= pos.sl) outcome = "loss";
+        }
+        if (outcome) {
+          const note = outcome === "win" ? `TP hit @ ${price}` : `SL hit @ ${price}`;
+          console.log(`[PositionMonitor] ${pos.id} ${pos.symbol} -> ${outcome.toUpperCase()} @ ${price}`);
+          this.resolve(pos.id, outcome, price, note);
+        }
+      } catch (e) {
+        console.error(`[PositionMonitor] check error ${pos.id}:`, e.message);
+      }
     }
   }
 

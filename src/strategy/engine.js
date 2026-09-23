@@ -1,29 +1,29 @@
 // ============================================================================
-// FRIT MA-RSI COMBO ENGINE — EMA(9/21) crossover + RSI(14) band, 4H-confirmed
+// FRIT MA-RSI COMBO ENGINE (30M Primary + 4H Confirmation)
 // ----------------------------------------------------------------------------
-// Drop-in replacement for MTFStrategyEngine (strategy/engine.js). Same
-// constructor deps and same run()/analyze()/cacheStatus() contract, so
-// scheduler.js and the /trade "enhanced" pipeline in index.js work with only
-// an import swap — no other wiring changes needed.
-//
-// Primary TF : 1H  (kept — matches your existing data pipeline + scheduler
-//              cadence; the source doc's M15/M30 for crypto/FX was never
-//              validated against your setup, so not worth chasing)
-// Confirm TF : 4H  (preserves the doc's ~1:4 primary:confirmation ratio)
-//
-// NOTE ON THE SOURCE DOC: it defines the 4H trend filter as "slow EMA(21)
-// above fast EMA(9) => uptrend" — the reverse of the usual convention
-// (normally fast > slow = uptrend, since the fast EMA reacts quicker to
-// rising price). Implemented LITERALLY as the doc states — see
-// CONFIRM_TREND_INVERTED below. Flip it to false if this was a doc typo and
-// not deliberate; you should paper-trade both readings before trusting either.
+// - Primary TF       : 30-minute (30M)
+// - Confirmation TF  : 4-hour (4H)
+// - Rule             : 4H EMA 9 > 21 = Bullish; 4H EMA 9 < 21 = Bearish.
+//                      Trades are taken strictly in alignment with the 4H trend.
+// - Persistent State : Does NOT require a fresh crossover this exact minute;
+//                      existing EMA alignment defines the active trend regime.
+// - Dual Scenarios   :
+//     1. Immediate Entry  : Triggered when 30M aligns with 4H.
+//     2. Pullback Re-entry: Calculated target zone (50-61.8% Fib / EMA 21)
+//        and anticipated crossover level before it happens.
+// - Pullback Health  : Detects exhaustion vs real reversal using 30M volume,
+//                      RSI, and swing structure without any extra API calls.
+// - Hybrid TP/SL     :
+//     - TP1: Nearest 30M swing liquidity pool capped at 1.5x ATR (high win-rate).
+//     - TP2: 2.5x ATR runner.
+//     - SL : Capped by ATR and anchored to recent 30M swing structure.
+// - Zero Extra API Calls: Pullback health, structure breaks, and levels are
+//   computed directly on the 30M array to preserve Twelve Data free tier limits.
 // ============================================================================
 
-const CONFIRM_TREND_INVERTED = true;
-
-const CACHE_TTL_MS = { "4h": 40 * 60 * 1000, "1h": 15 * 60 * 1000 };
+const CACHE_TTL_MS = { "4h": 40 * 60 * 1000, "30m": 10 * 60 * 1000 };
 const MAX_REQUESTS_PER_MINUTE = 6;
-const MIN_TRADE_CONFIDENCE = 60;
+const MIN_TRADE_CONFIDENCE = 55;
 
 const FAST_PERIOD = 9;
 const SLOW_PERIOD = 21;
@@ -31,16 +31,16 @@ const RSI_PERIOD = 14;
 const ATR_PERIOD = 14;
 const VOL_SMA_PERIOD = 20;
 const ATR_SL_MULT = 1.5;
-const MAX_SL_ATR_MULT = 2.5; // sanity cap, same philosophy as mtf_v1
-const MIN_RR = 1.8;
+const MAX_SL_ATR_MULT = 2.5;
+const MIN_RR = 1.5;
 
-const SESSION_START_HOUR = 7;  // GMT, London/NY window — skipped for crypto
+const SESSION_START_HOUR = 7;  // GMT, London/NY window
 const SESSION_END_HOUR = 17;
 const WEEKEND_DAYS = new Set([0, 6]);
-const CRYPTO_SET = new Set(["BTCUSD", "ETHUSD", "BTCUSDT", "ETHUSDT"]); // extend as needed
+const CRYPTO_SET = new Set(["BTCUSD", "ETHUSD", "BTCUSDT", "ETHUSDT"]);
 
 // ---------------------------------------------------------------------------
-// Pure math helpers
+// Pure Math & Indicator Helpers
 // ---------------------------------------------------------------------------
 function emaSeries(values, period) {
   if (!values.length) return [];
@@ -50,7 +50,6 @@ function emaSeries(values, period) {
   return out;
 }
 
-// Wilder RSI — standard smoothing, matches ta-lib/pandas-ta default.
 function rsiSeries(closes, period = 14) {
   if (closes.length < period + 1) return [];
   const gains = [], losses = [];
@@ -91,9 +90,10 @@ function smaLast(values, period) {
   return w.reduce((a, b) => a + b, 0) / period;
 }
 
-// Last confirmed swing low/high, used only as an SL sanity anchor.
-function lastSwing(candles, lookback = 3) {
-  let low = null, high = null;
+// Swings detector on 30M array (finds both swing highs and swing lows)
+function detectSwings(candles, lookback = 3) {
+  const highs = [];
+  const lows = [];
   for (let i = candles.length - lookback - 1; i >= lookback; i--) {
     const c = candles[i];
     let isLow = true, isHigh = true;
@@ -102,11 +102,28 @@ function lastSwing(candles, lookback = 3) {
       if (candles[j].low <= c.low) isLow = false;
       if (candles[j].high >= c.high) isHigh = false;
     }
-    if (isLow && low == null) low = c.low;
-    if (isHigh && high == null) high = c.high;
-    if (low != null && high != null) break;
+    if (isHigh) highs.push({ index: i, price: c.high });
+    if (isLow) lows.push({ index: i, price: c.low });
+    if (highs.length >= 4 && lows.length >= 4) break;
   }
-  return { low, high };
+  return {
+    lastHigh: highs[0]?.price ?? null,
+    lastLow: lows[0]?.price ?? null,
+    prevHigh: highs[1]?.price ?? null,
+    prevLow: lows[1]?.price ?? null,
+    highs,
+    lows,
+  };
+}
+
+// Calculate the anticipated price at which EMA 9 will cross EMA 21
+function calculateAnticipatedCrossoverPrice(ema9, ema21) {
+  const alpha9 = 2 / (FAST_PERIOD + 1);   // 0.20
+  const alpha21 = 2 / (SLOW_PERIOD + 1); // 0.090909
+  const numerator = ema21 * (1 - alpha21) - ema9 * (1 - alpha9);
+  const denominator = alpha9 - alpha21;
+  if (denominator === 0) return null;
+  return numerator / denominator;
 }
 
 function sessionStatus(symbol) {
@@ -121,7 +138,7 @@ function sessionStatus(symbol) {
 }
 
 // ---------------------------------------------------------------------------
-// Engine
+// Engine Implementation
 // ---------------------------------------------------------------------------
 export class MTFStrategyEngine {
   constructor(deps = {}) {
@@ -148,7 +165,8 @@ export class MTFStrategyEngine {
   async _candles(symbol, interval, size) {
     const key = `${symbol}:${interval}:${size}`;
     const hit = this._cache.get(key);
-    if (hit && Date.now() - hit.ts < CACHE_TTL_MS[interval]) {
+    const ttl = CACHE_TTL_MS[interval] || 15 * 60 * 1000;
+    if (hit && Date.now() - hit.ts < ttl) {
       this.stats.cache_hits++;
       return hit.data;
     }
@@ -165,153 +183,292 @@ export class MTFStrategyEngine {
   async analyze(symbol, options = {}) {
     const sym = String(symbol || "").toUpperCase();
     const t0 = Date.now();
-    const [candles1H, candles4H] = await Promise.all([
-      this._candles(sym, "1h", 150),
+
+    // Primary: 30m (120 candles = 60 hours) | Confirmation: 4h (80 candles = ~13 days)
+    const [candles30M, candles4H] = await Promise.all([
+      this._candles(sym, "30m", 120),
       this._candles(sym, "4h", 80),
     ]);
 
-    const need1H = SLOW_PERIOD + RSI_PERIOD + VOL_SMA_PERIOD + 10;
-    if (!candles1H || candles1H.length < need1H || !candles4H || candles4H.length < SLOW_PERIOD + 5) {
+    const need30M = SLOW_PERIOD + RSI_PERIOD + VOL_SMA_PERIOD + 10;
+    if (!candles30M || candles30M.length < need30M || !candles4H || candles4H.length < SLOW_PERIOD + 5) {
       return {
         symbol: sym, decision: "DATA_UNAVAILABLE",
-        reason: "Insufficient candle data (need 1H + 4H history)",
-        strategy: "ma_rsi_v1", timestamp: Date.now(), elapsed_ms: Date.now() - t0,
+        reason: "Insufficient candle data (need 30M + 4H history)",
+        strategy: "ma_rsi_30m_v2", timestamp: Date.now(), elapsed_ms: Date.now() - t0,
       };
     }
 
-    const price = candles1H.at(-1).close;
+    const price = candles30M.at(-1).close;
     const dp = sym === "XAUUSD" || sym === "XAGUSD" ? 2 : CRYPTO_SET.has(sym) ? 2 : 5;
     const fmt = (x, d = dp) => (x == null ? null : Number(x.toFixed(d)));
 
-    // --- 4H trend/confirmation filter ---
+    // =========================================================================
+    // 1. 4H Confirmation Timeframe (Macro Direction)
+    // =========================================================================
     const closes4H = candles4H.map(c => c.close);
     const ema4hFast = emaSeries(closes4H, FAST_PERIOD).at(-1);
     const ema4hSlow = emaSeries(closes4H, SLOW_PERIOD).at(-1);
-    const trendUp = CONFIRM_TREND_INVERTED ? ema4hSlow > ema4hFast : ema4hFast > ema4hSlow;
-    const trendDown = CONFIRM_TREND_INVERTED ? ema4hSlow < ema4hFast : ema4hFast < ema4hSlow;
-    // Doc's "wait for next candle to confirm" adapted to a stateless poll:
-    // require the most recently CLOSED 4H candle already closed on the
-    // correct side of the 4H slow EMA, rather than waiting on an unformed one.
-    const confirmLong = candles4H.at(-1).close > ema4hSlow;
-    const confirmShort = candles4H.at(-1).close < ema4hSlow;
+    const macroBullish = ema4hFast > ema4hSlow;
+    const macroBearish = ema4hFast < ema4hSlow;
+    const macroTrend = macroBullish ? "BULLISH" : macroBearish ? "BEARISH" : "NEUTRAL";
 
-    // --- 1H EMA crossover ---
-    const closes1H = candles1H.map(c => c.close);
-    const emaFast1H = emaSeries(closes1H, FAST_PERIOD);
-    const emaSlow1H = emaSeries(closes1H, SLOW_PERIOD);
-    const n = emaFast1H.length;
-    const crossUp = emaFast1H[n - 2] <= emaSlow1H[n - 2] && emaFast1H[n - 1] > emaSlow1H[n - 1];
-    const crossDown = emaFast1H[n - 2] >= emaSlow1H[n - 2] && emaFast1H[n - 1] < emaSlow1H[n - 1];
+    // =========================================================================
+    // 2. 30M Primary Timeframe (Persistent Alignment + Crossover State)
+    // =========================================================================
+    const closes30M = candles30M.map(c => c.close);
+    const emaFast30MSeries = emaSeries(closes30M, FAST_PERIOD);
+    const emaSlow30MSeries = emaSeries(closes30M, SLOW_PERIOD);
+    const n = emaFast30MSeries.length;
 
-    // --- RSI(14) band ---
-    const rsiNow = rsiSeries(closes1H, RSI_PERIOD).at(-1);
-    const rsiInBand = rsiNow > 30 && rsiNow < 70;
-    const rsiLongSweet = rsiNow > 30 && rsiNow < 55;
-    const rsiShortSweet = rsiNow > 45 && rsiNow < 70;
+    const ema30mFast = emaFast30MSeries[n - 1];
+    const ema30mSlow = emaSlow30MSeries[n - 1];
 
-    // --- Volume filter (best-effort; forex volume is often tick-derived/unreliable) ---
-    const volumes1H = candles1H.map(c => c.volume || 0);
-    const rawVol = volumes1H.slice(-VOL_SMA_PERIOD).reduce((a, b) => a + b, 0);
-    const hasRealVol = rawVol > VOL_SMA_PERIOD * 2;
-    const volSma = smaLast(volumes1H, VOL_SMA_PERIOD);
-    const volOk = !hasRealVol ? true : (volumes1H.at(-1) > (volSma ?? 0)); // don't gate on an unreliable proxy
+    // Current state (persistent - does not need to cross right now)
+    const primaryBullish = ema30mFast > ema30mSlow;
+    const primaryBearish = ema30mFast < ema30mSlow;
 
-    const atr1H = atr(candles1H, ATR_PERIOD);
-    const swing = lastSwing(candles1H, 3);
-    const session = sessionStatus(sym);
-    let news = { blocked: false };
-    if (this.checkNewsFilter) {
-      try { news = await this.checkNewsFilter(sym); } catch { news = { blocked: false }; }
-    }
+    // Fresh crossover on the most recent 1-2 candles
+    const freshCrossUp = emaFast30MSeries[n - 2] <= emaSlow30MSeries[n - 2] && emaFast30MSeries[n - 1] > emaSlow30MSeries[n - 1];
+    const freshCrossDown = emaFast30MSeries[n - 2] >= emaSlow30MSeries[n - 2] && emaFast30MSeries[n - 1] < emaSlow30MSeries[n - 1];
 
-    const longSetup = crossUp && trendUp && confirmLong && rsiInBand && volOk;
-    const shortSetup = crossDown && trendDown && confirmShort && rsiInBand && volOk;
+    // Anticipated Crossover Price Level
+    const anticipatedCrossoverPrice = calculateAnticipatedCrossoverPrice(ema30mFast, ema30mSlow);
 
-    // --- Levels: fixed ATR multiple, sanity-widened to clear the last swing,
-    //     capped so a stop never drifts past MAX_SL_ATR_MULT * ATR ---
-    const buildLevels = (side) => {
-      const atrDist = ATR_SL_MULT * atr1H;
-      let slDist = atrDist;
-      if (side === "long" && swing.low != null && price - swing.low > atrDist) {
-        slDist = Math.min(price - swing.low + 0.1 * atr1H, MAX_SL_ATR_MULT * atr1H);
-      } else if (side === "short" && swing.high != null && swing.high - price > atrDist) {
-        slDist = Math.min(swing.high - price + 0.1 * atr1H, MAX_SL_ATR_MULT * atr1H);
+    // =========================================================================
+    // 3. Volatility, Swings & Pullback Health (Zero Extra API Calls)
+    // =========================================================================
+    const atr30M = atr(candles30M, ATR_PERIOD) || 1.0;
+    const swings = detectSwings(candles30M, 3);
+    const rsiNow = rsiSeries(closes30M, RSI_PERIOD).at(-1) || 50;
+
+    // Volume Health on 30M
+    const volumes30M = candles30M.map(c => c.volume || 0);
+    const volSma = smaLast(volumes30M, VOL_SMA_PERIOD) || 1;
+    const lastVol = volumes30M.at(-1);
+    const isCounterTrendVolLow = lastVol <= volSma * 1.1; // low volume counter-move = healthy pullback
+
+    // Pullback Exhaustion & Integrity Assessment
+    let pullbackStatus = "IN_TREND";
+    let isPullbackHealthy = true;
+    let isRealReversal = false;
+    let reversalSide = null;
+
+    if (macroBearish && primaryBullish) {
+      pullbackStatus = "BULLISH_PULLBACK_IN_BEAR_TREND";
+      const brokeSwingHigh = swings.lastHigh != null && price > swings.lastHigh;
+      const volumeSurging = lastVol > volSma * 1.3;
+      const rsiOverbought = rsiNow >= 62;
+
+      if (brokeSwingHigh || (volumeSurging && rsiOverbought)) {
+        isPullbackHealthy = false;
+        isRealReversal = true;
+        reversalSide = "BUY";
+        pullbackStatus = "INVALID_PULLBACK_REAL_BULLISH_REVERSAL";
+      } else {
+        isPullbackHealthy = isCounterTrendVolLow && rsiNow <= 60;
       }
-      const sl = side === "long" ? price - slDist : price + slDist;
-      const tp = side === "long" ? price + 2 * slDist : price - 2 * slDist;   // 1:2 RR
-      const tp2 = side === "long" ? price + 1 * slDist : price - 1 * slDist;  // 1:1 partial
-      const rr = slDist > 0 ? Math.abs(tp - price) / slDist : 0;
-      return { entry: price, sl, tp, tp2, rr };
-    };
+    } else if (macroBullish && primaryBearish) {
+      pullbackStatus = "BEARISH_PULLBACK_IN_BULL_TREND";
+      const brokeSwingLow = swings.lastLow != null && price < swings.lastLow;
+      const volumeSurging = lastVol > volSma * 1.3;
+      const rsiOversold = rsiNow <= 38;
 
-    const scoreSide = (side) => {
-      let conf = 50;
-      const reasons = [`4H trend ${trendUp && side === "long" ? "up" : trendDown && side === "short" ? "down" : "misaligned"}`];
-      conf += 15; // crossover fired
-      conf += 10; // trend aligned (only reached if setup true)
-      conf += 8;  // confirmation TF aligned
-      reasons.push(`EMA(${FAST_PERIOD}/${SLOW_PERIOD}) ${side === "long" ? "bullish" : "bearish"} crossover on 1H`);
-      reasons.push(`4H close confirms (vs slow EMA)`);
-      if (side === "long" ? rsiLongSweet : rsiShortSweet) { conf += 7; reasons.push(`RSI ${rsiNow.toFixed(1)} in sweet spot`); }
-      else { conf += 3; reasons.push(`RSI ${rsiNow.toFixed(1)} in band but outside sweet spot`); }
-      if (hasRealVol && volOk) { conf += 5; reasons.push("Volume above 20-SMA"); }
-      if (session.ok) { conf += 5; reasons.push(session.reason); } else reasons.push(session.reason);
-      if (!news.blocked) { conf += 5; reasons.push("No high-impact news within window"); }
-      return { conf: Math.max(0, Math.min(95, Math.round(conf))), reasons };
-    };
-
-    let signal = "WAIT", side = null, levels = null, conf = 0, reasons = [];
-    if (longSetup || shortSetup) {
-      side = longSetup ? "long" : "short";
-      levels = buildLevels(side);
-      const scored = scoreSide(side);
-      conf = scored.conf; reasons = scored.reasons;
-      if (levels.rr < MIN_RR) reasons.push(`Filtered: RR ${levels.rr.toFixed(2)} below minimum ${MIN_RR}`);
-      else if (news.blocked) { signal = "NO_TRADE"; }
-      else if (!session.ok) { signal = "WAIT"; }
-      else if (conf >= MIN_TRADE_CONFIDENCE) { signal = side === "long" ? "BUY" : "SELL"; }
-    } else {
-      reasons = [
-        crossUp || crossDown ? "Crossover fired but trend/confirmation/RSI/volume filter blocked it" : "No EMA crossover on 1H",
-      ];
+      if (brokeSwingLow || (volumeSurging && rsiOversold)) {
+        isPullbackHealthy = false;
+        isRealReversal = true;
+        reversalSide = "SELL";
+        pullbackStatus = "INVALID_PULLBACK_REAL_BEARISH_REVERSAL";
+      } else {
+        isPullbackHealthy = isCounterTrendVolLow && rsiNow >= 40;
+      }
     }
 
+    // =========================================================================
+    // 4. Session & News Advisory
+    // =========================================================================
+    const session = sessionStatus(sym);
+    let news = { blocked: false, has_news: false };
+    if (this.checkNewsFilter) {
+      try { news = await this.checkNewsFilter(sym); } catch { news = { blocked: false, has_news: false }; }
+    }
+
+    // =========================================================================
+    // 5. Scenarios: Immediate Entry vs Pullback/Anticipated Re-entry
+    // =========================================================================
+    const isAligned = (macroBullish && primaryBullish) || (macroBearish && primaryBearish);
+    const activeSide = macroBullish ? "BUY" : macroBearish ? "SELL" : "NEUTRAL";
+
+    let scenario1 = null;
+    let scenario2 = null;
+
+    if (isRealReversal && reversalSide) {
+      // RULE: When the pullback checker observes that a real reversal move is playing out,
+      // no new trend-continuation entry will occur. Dual scenarios are canceled and
+      // replaced with EXACTLY 1 IMMEDIATE ENTRY in the reversal direction.
+      const isLong = reversalSide === "BUY";
+      const slDist = Math.min(MAX_SL_ATR_MULT * atr30M, Math.max(ATR_SL_MULT * atr30M, isLong ? (swings.lastLow ? price - swings.lastLow + 0.1 * atr30M : ATR_SL_MULT * atr30M) : (swings.lastHigh ? swings.lastHigh - price + 0.1 * atr30M : ATR_SL_MULT * atr30M)));
+      const sl = isLong ? price - slDist : price + slDist;
+      const tp1 = isLong ? price + 1.8 * slDist : price - 1.8 * slDist;
+      const tp2 = isLong ? price + 2.5 * slDist : price - 2.5 * slDist;
+      const rr = slDist > 0 ? Math.abs(tp1 - price) / slDist : 1.8;
+
+      scenario1 = {
+        name: `Immediate ${reversalSide} Real Reversal Entry (Single Scenario)`,
+        action: reversalSide,
+        entry: fmt(price),
+        sl: fmt(sl),
+        tp1: fmt(tp1),
+        tp2: fmt(tp2),
+        rr: Number(rr.toFixed(2)),
+        condition: "Pullback invalidated: aggressive volume & structure break confirm real reversal. Dual scenarios canceled.",
+      };
+      scenario2 = null; // No second scenario: old trend is broken!
+    } else {
+      // Normal flow:
+      // Scenario 1: Immediate Entry (when 30M is aligned with 4H)
+      if (isAligned && activeSide !== "NEUTRAL") {
+        const isLong = activeSide === "BUY";
+        const slDist = Math.min(MAX_SL_ATR_MULT * atr30M, Math.max(ATR_SL_MULT * atr30M, isLong ? (swings.lastLow ? price - swings.lastLow + 0.1 * atr30M : ATR_SL_MULT * atr30M) : (swings.lastHigh ? swings.lastHigh - price + 0.1 * atr30M : ATR_SL_MULT * atr30M)));
+        const sl = isLong ? price - slDist : price + slDist;
+
+        const tp1Structural = isLong ? (swings.lastHigh && swings.lastHigh > price ? swings.lastHigh : price + 1.5 * slDist) : (swings.lastLow && swings.lastLow < price ? swings.lastLow : price - 1.5 * slDist);
+        const tp1 = isLong ? Math.min(tp1Structural, price + 1.8 * slDist) : Math.max(tp1Structural, price - 1.8 * slDist);
+        const tp2 = isLong ? price + 2.5 * slDist : price - 2.5 * slDist;
+        const rr = slDist > 0 ? Math.abs(tp1 - price) / slDist : 1.5;
+
+        scenario1 = {
+          name: "Immediate Momentum Entry",
+          action: activeSide,
+          entry: fmt(price),
+          sl: fmt(sl),
+          tp1: fmt(tp1),
+          tp2: fmt(tp2),
+          rr: Number(rr.toFixed(2)),
+          condition: freshCrossUp || freshCrossDown ? "Fresh 30M EMA cross confirmed" : "30M EMA persistent alignment with 4H trend",
+        };
+      }
+
+      // Scenario 2: Pullback & Anticipated Crossover Entry (only if pullback is healthy)
+      if (activeSide !== "NEUTRAL" && isPullbackHealthy) {
+        const isLong = activeSide === "BUY";
+        const pullTargetPrice = fmt(ema30mSlow);
+        const estCross = anticipatedCrossoverPrice ? fmt(anticipatedCrossoverPrice) : null;
+        const slDist = ATR_SL_MULT * atr30M;
+        const estSl = isLong ? (pullTargetPrice ? pullTargetPrice - slDist : price - slDist) : (pullTargetPrice ? pullTargetPrice + slDist : price + slDist);
+        const estTp1 = isLong ? (estSl ? pullTargetPrice + 2 * slDist : price + 2 * slDist) : (estSl ? pullTargetPrice - 2 * slDist : price - 2 * slDist);
+
+        scenario2 = {
+          name: "Pullback / Anticipated Re-entry",
+          action: activeSide,
+          watch_zone: `${fmt(ema30mSlow)} (30M EMA 21)`,
+          anticipated_crossover_level: estCross,
+          confirmation_trigger: isLong
+            ? `Wait for 30M candle rejection at ~${pullTargetPrice} and EMA 9 curving back above EMA 21`
+            : `Wait for 30M candle rejection at ~${pullTargetPrice} and EMA 9 curving back below EMA 21`,
+          estimated_sl: fmt(estSl),
+          estimated_tp1: fmt(estTp1),
+          pullback_health: {
+            status: pullbackStatus,
+            is_healthy: isPullbackHealthy,
+            volume_ok: isCounterTrendVolLow,
+            rsi: Number(rsiNow.toFixed(1)),
+            note: "Pullback volume is low; trend structure remains intact.",
+          },
+        };
+      }
+    }
+
+    // Determine primary decision output
+    let decision = "WAIT";
+    let conf = 50;
+    const reasons = [`4H Macro Trend: ${macroTrend} (EMA 9 vs 21)`];
+
+    if (isRealReversal && reversalSide) {
+      decision = reversalSide;
+      conf = 68;
+      reasons.push(`Pullback Invalidated: Real ${reversalSide} Reversal confirmed on 30M structure/volume.`);
+      reasons.push("Old trend broken — no pullback re-entry will occur. 1 single immediate reversal entry provided.");
+      if (session.ok) conf += 5;
+    } else if (isAligned && activeSide !== "NEUTRAL") {
+      decision = activeSide;
+      conf = 65;
+      reasons.push(`30M Primary Trend: Aligned with 4H (${activeSide})`);
+      if (freshCrossUp || freshCrossDown) { conf += 15; reasons.push("Fresh 30M EMA crossover just occurred"); }
+      else { conf += 10; reasons.push("Persistent 30M EMA directional alignment"); }
+      if (rsiNow >= 35 && rsiNow <= 65) { conf += 8; reasons.push(`RSI ${rsiNow.toFixed(1)} healthy`); }
+      if (session.ok) { conf += 5; reasons.push(session.reason); }
+    } else if (activeSide !== "NEUTRAL") {
+      decision = "WAIT_PULLBACK";
+      conf = 45;
+      reasons.push(`4H is ${macroTrend}, but 30M is undergoing a healthy pullback. Refer to Scenario 2 for re-entry.`);
+    } else {
+      reasons.push("4H trend is neutral / transitioning.");
+    }
+
+    // News advisory adjustments
+    if (news.has_news) {
+      reasons.push(news.reason);
+      if (news.recommendation) reasons.push(`Advisory: ${news.recommendation}`);
+    }
+
+    const primaryScenario = scenario1 || scenario2;
     const result = {
       symbol: sym,
       price: fmt(price),
-      strategy: "ma_rsi_v1",
-      decision: signal,
-      direction: signal === "BUY" ? "BULLISH" : signal === "SELL" ? "BEARISH" : "NEUTRAL",
-      confidence: conf,
+      strategy: "ma_rsi_30m_v2",
+      decision,
+      direction: macroTrend,
+      confidence: Math.max(20, Math.min(95, conf)),
       reasons,
-      entry: levels ? fmt(levels.entry) : null,
-      sl: levels ? fmt(levels.sl) : null,
-      tp: levels ? fmt(levels.tp) : null,
-      tp2: levels ? fmt(levels.tp2) : null,
-      rr: levels ? Number(levels.rr.toFixed(2)) : null,
-      regime: { trend: trendUp ? "bull" : trendDown ? "bear" : "neutral", ema4h_fast: fmt(ema4hFast), ema4h_slow: fmt(ema4hSlow) },
-      structure: { trend: trendUp ? "up" : trendDown ? "down" : "neutral", last_swing_low: fmt(swing.low), last_swing_high: fmt(swing.high) },
-      entry_ctx: {
-        rsi: Number(rsiNow.toFixed(1)), rsi_band_ok: rsiInBand, atr_1h: fmt(atr1H),
-        ema1h_fast: fmt(emaFast1H.at(-1)), ema1h_slow: fmt(emaSlow1H.at(-1)),
-        cross_up: crossUp, cross_down: crossDown, confirm_long: confirmLong, confirm_short: confirmShort,
-        volume_mode: hasRealVol ? "real" : "unreliable/skipped",
+      entry: primaryScenario?.entry ?? (scenario2 ? fmt(price) : null),
+      sl: primaryScenario?.sl ?? scenario2?.estimated_sl ?? null,
+      tp: primaryScenario?.tp1 ?? scenario2?.estimated_tp1 ?? null,
+      tp2: primaryScenario?.tp2 ?? null,
+      rr: primaryScenario?.rr ?? 1.8,
+      scenarios: {
+        scenario_1_immediate: scenario1,
+        scenario_2_pullback_crossover: scenario2,
       },
-      guards: { session, news_blocked: news.blocked, news_reason: news.reason ?? null },
+      regime: {
+        timeframe_primary: "30m",
+        timeframe_confirm: "4h",
+        macro_trend: macroTrend,
+        macro_ema_fast: fmt(ema4hFast),
+        macro_ema_slow: fmt(ema4hSlow),
+        primary_ema_fast: fmt(ema30mFast),
+        primary_ema_slow: fmt(ema30mSlow),
+        anticipated_crossover_price: fmt(anticipatedCrossoverPrice),
+      },
+      structure_30m: {
+        last_swing_high: fmt(swings.lastHigh),
+        last_swing_low: fmt(swings.lastLow),
+        atr_30m: fmt(atr30M),
+        rsi_30m: Number(rsiNow.toFixed(1)),
+        pullback_status: pullbackStatus,
+        pullback_healthy: isPullbackHealthy,
+      },
+      guards: {
+        session,
+        news_advisory: news.has_news ? news.reason : "No high-impact news active",
+        news_recommendation: news.recommendation ?? null,
+      },
       timestamp: Date.now(),
       elapsed_ms: Date.now() - t0,
     };
 
-    if (news.blocked) result.reason = `News blackout: ${news.reason}`;
-    else if (!session.ok) result.reason = session.reason;
-    else if (signal === "BUY" || signal === "SELL") result.reason = "MA-RSI setup aligned across 1H/4H";
-    else result.reason = reasons[reasons.length - 1] || "No aligned setup right now";
+    if (decision === "BUY" || decision === "SELL") {
+      result.reason = `Aligned 4H + 30M ${macroTrend} setup. ${primaryScenario?.condition || ""}`;
+    } else if (decision === "WAIT_PULLBACK") {
+      result.reason = `4H is ${macroTrend}; 30M pullback in progress. Watch anticipated level ~${scenario2?.anticipated_crossover_level || scenario2?.watch_zone}`;
+    } else {
+      result.reason = reasons[reasons.length - 1] || "Waiting for clear alignment";
+    }
 
     this.stats.last_run = result;
     return result;
   }
 
-  // pipeline.run()-compatible decision for /trade — same shape as mtf_v1
   async run(symbol, options = {}) {
     const sym = String(symbol || "").toUpperCase();
     const t0 = Date.now();
@@ -319,24 +476,44 @@ export class MTFStrategyEngine {
     if (analysis.decision === "DATA_UNAVAILABLE") return analysis;
 
     const out = {
-      decision: analysis.decision, symbol: sym, strategy: "ma_rsi_v1",
-      confidence: analysis.confidence, reason: analysis.reason ?? null, reasons: analysis.reasons ?? [],
-      entry: analysis.entry, sl: analysis.sl, tp: analysis.tp, tp2: analysis.tp2, rr: analysis.rr,
-      regime: analysis.regime, structure: analysis.structure, entry_ctx: analysis.entry_ctx, guards: analysis.guards,
-      analysis, timestamp: Date.now(), elapsed_ms: Date.now() - t0,
+      decision: analysis.decision,
+      symbol: sym,
+      strategy: "ma_rsi_30m_v2",
+      confidence: analysis.confidence,
+      reason: analysis.reason ?? null,
+      reasons: analysis.reasons ?? [],
+      entry: analysis.entry,
+      sl: analysis.sl,
+      tp: analysis.tp,
+      tp2: analysis.tp2,
+      rr: analysis.rr,
+      scenarios: analysis.scenarios,
+      regime: analysis.regime,
+      structure_30m: analysis.structure_30m,
+      guards: analysis.guards,
+      analysis,
+      timestamp: Date.now(),
+      elapsed_ms: Date.now() - t0,
     };
 
     if (analysis.decision === "BUY" || analysis.decision === "SELL") {
       out.lot_size = this.calculateLotSize
-        ? this.calculateLotSize({ symbol: sym, balance: options.balance || 1000, riskPercent: options.riskPercent || 1, entry: analysis.entry, stopLoss: analysis.sl })
+        ? this.calculateLotSize({
+            symbol: sym,
+            balance: options.balance || 1000,
+            riskPercent: options.riskPercent || 1,
+            entry: analysis.entry,
+            stopLoss: analysis.sl,
+          })
         : 0.01;
+
       if (this.addTradeMemory) {
         try {
           this.addTradeMemory(sym, {
             direction: analysis.decision,
-            pattern: `ma_rsi_v1:${analysis.structure?.trend ?? "?"}`,
+            pattern: `ma_rsi_30m:${analysis.regime?.macro_trend ?? "?"}`,
             outcome: "pending",
-            note: `MA-RSI conf=${analysis.confidence}% rr=${analysis.rr} rsi=${analysis.entry_ctx?.rsi}`,
+            note: `30M/4H conf=${analysis.confidence}% rr=${analysis.rr} rsi=${analysis.structure_30m?.rsi_30m}`,
           });
         } catch { /* journal best-effort */ }
       }
@@ -346,13 +523,20 @@ export class MTFStrategyEngine {
 
   cacheStatus() {
     return {
-      strategy: "ma_rsi_v1",
+      strategy: "ma_rsi_30m_v2",
       api_calls: this.stats.api_calls,
       cache_hits: this.stats.cache_hits,
       rate_limited_calls: this.stats.rate_limited,
       cache_entries: this._cache.size,
       rate_budget: `${this._requestTimes.length}/${MAX_REQUESTS_PER_MINUTE} in last 60s`,
-      last_run: this.stats.last_run ? { symbol: this.stats.last_run.symbol, decision: this.stats.last_run.decision, confidence: this.stats.last_run.confidence } : null,
+      last_run: this.stats.last_run
+        ? {
+            symbol: this.stats.last_run.symbol,
+            decision: this.stats.last_run.decision,
+            confidence: this.stats.last_run.confidence,
+            macro_trend: this.stats.last_run.regime?.macro_trend,
+          }
+        : null,
     };
   }
 }

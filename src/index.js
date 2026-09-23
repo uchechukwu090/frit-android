@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
@@ -1440,13 +1440,17 @@ async function checkNewsFilter(symbol) {
   const window = 30 * 60 * 1000;
   const nearby = events.filter(e => currencies.includes(e.currency) && Math.abs(e.time - now) <= window);
   if (nearby.length > 0) {
+    const titles = nearby.map(e => `${e.currency} ${e.title}`).join(", ");
     return {
-      blocked: true,
-      reason: `High-impact news within 30 min: ${nearby.map(e => `${e.currency} ${e.title}`).join(", ")}`,
+      blocked: false, // Do not hard-kill the analysis; provide strategy advisory
+      has_news: true,
+      event_active: true,
+      reason: `High-impact news within 30 min: ${titles}`,
+      recommendation: "High volatility event! Standard trend entries have spread spike risk. Recommendation: (1) Wait 15m post-release for candle stabilization, or (2) Trade the pre-news range breakout with half risk.",
       events: nearby,
     };
   }
-  return { blocked: false };
+  return { blocked: false, has_news: false };
 }
 
 // ===================== MTF CONFIRMATION =====================
