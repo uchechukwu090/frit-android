@@ -1822,7 +1822,7 @@ if (process.env.TRADE_TASKS === "true") {
 // pending_action and executed by IntegrationCoordinator.executeEdgeTool().
 // run_command / write_file / run_sandbox_code are deliberately NOT advertised:
 // they stay gated behind DEV_TOOLS_ENABLED=false on the client.
-const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data",
+const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data", "get_market_news",
   "analyze_market", "run_code", "wait_and_verify", "assert_text_visible", "get_frit_manual"
 ]);
 
@@ -1860,6 +1860,7 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "search_web", description: "Deep web research spanning DuckDuckGo, Bing and Brave. Returns a real ranked result list (titles, URLs, snippets), NOT one abstract. Supports search-dorking operators: site:, intitle:, inurl:, filetype:, -keyword, \"exact phrase\". Call multiple times with refined queries for multi-angle research.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
   { type: "function", function: { name: "get_market_data", description: "Fetch live spot prices for one or more symbols (e.g. XAUUSD, BTCUSD).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
+  { type: "function", function: { name: "get_market_news", description: "Fetch real-time financial, fundamental, and macroeconomic news for any trading symbol (XAUUSD, BTCUSD, Forex, Stocks) for the current date/year.", parameters: { type: "object", properties: { symbol: { type: "string" }, query: { type: "string" } } } } },
   { type: "function", function: { name: "analyze_market", description: "Run the MTFStrategyEngine multi-timeframe analysis on a symbol (returns regime, structure, direction/decision, entry, SL, TP, confidence).", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, balance: { type: "number" }, risk_percent: { type: "number" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_market_quote", description: "Fetch a quick market quote for a symbol.", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "place_mt5_trade", description: "Place a real market order on MetaTrader 5 via the phone's MT5 agent. Use this after market analysis confirms a high-confidence entry signal.", parameters: { type: "object", properties: { symbol: { type: "string" }, action: { type: "string", enum: ["BUY", "SELL"] }, volume: { type: "number" }, sl: { type: "number" }, tp: { type: "number" } }, required: ["symbol", "action", "volume"] } } },
@@ -1896,6 +1897,11 @@ async function runLocalTool(name, args = {}, agentState = null) {
     case "search_web": return { ok: true, data: await webSearch(args.query || "") };
     case "get_weather": return { ok: true, data: await getWeather(args.city || "Lagos") };
     case "get_market_data": return { ok: true, data: await fetchMarketPrices([args.symbol || "BTCUSD"]) };
+    case "get_market_news": {
+      const sym = args.symbol || "market";
+      const q = args.query || `${sym} market fundamental news ${new Date().getFullYear()}`;
+      return { ok: true, data: await webSearch(q) };
+    }
     case "analyze_market": return { ok: true, data: await mtfStrategy.analyze(args.symbol, { interval: args.interval, balance: args.balance, riskPercent: args.risk_percent }) };
     case "run_code": return { ok: true, data: await runSandbox({ language: args.language, code: args.code, stdin: args.stdin || "", timeout_ms: args.timeout_ms || 8000 }) };
     case "get_frit_manual": return { ok: true, data: buildFritManual() };
@@ -1961,6 +1967,7 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- If a tool fails: Don't give up. Try a different approach (e.g., tap_coordinates instead of tap_button).",
     "- Run Code: Use 'run_code' for complex logic, math, or data processing. Don't guess calculations.",
     "- Browse: Use 'search_web' to find information.",
+    "- Market/trading news & fundamentals: ALWAYS call 'get_market_news' or 'search_web' to retrieve current live 2025/2026 market news. NEVER cite outdated news from 2024 or earlier memory!",
     "- Market/trading tasks: analysis happens HERE on the server, NOT on the phone. Actually CALL the 'analyze_market' or 'get_market_data' tool (a real function call) and read the returned direction/entry/SL/TP — do not narrate calling it. Only use the phone (open_app MetaTrader5, tap, type) to EXECUTE an order after the analysis is complete.",
     "",
     "Your Goal is to finish the user's task COMPLETELY. If it takes 10 steps, do 10 steps.",
