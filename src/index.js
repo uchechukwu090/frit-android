@@ -90,7 +90,7 @@ const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
 // The sandbox service requires its own auth token. The AI never sees this —
 // the server attaches it when forwarding run_code calls.
-const SANDBOX_AUTH = process.env.SANDBOX_AUTH || "";
+const SANDBOX_AUTH = process.env.SANDBOX_AUTH || process.env.SANDBOX_AUTH_TOKEN || "";
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || "";
 
@@ -393,7 +393,7 @@ function resolveProvider(model) {
 
 async function mistralChat({ model, messages, tools = null, temperature = 0.3, max_tokens = 1600, tool_choice = "auto", retries = 3 }) {
   const provider = resolveProvider(model);
-  if (provider === "gemini") return geminiChat({ model, messages, temperature, max_tokens });
+  if (provider === "gemini") return geminiChat({ model, messages, tools, temperature, max_tokens });
 
   const base = provider === "groq" ? "https://api.groq.com/openai/v1/chat/completions"
     : provider === "go" ? "https://opencode.ai/zen/go/v1/chat/completions"
@@ -692,7 +692,10 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
           // would blow the token budget for no benefit (the model can't see
           // images this way anyway; it only needs to know a file was made).
           if (name === "run_code" && Array.isArray(result?.data?.artifacts) && result.data.artifacts.length) {
-            for (const art of result.data.artifacts) turnArtifacts.push(art);
+            for (const art of result.data.artifacts) {
+              const b64 = art.content_base64 || art.base64 || "";
+              if (b64) turnArtifacts.push({ name: art.name, mime: art.mime, size: art.size, base64: b64, content_base64: b64 });
+            }
             result = {
               ...result,
               data: {
@@ -819,6 +822,8 @@ app.post("/agent/start", requireAuth, async (req, res) => {
   } catch (_) {
     // Router failed — fall through to the agent loop rather than erroring out.
   }
+
+  if (!SANDBOX_URL.includes("127.0.0.1")) fetch(`${SANDBOX_URL}/health`).catch(() => {}); // wake sandbox while LLM plans
 
   const sessionId = `sess_${Date.now()}`;
 
@@ -975,26 +980,35 @@ function sandboxAuthHeaders() {
 }
 
 async function runSandbox(args = {}) {
-  try {
-    const localRes = await fetch("http://127.0.0.1:8790/sandbox/run", {
-      method: "POST",
-      headers: sandboxAuthHeaders(),
-      body: JSON.stringify(args),
-      signal: AbortSignal.timeout(4000),
-    });
-    if (localRes.ok) {
-      const data = await localRes.json();
-      return data;
+  const targets = [];
+  if (process.env.LOCAL_SANDBOX_URL) targets.push(process.env.LOCAL_SANDBOX_URL);
+  targets.push(SANDBOX_URL);
+  let lastErr;
+  for (const base of targets) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(`${base}/sandbox/run`, {
+          method: "POST",
+          headers: sandboxAuthHeaders(),
+          body: JSON.stringify(args),
+          signal: AbortSignal.timeout(90_000), // covers a cold start
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) return data;
+        const msg = data?.details || data?.error || `Sandbox HTTP ${res.status}`;
+        lastErr = new Error(msg);
+        if (/busy/i.test(msg) && attempt < 3) {
+          await new Promise(r => setTimeout(r, 2000 * attempt));
+          continue;
+        }
+        break; // auth/validation errors won't fix themselves
+      } catch (e) {
+        lastErr = e;
+        break; // network error: try next target
+      }
     }
-  } catch (_) {}
-  const res = await fetch(`${SANDBOX_URL}/sandbox/run`, {
-    method: "POST",
-    headers: sandboxAuthHeaders(),
-    body: JSON.stringify(args),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data?.details || data?.error || "Sandbox failed");
-  return data;
+  }
+  throw lastErr || new Error("Sandbox unavailable");
 }
 
 // ========================= MARKET DATA ============================
@@ -1856,7 +1870,7 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "take_photo", description: "Open the camera app for a photo.", parameters: { type: "object", properties: { front_camera: { type: "boolean" } } } } },
 
   // ---- Server-side tools (execute on the server) ----
-  { type: "function", function: { name: "run_code", description: "Execute Python/JS code server-side in a real sandbox (NO phone needed). Use it for: writing code, building webpages (write a .html file), math, data parsing, backtesting, charting, reports, file creation. If your code writes a file (e.g. matplotlib chart to 'chart.png', a CSV, 'index.html') into its working directory, that file is captured and returned to the user as a visual/downloadable artifact. ALWAYS use this instead of the phone for anything computational or for building files/webpages.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" } }, required: ["language", "code"] } } },
+  { type: "function", function: { name: "run_code", description: "Execute Python/JS code server-side in a real sandbox (NO phone needed). Python has numpy, pandas, scipy, scikit-learn, statsmodels, matplotlib, seaborn, TA-Lib, requests, openpyxl, python-docx, python-pptx, reportlab, pillow. Limits: 15s runtime, ~256MB memory, nothing persists between calls. To return a visual or file, WRITE it to the working directory: plt.savefig('chart.png') (never plt.show()), df.to_csv('data.csv'), wb.save('report.xlsx'), open('index.html','w'). Files are returned to the user automatically (max 10 files, 3MB each). Use print() for text results. ALWAYS use this instead of the phone for anything computational or for building files/webpages.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript"] }, code: { type: "string" }, stdin: { type: "string" }, timeout_ms: { type: "number", description: "max 20000" } }, required: ["language", "code"] } } },
   { type: "function", function: { name: "search_web", description: "Deep web research spanning DuckDuckGo, Bing and Brave. Returns a real ranked result list (titles, URLs, snippets), NOT one abstract. Supports search-dorking operators: site:, intitle:, inurl:, filetype:, -keyword, \"exact phrase\". Call multiple times with refined queries for multi-angle research.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
   { type: "function", function: { name: "get_market_data", description: "Fetch live spot prices for one or more symbols (e.g. XAUUSD, BTCUSD).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
@@ -1903,7 +1917,7 @@ async function runLocalTool(name, args = {}, agentState = null) {
       return { ok: true, data: await webSearch(q) };
     }
     case "analyze_market": return { ok: true, data: await mtfStrategy.analyze(args.symbol, { interval: args.interval, balance: args.balance, riskPercent: args.risk_percent }) };
-    case "run_code": return { ok: true, data: await runSandbox({ language: args.language, code: args.code, stdin: args.stdin || "", timeout_ms: args.timeout_ms || 8000 }) };
+    case "run_code": return { ok: true, data: await runSandbox({ language: args.language, code: args.code, stdin: args.stdin || "", timeout_ms: args.timeout_ms || 15000 }) };
     case "get_frit_manual": return { ok: true, data: buildFritManual() };
     case "wait_and_verify": {
       const delay = args.delay_ms || 500;
@@ -2368,7 +2382,7 @@ app.get("/weather", async (req, res) => {
   }
 });
 
-app.post("/transcribe", async (req, res) => {
+app.post("/transcribe", requireAuth, async (req, res) => {
   try {
     const { audio_base64, mime_type = "audio/webm" } = req.body || {};
     if (!audio_base64) return res.status(400).json({ error: "audio_base64 required" });
@@ -2413,7 +2427,7 @@ app.get("/acp/status", requireAuth, async (req, res) => {
   const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
   try {
     const analysis = await analyzeSymbol(sym, "1h", null);
-    const gsri = getGsriSnapshot() || {};
+    const gsri = (await getGsriSnapshot()) || {};
     const gsriObj = typeof gsri === "object" ? gsri : {};
     res.json({
       symbol: sym,
