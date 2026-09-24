@@ -529,6 +529,20 @@ async function verifyLastStep(session, ledger, toolResults, deviceState) {
   }
 }
 
+const SETTINGS_KEYWORD = /\b(bluetooth|wi-?fi|mobile data|cellular|airplane|flight mode|location|gps|battery|power saver)\b/i;
+const SETTINGS_NAV_LABEL = /^(network|network & internet|connections|connected devices|internet|settings)$/i;
+
+function rewriteSettingsNavigation(tc, goal) {
+  const m = String(goal || "").match(SETTINGS_KEYWORD);
+  if (!m) return tc;
+  const n = tc.function.name;
+  const a = tc.function.arguments || {};
+  const slowOpen = n === "open_app" && /^settings?$/i.test(String(a.app_name || "").trim());
+  const slowNav = (n === "tap_button" || n === "tap_element") && SETTINGS_NAV_LABEL.test(String(a.label || "").trim());
+  if (!slowOpen && !slowNav) return tc;
+  return { ...tc, function: { ...tc.function, name: "execute_local_action", arguments: { action: `open ${m[1].toLowerCase()}` } } };
+}
+
 async function runAgentStep(sessionId, toolResults = null, deviceState = null, opts = {}) {
   const session = db.prepare("SELECT * FROM agent_sessions WHERE id = ?").get(sessionId);
   if (!session) throw new Error("Session not found");
@@ -559,10 +573,17 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
     }
   }
 
+  // Preserve stored device state (like installed_apps) across resumes
+  const stored = session.last_device_state ? safeJsonParse(session.last_device_state, {}) : {};
+  const mergedDeviceState = { ...stored, ...(deviceState || {}) };
+  if (deviceState) {
+    db.prepare("UPDATE agent_sessions SET last_device_state = ? WHERE id = ?").run(JSON.stringify(mergedDeviceState), sessionId);
+  }
+
   // ---- 2. Verification of the last action batch (independent second model) ----
   let verification = null;
   if (toolResults && deviceState) {
-    verification = await verifyLastStep(session, ledger, toolResults, deviceState);
+    verification = await verifyLastStep(session, ledger, toolResults, mergedDeviceState);
     if (verification) {
       const active = getActiveSubtask(ledger);
       if (active && active.status !== "done" && active.status !== "failed") {
@@ -580,7 +601,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
 
   // ---- 3. Build system prompt (device state + memory + ledger + trade memory) ----
   const activeSubtask = getActiveSubtask(ledger);
-  const deviceStateForPrompt = deviceState || (session.last_device_state ? safeJsonParse(session.last_device_state, {}) : {});
+  const deviceStateForPrompt = mergedDeviceState;
   const systemPrompt = buildAutomationSystemPrompt({
     deviceState: deviceStateForPrompt,
     memory,
@@ -642,7 +663,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
     const looksLikeSentence = (s) => /\b(and|to|that|reply|check|open|task)\b/i.test(s) && s.split(/\s+/).length > 4;
     const badAppCalls = [];
     const androidCalls = [];
-    for (const tc of rawAndroidCalls) {
+    for (let tc of rawAndroidCalls.map(t => rewriteSettingsNavigation(t, session.goal))) {
       if (tc.function.name === "open_app") {
         const appName = (tc.function.arguments || {}).app_name || "";
         if (appName.length > MAX_APP_NAME_LEN || looksLikeSentence(appName)) {
@@ -1844,6 +1865,7 @@ const AGENT_TOOLS = [
   // ---- Phone/UI control (executed on Android) ----
   { type: "function", function: { name: "open_app", description: "Launch any installed app by name or package. Always verify afterwards with read_screen.", parameters: { type: "object", properties: { app_name: { type: "string" }, package: { type: "string" } } } } },
   { type: "function", function: { name: "execute_local_action", description: "Offload app launching, local macros, settings toggles, or device utilities directly to the local on-device engine to save API credits and turns.", parameters: { type: "object", properties: { action: { type: "string", description: "The local action or command to execute (e.g. 'open MT5', 'toggle mobile data', 'set alarm for 7am')" } }, required: ["action"] } } },
+  { type: "function", function: { name: "return_to_frit", description: "Bring the FRIT app back to the foreground. Call this when a phone task in another app/settings is finished.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "read_screen", description: "Read visible text from the screen. Use this frequently to observe state and verify the result of every action.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "read_screen_structured", description: "Return exact coordinates of UI elements. Essential for precise clicking.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "tap_button", description: "Tap a button by its visible label/text.", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
@@ -1971,6 +1993,8 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- Only call DEVICE-CONTROL tools (open_app, tap, type, scroll, go_back, press_home) when the user's message clearly asks for a phone action. For greetings or small talk with no request in them, reply in plain conversational text with ZERO tool calls — do not invent a phone task out of a greeting like 'hi'.",
     "- This restriction does NOT apply to server-side analysis/data tools (analyze_market, get_market_data, search_web, run_code, get_weather). If the user asks a question those tools can answer — e.g. 'what's your analysis on XAUUSD', 'search X', 'what's the weather' — CALL the relevant tool immediately. A question is still a request; don't treat 'they didn't say an imperative command' as a reason to skip the tool and answer from memory instead.",
     "- For 'open_app': the 'app_name' argument must be ONLY the literal app name (e.g. 'WhatsApp', 'Messenger') — never a sentence, instruction, or task description. Open the app first, THEN use separate tool calls (read_screen, tap, type) to carry out the actual task once it's open.",
+    "- SETTINGS TOGGLES (bluetooth/wifi/data/airplane/location/battery): step 1 call 'execute_local_action' (e.g. 'open bluetooth') — it lands directly on the right page. Step 2 'read_screen', then 'tap_element' the toggle. Step 3 'read_screen' to confirm it flipped. Step 4 call 'return_to_frit'. Never navigate Settings menus manually.",
+    "- DIVISION OF LABOR: the phone's local engine owns launching apps and system shortcuts (open_app, execute_local_action). You own analysis, decisions, and every tap/type INSIDE an app. Never navigate to an app manually; launch it, then act on the screen text the launch returns.",
     "- If the device state below lists 'Installed apps', ONLY target names from that list with open_app — do not guess an app exists if it isn't listed. If it's not there, tell the user instead of trying anyway.",
     "- You only have the tools explicitly provided to you in this request (open_app, read_screen, tap_button, type_text, run_code, search_web, get_market_data, analyze_market, send_whatsapp, make_call, etc.). Never assume a capability exists beyond that list — e.g. there is no generic 'send_message' or 'call_contact' tool, use the exact tool names you were given.",
     "",
