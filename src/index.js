@@ -1843,6 +1843,7 @@ const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data
 const AGENT_TOOLS = [
   // ---- Phone/UI control (executed on Android) ----
   { type: "function", function: { name: "open_app", description: "Launch any installed app by name or package. Always verify afterwards with read_screen.", parameters: { type: "object", properties: { app_name: { type: "string" }, package: { type: "string" } } } } },
+  { type: "function", function: { name: "execute_local_action", description: "Offload app launching, local macros, settings toggles, or device utilities directly to the local on-device engine to save API credits and turns.", parameters: { type: "object", properties: { action: { type: "string", description: "The local action or command to execute (e.g. 'open MT5', 'toggle mobile data', 'set alarm for 7am')" } }, required: ["action"] } } },
   { type: "function", function: { name: "read_screen", description: "Read visible text from the screen. Use this frequently to observe state and verify the result of every action.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "read_screen_structured", description: "Return exact coordinates of UI elements. Essential for precise clicking.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "tap_button", description: "Tap a button by its visible label/text.", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
@@ -1898,7 +1899,8 @@ function buildFritManual() {
   lines.push(
     "",
     "Notes:",
-    "- 'open_app' only works reliably for apps present in the device state's 'Installed apps' list — check that list before assuming an app exists.",
+    "- 'open_app' and 'execute_local_action' offload app launching and local device operations directly to the phone's local engine to conserve server tokens.",
+    "- 'open_app' works reliably for apps present in the device state's 'Installed apps' list — check that list before assuming an app exists.",
     "- There is no generic message/call tool beyond what's listed above (send_whatsapp, send_sms, make_call). If a task needs an app not covered by a dedicated tool, use open_app + read_screen + tap/type to drive it manually.",
     "- run_code executes real Python/JS server-side via the sandbox. Files it writes (charts, CSVs, reports) are captured as artifacts and returned to the user — use it instead of writing code as plain text, and prefer writing a file when the user wants something visual.",
   );
@@ -2016,7 +2018,7 @@ function buildDeviceStateBlock(ds = {}) {
   if (Array.isArray(d.installed_apps) && d.installed_apps.length) {
     // Ground open_app in reality: only these names are guaranteed to exist.
     // Capped to keep prompt size sane on large phones (150+ apps is common).
-    const names = d.installed_apps.map(a => (typeof a === "string" ? a : a.name)).filter(Boolean);
+    const names = d.installed_apps.map(a => (typeof a === "string" ? a : (a.label || a.name || a.package))).filter(Boolean);
     parts.push(`Installed apps (${names.length}, use EXACT names with open_app): ${names.slice(0, 200).join(", ")}${names.length > 200 ? ", ..." : ""}`);
   }
   return parts.length ? parts.join("\n") : "No device state provided.";
@@ -2028,12 +2030,20 @@ function buildDeviceStateBlock(ds = {}) {
 function resolveInstalledApp(requestedName, deviceState) {
   const list = Array.isArray(deviceState?.installed_apps) ? deviceState.installed_apps : [];
   if (!list.length || !requestedName) return null;
-  const names = list.map(a => (typeof a === "string" ? a : a.name)).filter(Boolean);
   const target = requestedName.trim().toLowerCase();
-  const exact = names.find(n => n.toLowerCase() === target);
-  if (exact) return exact;
-  const contains = names.find(n => n.toLowerCase().includes(target) || target.includes(n.toLowerCase()));
-  return contains || null;
+
+  for (const item of list) {
+    if (typeof item === "string") {
+      if (item.toLowerCase() === target || item.toLowerCase().includes(target)) return item;
+    } else if (item && typeof item === "object") {
+      const label = (item.label || item.name || "").toLowerCase();
+      const pkg = (item.package || "").toLowerCase();
+      if (label === target || pkg === target || label.includes(target) || target.includes(label)) {
+        return item.label || item.name || item.package;
+      }
+    }
+  }
+  return null;
 }
 
 // ==================== SCREEN FRAME INGESTION ====================
