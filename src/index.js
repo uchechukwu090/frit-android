@@ -83,6 +83,12 @@ const HAS_ZEN = !!ZEN_API_KEY;
 // which is a shared/limited free pool that was already exhausted.
 // Legacy var kept in case anything external still reads it; the actual
 // primary model selection now happens via GO_MODEL below (see MODELS block).
+// NOTE (Sep 2026 research): the Zen free "deepseek-v4-flash-free" promo ENDED
+// (deprecated upstream). Live free options: "big-pickle" (stealth, FREE,
+// 200K ctx, tool-calling, chat/completions) and
+// "muse-spark-1.3-contributor-free" (FREE, 1M ctx — but /v1/responses endpoint
+// only, NOT chat/completions, plus trains-on-your-data terms). Both freebies
+// are explicitly LIMITED-TIME, so neither is a permanent free primary.
 const ZEN_MODEL = process.env.OPENCODE_ZEN_MODEL || "deepseek-v4-flash-free";
 const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
 const MISTRAL_FAST_MODEL = process.env.MISTRAL_FAST_MODEL || "mistral-small-latest";
@@ -133,9 +139,16 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // models use the "go:" prefix here; plain Zen free-tier models (a shared,
 // capacity-limited pool, not personal quota) use "zen:".
 const GO_MODEL = process.env.OPENCODE_GO_MODEL || "deepseek-v4-flash"; // -> opencode-go/deepseek-v4-flash
+// Primary agent brain: Big Pickle on the FREE Zen pool (chat/completions +
+// tool calling, $0 in/out) so day-to-day agent work costs nothing; the paid
+// Go DeepSeek (1M ctx, stable quota) sits directly behind it in every chain.
+// Picked over muse-spark-1.3-contributor-free because Spark-free only serves
+// /v1/responses (needs a separate adapter, not yet built) and its terms let
+// prompts train future Meta models. Override with AGENT_MODEL env at any time.
+const AGENT_PRIMARY = process.env.AGENT_MODEL || "zen:big-pickle";
 const MODELS = {
   vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : "pixtral-large-latest"),
-  agent: process.env.AGENT_MODEL || (HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:openai/gpt-oss-120b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
+  agent: AGENT_PRIMARY,
   conversation: process.env.CONVERSATION_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
   tools: process.env.TOOLS_MODEL || (HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:openai/gpt-oss-120b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
   coding: process.env.CODING_MODEL || (HAS_GROQ ? "groq:qwen/qwen3.6-27b" : "codestral-latest"),
@@ -161,17 +174,19 @@ function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {
 // Runtime fallback chains: if the primary model for a role fails, walk to
 // the next provider instead of throwing "brain disconnected" up to the
 // client. Priority order:
-//   1. OpenCode Go DeepSeek V4 Flash (your $10/mo Go subscription — real
+//   1. Big Pickle (Zen free pool — $0, tool calling; primary, limited-time promo)
+//   2. OpenCode Go DeepSeek V4 Flash (your $10/mo Go subscription — real
 //      paid quota, 1M context, strong tool calling, ~$60/mo of usage)
-//   2. Groq GPT-OSS 120B (your own quota, tool calling, predictable TPM —
+//   3. Groq GPT-OSS 120B (your own quota, tool calling, predictable TPM —
 //      replaces the deprecated Llama 3.3 70B)
-//   3. Gemini 3.6 Flash (solid tool calling, smaller free-tier RPM/RPD)
-//   4. Mistral Large (kept last — weaker observed tool-calling reliability
+//   4. Gemini 3.6 Flash (solid tool calling, smaller free-tier RPM/RPD)
+//   5. Mistral Large (kept last — weaker observed tool-calling reliability
 //      on multi-field function args, per production logs)
-//   5. OpenCode Zen free models (shared/capacity-limited pool — last resort,
+//   6. OpenCode Zen free models (shared/capacity-limited pool — last resort,
 //      may itself be rate-limited independent of anything you did)
 function buildFallbackChain(primary) {
   const chain = [primary];
+  if (primary !== "zen:big-pickle") chain.push("zen:big-pickle");
   if (HAS_ZEN) chain.push(`go:${GO_MODEL}`);
   if (HAS_GROQ) chain.push("groq:openai/gpt-oss-120b");
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
@@ -1885,7 +1900,8 @@ const AGENT_TOOLS = [
   // ---- Communication & daily-life tasks (general-purpose) ----
   { type: "function", function: { name: "send_whatsapp", description: "Open a WhatsApp chat with a contact (by name) and draft a message. Then verify and send via UI.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name", "message"] } } },
   { type: "function", function: { name: "send_sms", description: "Open the SMS composer to a contact with a message. Then verify and send via UI.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name", "message"] } } },
-  { type: "function", function: { name: "make_call", description: "Place a phone call to a contact.", parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" } }, required: ["contact_name"] } } },
+  { type: "function", function: { name: "make_call", description: "Place a phone call to a contact. Set converse:true when the user wants FRIT to actually TALK on the call (e.g. 'call John and ask him X') — FRIT waits for the other side to answer, then holds a live half-duplex voice conversation (greet, listen, reply, hangs up on goodbye/silence/5-min cap). With converse:true the task is NOT done when the call is placed — it continues until the conversation ends. With converse false/default the task IS done as soon as the dialer opens.", parameters: { type: "object", properties: { contact_name: { type: "string" }, phone_number: { type: "string" }, converse: { type: "boolean" } }, required: ["contact_name"] } } },
+  { type: "function", function: { name: "answer_calls", description: "Enable/disable auto-answer for INCOMING calls. The phone answers and FRIT holds a live half-duplex voice conversation (greet, listen, reply, hang up on goodbye/silence/5-min cap) over the speakerphone bridge. Works in reasonably quiet rooms; do NOT promise studio quality or interruption handling.", parameters: { type: "object", properties: { enabled: { type: "boolean" } } } } },
   { type: "function", function: { name: "set_alarm", description: "Set an alarm at a given time.", parameters: { type: "object", properties: { time: { type: "string" }, label: { type: "string" } }, required: ["time"] } } },
   { type: "function", function: { name: "set_timer", description: "Start a countdown timer.", parameters: { type: "object", properties: { duration: { type: "string" } }, required: ["duration"] } } },
   { type: "function", function: { name: "play_music", description: "Play music or media by query.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
@@ -1910,6 +1926,7 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "wait_and_verify", description: "Wait a moment before verifying state (use after actions that take time).", parameters: { type: "object", properties: { delay_ms: { type: "number" } } } } },
   { type: "function", function: { name: "assert_text_visible", description: "Verify that text is visible on the last screen state.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
   { type: "function", function: { name: "get_frit_manual", description: "Get a full reference of every real tool FRIT has, grouped by category, plus how to use the phone's installed-apps list correctly. Call this only if you're unsure what capabilities you have — don't call it for every task.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "delegate_subtasks", description: "Fan OUT independent subtasks to parallel subagent models (different providers, zero extra agent turns). Use for: researching several angles at once, drafting + summarizing while you keep driving the phone, comparing options. Args: subtasks = [{task, kind}] where kind is lookup/extract/draft/summarize/research/analyze/code. Max 4 per call. Results come back merged in one response.", parameters: { type: "object", properties: { subtasks: { type: "array", items: { type: "object", properties: { task: { type: "string" }, kind: { type: "string" } }, required: ["task"] } } }, required: ["subtasks"] } } },
 ];
 
 // Auto-generated from AGENT_TOOLS itself, so this can never drift out of sync
@@ -1946,6 +1963,14 @@ async function runLocalTool(name, args = {}, agentState = null) {
     case "analyze_market": return { ok: true, data: await mtfStrategy.analyze(args.symbol, { interval: args.interval, balance: args.balance, riskPercent: args.risk_percent }) };
     case "run_code": return { ok: true, data: await runSandbox({ language: args.language, code: args.code, stdin: args.stdin || "", timeout_ms: args.timeout_ms || 15000 }) };
     case "get_frit_manual": return { ok: true, data: buildFritManual() };
+    // Fan-out: run independent subtasks in PARALLEL across providers so the
+    // primary brain isn't the bottleneck. Each subtask gets the cheapest
+    // capable model on a DIFFERENT provider (spreads rate-limit + cost load):
+    //   - fast lookup/extract  -> Groq gpt-oss-20b (1000 tok/s, $0.075/M)
+    //   - drafting/summarize   -> Mistral Small (inside your 1M/mo free tier)
+    //   - research/heavy lift  -> Zen Big Pickle (free pool)
+    // Local 1.7B can also take subtasks via execute_local_action when offline.
+    case "delegate_subtasks": return { ok: true, data: await runSubagents(args.subtasks || []) };
     case "wait_and_verify": {
       const delay = args.delay_ms || 500;
       await new Promise(r => setTimeout(r, delay));
@@ -1960,6 +1985,45 @@ async function runLocalTool(name, args = {}, agentState = null) {
     }
     default: return { ok: false, error: "Not a server-side tool" };
   }
+}
+
+// ==================== SUBAGENT FAN-OUT ====================
+// Primary delegates independent chunks here; they resolve concurrently and
+// the merged results come back as ONE tool result (one agent turn, not N).
+const SUBAGENT_POOL = [
+  { slot: "speed", model: "groq:openai/gpt-oss-20b", kinds: ["lookup", "extract", "classify", "quick"] },
+  { slot: "draft", model: "mistral-small-latest", kinds: ["draft", "summarize", "rewrite", "plan"] },
+  { slot: "heavy", model: "zen:big-pickle", kinds: ["research", "compare", "analyze", "code"] },
+];
+function pickSubagentModel(kind = "") {
+  const k = String(kind).toLowerCase();
+  const hit = SUBAGENT_POOL.find(p => p.kinds.some(x => k.includes(x)));
+  return (hit || SUBAGENT_POOL[0]).model;
+}
+async function runSubagents(subtasks = []) {
+  const jobs = (Array.isArray(subtasks) ? subtasks : []).slice(0, 4).map((t, i) => {
+    const task = typeof t === "string" ? t : (t.task || t.goal || "");
+    const kind = typeof t === "string" ? "" : (t.kind || "");
+    const model = pickSubagentModel(kind);
+    const p = mistralChat({
+      model,
+      messages: [
+        { role: "system", content: "You are a FRIT subagent. Do ONLY the subtask below. Reply with the result only — no preamble, no tool calls, under 400 words." },
+        { role: "user", content: task },
+      ],
+      temperature: 0.3, max_tokens: 900,
+    }).then(
+      out => ({ index: i, model, ok: true, result: String(out || "").slice(0, 2500) }),
+      err => ({ index: i, model, ok: false, result: `FAILED: ${err.message}` }),
+    );
+    // Per-subtask timeout so one slow provider can't stall the merge.
+    const timeout = new Promise(res => setTimeout(
+      () => res({ index: i, model, ok: false, result: "FAILED: subtask timeout (45s)" }), 45000));
+    return Promise.race([p, timeout]);
+  });
+  const settled = await Promise.all(jobs);
+  settled.sort((a, b) => a.index - b.index);
+  return { subtask_count: settled.length, results: settled };
 }
 
 // ==================== AUTOMATION SYSTEM PROMPT ====================
@@ -1999,6 +2063,9 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- SETTINGS TOGGLES (bluetooth/wifi/data/airplane/location/battery): step 1 call 'execute_local_action' (e.g. 'open bluetooth') — it lands directly on the right page. Step 2 'read_screen', then 'tap_element' the toggle. Step 3 'read_screen' to confirm it flipped. Step 4 call 'return_to_frit'. Never navigate Settings menus manually.",
     "- DIVISION OF LABOR: the phone's local engine owns launching apps and system shortcuts (open_app, execute_local_action). You own analysis, decisions, and every tap/type INSIDE an app. Never navigate to an app manually; launch it, then act on the screen text the launch returns.",
     "- If the device state below lists 'Installed apps', ONLY target names from that list with open_app — do not guess an app exists if it isn't listed. If it's not there, tell the user instead of trying anyway.",
+    "- UNFAMILIAR APP UI (Opay, Facebook, MT5, any app you haven't driven in THIS session): BEFORE tapping blindly, spend ONE 'search_web' call on the exact flow — e.g. 'Opay Android app how to transfer money steps 2026', 'Facebook Android app create post steps'. Combine that walkthrough with the live screen text and NEVER second-guess: screen text always wins over the article when they disagree. Skip the search only for apps/flows you already completed successfully in this session.",
+    "- PARALLELIZE with 'delegate_subtasks': independent research angles, per-option comparisons, or draft-while-you-drive work goes there (up to 4 at once across Groq/Mistral/Zen-free) instead of burning sequential agent turns.",
+    "- PAST FEEDBACK IS BINDING: user memory may contain 'feedback_negative: task=[...] bad_reply=[...]'. If the current goal matches such a task, you MUST use a different approach than the recorded bad reply — repeating it is a failure. 'feedback_positive' entries mark the approach to reuse.",
     "- You only have the tools explicitly provided to you in this request (open_app, read_screen, tap_button, type_text, run_code, search_web, get_market_data, analyze_market, send_whatsapp, make_call, etc.). Never assume a capability exists beyond that list — e.g. there is no generic 'send_message' or 'call_contact' tool, use the exact tool names you were given.",
     "",
     "TIPS FOR FULL AUTONOMY:",
