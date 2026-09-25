@@ -84,11 +84,9 @@ const HAS_ZEN = !!ZEN_API_KEY;
 // Legacy var kept in case anything external still reads it; the actual
 // primary model selection now happens via GO_MODEL below (see MODELS block).
 // NOTE (Sep 2026 research): the Zen free "deepseek-v4-flash-free" promo ENDED
-// (deprecated upstream). Live free options: "big-pickle" (stealth, FREE,
-// 200K ctx, tool-calling, chat/completions) and
-// "muse-spark-1.3-contributor-free" (FREE, 1M ctx — but /v1/responses endpoint
-// only, NOT chat/completions, plus trains-on-your-data terms). Both freebies
-// are explicitly LIMITED-TIME, so neither is a permanent free primary.
+// (deprecated upstream). The "big-pickle" free Zen model exists but OpenCode
+// rejects free-tier calls from outside the OpenCode app — it FAILS in a normal
+// server, so it is NOT used here (see AGENT_PRIMARY below).
 const ZEN_MODEL = process.env.OPENCODE_ZEN_MODEL || "deepseek-v4-flash-free";
 const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
 const MISTRAL_FAST_MODEL = process.env.MISTRAL_FAST_MODEL || "mistral-small-latest";
@@ -139,13 +137,13 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // models use the "go:" prefix here; plain Zen free-tier models (a shared,
 // capacity-limited pool, not personal quota) use "zen:".
 const GO_MODEL = process.env.OPENCODE_GO_MODEL || "deepseek-v4-flash"; // -> opencode-go/deepseek-v4-flash
-// Primary agent brain: Big Pickle on the FREE Zen pool (chat/completions +
-// tool calling, $0 in/out) so day-to-day agent work costs nothing; the paid
-// Go DeepSeek (1M ctx, stable quota) sits directly behind it in every chain.
-// Picked over muse-spark-1.3-contributor-free because Spark-free only serves
-// /v1/responses (needs a separate adapter, not yet built) and its terms let
-// prompts train future Meta models. Override with AGENT_MODEL env at any time.
-const AGENT_PRIMARY = process.env.AGENT_MODEL || "zen:big-pickle";
+// Primary agent brain: OpenCode Go DeepSeek V4 Flash — your paid $10/mo Go
+// subscription with real quota (1M ctx, native tool calling). Big Pickle on the
+// FREE Zen pool is REMOVED as primary: OpenCode now rejects free-tier models
+// used outside the OpenCode app ("can only be used from within OpenCode"), so
+// zen:big-pickle fails in production. Groq GPT-OSS + Gemini + Mistral sit
+// behind Go in the fallback chains. Override with AGENT_MODEL env at any time.
+const AGENT_PRIMARY = process.env.AGENT_MODEL || `go:${GO_MODEL}`;
 const MODELS = {
   vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : "pixtral-large-latest"),
   agent: AGENT_PRIMARY,
@@ -174,24 +172,21 @@ function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {
 // Runtime fallback chains: if the primary model for a role fails, walk to
 // the next provider instead of throwing "brain disconnected" up to the
 // client. Priority order:
-//   1. Big Pickle (Zen free pool — $0, tool calling; primary, limited-time promo)
-//   2. OpenCode Go DeepSeek V4 Flash (your $10/mo Go subscription — real
+//   1. OpenCode Go DeepSeek V4 Flash (your $10/mo Go subscription — real
 //      paid quota, 1M context, strong tool calling, ~$60/mo of usage)
-//   3. Groq GPT-OSS 120B (your own quota, tool calling, predictable TPM —
+//   2. Groq GPT-OSS 120B (your own quota, tool calling, predictable TPM —
 //      replaces the deprecated Llama 3.3 70B)
-//   4. Gemini 3.6 Flash (solid tool calling, smaller free-tier RPM/RPD)
-//   5. Mistral Large (kept last — weaker observed tool-calling reliability
+//   3. Gemini 3.6 Flash (solid tool calling, smaller free-tier RPM/RPD)
+//   4. Mistral Large (kept last — weaker observed tool-calling reliability
 //      on multi-field function args, per production logs)
-//   6. OpenCode Zen free models (shared/capacity-limited pool — last resort,
-//      may itself be rate-limited independent of anything you did)
+// Big Pickle / Zen free-tier models are NOT in the chains: OpenCode rejects
+// free-tier calls from outside the OpenCode app.
 function buildFallbackChain(primary) {
   const chain = [primary];
-  if (primary !== "zen:big-pickle") chain.push("zen:big-pickle");
   if (HAS_ZEN) chain.push(`go:${GO_MODEL}`);
   if (HAS_GROQ) chain.push("groq:openai/gpt-oss-120b");
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
-  if (HAS_ZEN) chain.push("zen:deepseek-v4-flash-free");
   return [...new Set(chain)];
 }
 
@@ -227,11 +222,11 @@ async function chatWithFallback(role, { messages, tools = null, tool_choice = "a
     const model = chain[i];
     try {
       const out = await mistralChat({ model, messages, tools, tool_choice, temperature, max_tokens });
-      if (i > 0) console.warn(`[chatWithFallback] role=${role} recovered on fallback model ${model} (primary failed)`);
+      if (i > 0) console.warn(`[chatWithFallback] role=${role} primary model unavailable — recovered on ${model} (normal fallback)`);
       return out;
     } catch (err) {
       attempts.push(`${model}: ${err.message}`);
-      console.warn(`[chatWithFallback] role=${role} model=${model} failed: ${err.message}`);
+      console.warn(`[chatWithFallback] role=${role} model=${model} unavailable: ${err.message}`);
     }
   }
   // Every model in the chain failed — surface a clear, distinguishable error
@@ -1993,7 +1988,7 @@ async function runLocalTool(name, args = {}, agentState = null) {
 const SUBAGENT_POOL = [
   { slot: "speed", model: "groq:openai/gpt-oss-20b", kinds: ["lookup", "extract", "classify", "quick"] },
   { slot: "draft", model: "mistral-small-latest", kinds: ["draft", "summarize", "rewrite", "plan"] },
-  { slot: "heavy", model: "zen:big-pickle", kinds: ["research", "compare", "analyze", "code"] },
+  { slot: "heavy", model: `go:${GO_MODEL}`, kinds: ["research", "compare", "analyze", "code"] },
 ];
 function pickSubagentModel(kind = "") {
   const k = String(kind).toLowerCase();
@@ -2064,7 +2059,7 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- DIVISION OF LABOR: the phone's local engine owns launching apps and system shortcuts (open_app, execute_local_action). You own analysis, decisions, and every tap/type INSIDE an app. Never navigate to an app manually; launch it, then act on the screen text the launch returns.",
     "- If the device state below lists 'Installed apps', ONLY target names from that list with open_app — do not guess an app exists if it isn't listed. If it's not there, tell the user instead of trying anyway.",
     "- UNFAMILIAR APP UI (Opay, Facebook, MT5, any app you haven't driven in THIS session): BEFORE tapping blindly, spend ONE 'search_web' call on the exact flow — e.g. 'Opay Android app how to transfer money steps 2026', 'Facebook Android app create post steps'. Combine that walkthrough with the live screen text and NEVER second-guess: screen text always wins over the article when they disagree. Skip the search only for apps/flows you already completed successfully in this session.",
-    "- PARALLELIZE with 'delegate_subtasks': independent research angles, per-option comparisons, or draft-while-you-drive work goes there (up to 4 at once across Groq/Mistral/Zen-free) instead of burning sequential agent turns.",
+    "- PARALLELIZE with 'delegate_subtasks': independent research angles, per-option comparisons, or draft-while-you-drive work goes there (up to 4 at once across Groq/Mistral/Go) instead of burning sequential agent turns.",
     "- PAST FEEDBACK IS BINDING: user memory may contain 'feedback_negative: task=[...] bad_reply=[...]'. If the current goal matches such a task, you MUST use a different approach than the recorded bad reply — repeating it is a failure. 'feedback_positive' entries mark the approach to reuse.",
     "- You only have the tools explicitly provided to you in this request (open_app, read_screen, tap_button, type_text, run_code, search_web, get_market_data, analyze_market, send_whatsapp, make_call, etc.). Never assume a capability exists beyond that list — e.g. there is no generic 'send_message' or 'call_contact' tool, use the exact tool names you were given.",
     "",
