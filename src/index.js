@@ -77,6 +77,14 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const HAS_GROQ = !!GROQ_API_KEY;
 const ZEN_API_KEY = process.env.OPENCODE_ZEN_API_KEY || "";
 const HAS_ZEN = !!ZEN_API_KEY;
+// Direct DeepSeek API — replaces the expired OpenCode Go subscription as the
+// primary agent brain. No monthly commitment (pay-per-token), cheap, native
+// tool calling, and it's the SAME model family Go was proxying to anyway.
+// Get a key at platform.deepseek.com. deepseek-chat = V3.2-class general/tool
+// model; deepseek-reasoner = R1-class, slower/pricier, only worth it for the
+// heaviest subagent research tasks.
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
+const HAS_DEEPSEEK = !!DEEPSEEK_API_KEY;
 // Model id on OpenCode Zen. Now that you're on OpenCode Go ($10/mo, real
 // paid credits), default to the PAID "deepseek-v4-flash" (1M context, native
 // tool calling, generous Go-covered allowance) — not "deepseek-v4-flash-free",
@@ -137,18 +145,20 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // models use the "go:" prefix here; plain Zen free-tier models (a shared,
 // capacity-limited pool, not personal quota) use "zen:".
 const GO_MODEL = process.env.OPENCODE_GO_MODEL || "deepseek-v4-flash"; // -> opencode-go/deepseek-v4-flash
-// Primary agent brain: OpenCode Go DeepSeek V4 Flash — your paid $10/mo Go
-// subscription with real quota (1M ctx, native tool calling). Big Pickle on the
-// FREE Zen pool is REMOVED as primary: OpenCode now rejects free-tier models
-// used outside the OpenCode app ("can only be used from within OpenCode"), so
-// zen:big-pickle fails in production. Groq GPT-OSS + Gemini + Mistral sit
-// behind Go in the fallback chains. Override with AGENT_MODEL env at any time.
-const AGENT_PRIMARY = process.env.AGENT_MODEL || `go:${GO_MODEL}`;
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-flash"; // DeepSeek-V4.1-Flash, native tool calling (legacy deepseek-chat alias still routes here but is deprecated)
+// Primary agent brain. The OpenCode Go $10/mo subscription has EXPIRED, so
+// go:${GO_MODEL} is no longer usable (401s). Replaced with DeepSeek's own
+// direct API: no subscription, pay-per-token, same underlying model family Go
+// was proxying to, and cheap enough (~$0.15-0.60/M off-peak as of 2026-09) that
+// normal usage costs far less than the old $10/mo floor. If you renew Go
+// later, set AGENT_MODEL=go:deepseek-v4-flash to switch back. Override with
+// AGENT_MODEL env at any time.
+const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : `go:${GO_MODEL}`);
 const MODELS = {
-  vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : "pixtral-large-latest"),
+  vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : "mistral-large-latest"),
   agent: AGENT_PRIMARY,
   conversation: process.env.CONVERSATION_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  tools: process.env.TOOLS_MODEL || (HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:openai/gpt-oss-120b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
+  tools: process.env.TOOLS_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:openai/gpt-oss-120b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
   coding: process.env.CODING_MODEL || (HAS_GROQ ? "groq:qwen/qwen3.6-27b" : "codestral-latest"),
   fast: process.env.FAST_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_FAST_MODEL)),
   voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || "voxtral-mini-transcribe-realtime",
@@ -183,7 +193,8 @@ function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {
 // free-tier calls from outside the OpenCode app.
 function buildFallbackChain(primary) {
   const chain = [primary];
-  if (HAS_ZEN) chain.push(`go:${GO_MODEL}`);
+  if (HAS_DEEPSEEK) chain.push(`deepseek:${DEEPSEEK_MODEL}`);
+  if (HAS_ZEN) chain.push(`go:${GO_MODEL}`); // harmless to keep listed; simply 401s and falls through if Go is still expired
   if (HAS_GROQ) chain.push("groq:openai/gpt-oss-120b");
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
@@ -194,14 +205,15 @@ function buildVisionFallbackChain(primary) {
   const chain = [primary];
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (HAS_GROQ) {
-    // Qwen 3.x series on Groq are multimodal (vision-capable)
+    // Groq vision-capable Qwen models (both confirmed vision in Groq docs):
+    // qwen3.8-27b first (newer, vision + tool use + JSON mode), 3.5 as backup.
     chain.push("groq:qwen/qwen3.8-27b");
     chain.push("groq:qwen/qwen3.6-27b");
-    chain.push("groq:llama-3.2-90b-vision-preview");
-    chain.push("groq:llama-3.2-11b-vision-preview");
   }
-  // Pixtral is Mistral's high-capability vision model
-  if (MISTRAL_API_KEY) chain.push("pixtral-large-latest");
+  // Pixtral is DEAD — Mistral retired pixtral-large-latest on 2026-05-31
+  // (every call 400s "model retired"). Mistral Large 3 is multimodal, so the
+  // Mistral-side vision fallback is now mistral-large-latest.
+  if (MISTRAL_API_KEY) chain.push("mistral-large-latest");
   return [...new Set(chain)];
 }
 
@@ -212,6 +224,18 @@ const FALLBACK_CHAINS = {
   conversation: buildFallbackChain(MODELS.conversation),
   fast: buildFallbackChain(MODELS.fast),
 };
+
+// Generic phone-operation skill (merged field knowledge for driving ANY app
+// accurately: tap ladder, text-less icons, keyboard/dialog handling). Loaded
+// once at boot from server/skills/phone-ui.md and injected into every agent
+// system prompt below the TIPS block. Edit the .md to teach the brain new
+// patterns — no code change needed.
+let PHONE_UI_SKILL = "";
+try {
+  PHONE_UI_SKILL = readFileSync(new URL("./skills/phone-ui.md", import.meta.url), "utf8").trim();
+} catch (e) {
+  console.warn("[skills] phone-ui.md not loaded:", e.message);
+}
 
 // Same signature as mistralChat, but walks a role's fallback chain on failure
 // (e.g. Groq rate limit exhausted) instead of bubbling the error straight up.
@@ -397,6 +421,7 @@ function resolveProvider(model) {
   if (typeof model === "string" && model.startsWith("groq:")) return "groq";
   if (typeof model === "string" && model.startsWith("go:")) return "go";
   if (typeof model === "string" && model.startsWith("zen:")) return "zen";
+  if (typeof model === "string" && model.startsWith("deepseek:")) return "deepseek";
   if (typeof model === "string" && model.startsWith("gemini")) return "gemini";
   return "mistral";
 }
@@ -408,8 +433,9 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
   const base = provider === "groq" ? "https://api.groq.com/openai/v1/chat/completions"
     : provider === "go" ? "https://opencode.ai/zen/go/v1/chat/completions"
     : provider === "zen" ? "https://opencode.ai/zen/v1/chat/completions"
+    : provider === "deepseek" ? "https://api.deepseek.com/chat/completions"
     : `${MISTRAL_BASE}/chat/completions`;
-  const apiKey = provider === "groq" ? GROQ_API_KEY : (provider === "zen" || provider === "go") ? ZEN_API_KEY : MISTRAL_API_KEY;
+  const apiKey = provider === "groq" ? GROQ_API_KEY : (provider === "zen" || provider === "go") ? ZEN_API_KEY : provider === "deepseek" ? DEEPSEEK_API_KEY : MISTRAL_API_KEY;
   // Go's own model catalog uses "opencode-go/<model-id>" — e.g. "go:deepseek-v4-flash"
   // becomes "opencode-go/deepseek-v4-flash" on the wire, NOT plain "deepseek-v4-flash"
   // (that bare id is what hits your pay-as-you-go Zen wallet instead).
@@ -420,7 +446,7 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
   // 400s, the prefixed form may be needed after all — flag it and we'll flip
   // it back.
   const cleanModel = provider === "go" ? model.slice(3)
-    : (provider === "groq" || provider === "zen") ? model.slice(model.indexOf(":") + 1)
+    : (provider === "groq" || provider === "zen" || provider === "deepseek") ? model.slice(model.indexOf(":") + 1)
     : model;
 
   const body = { model: cleanModel, messages, temperature, max_tokens };
@@ -840,6 +866,32 @@ async function routeChatOrTask(goal, history = []) {
   return { isTask: true };
 }
 
+// Prompt enhancer: vague user commands fail because the brain must guess
+// intent AND tool mapping at once. This cheap fast-model pass rewrites the
+// goal into an explicit, endpoint-aware instruction (naming the exact
+// tool/endpoint sequence, e.g. XAUUSD -> analyze_market then phone MT5
+// execution with the stated lot size) before the planner/ledger ever sees it.
+// Runs once per /agent/start on real tasks only (the router above already
+// peeled off chit-chat). Any failure falls back to the raw goal.
+async function enhanceGoalForAgent(rawGoal) {
+  try {
+    const out = await chatWithFallback("fast", {
+      messages: [
+        { role: "system", content: "You are a prompt enhancer for FRIT, an Android AI agent with server tools: analyze_market(symbol...), get_market_data(symbol), run_code(code), search_web(query), get_weather, send_whatsapp(contact,message), make_call(number), and phone UI tools (open_app, tap_element, type_text, scroll, read_screen). Rewrite the user's vague command into ONE explicit paragraph: state the intent, name the exact tool/endpoint sequence in order, keep device facts (symbols, lot sizes, names) verbatim. Output ONLY the rewritten instruction, no preamble." },
+        { role: "user", content: String(rawGoal || "") }
+      ]
+    });
+    const text = out?.choices?.[0]?.message?.content?.trim();
+    if (text && text.length > 10) {
+      console.log(`[agent/start] goal enhanced: "${String(rawGoal).slice(0, 120)}" -> "${text.slice(0, 160)}"`);
+      return text;
+    }
+  } catch (e) {
+    console.warn("[agent/start] goal enhancement failed, using raw goal:", e.message);
+  }
+  return rawGoal;
+}
+
 app.post("/agent/start", requireAuth, async (req, res) => {
   const { goal, device_state, memory, history } = req.body;
   if (!goal) return res.status(400).json({ error: "Goal required" });
@@ -857,13 +909,14 @@ app.post("/agent/start", requireAuth, async (req, res) => {
   if (!SANDBOX_URL.includes("127.0.0.1")) fetch(`${SANDBOX_URL}/health`).catch(() => {}); // wake sandbox while LLM plans
 
   const sessionId = `sess_${Date.now()}`;
+  const effectiveGoal = await enhanceGoalForAgent(goal);
 
   try {
     // Initial Plan / Ledger creation
     const planOut = await chatWithFallback("fast", {
       messages: [
         { role: "system", content: "Break the user's goal into an ordered JSON list of subtasks: [{\"seq\": 1, \"description\": \"...\", \"status\": \"pending\"}]" },
-        { role: "user", content: goal }
+        { role: "user", content: effectiveGoal }
       ]
     });
 
@@ -872,16 +925,16 @@ app.post("/agent/start", requireAuth, async (req, res) => {
       const parsed = JSON.parse(planOut.choices[0].message.content.match(/\[.*\]/s)[0]);
       ledger = (Array.isArray(parsed) ? parsed : []).map((t, i) => ({
         seq: t.seq ?? i + 1,
-        description: String(t.description || t.task || goal),
+        description: String(t.description || t.task || effectiveGoal),
         status: t.status || "pending",
       }));
     } catch (e) {
-      ledger = [{ seq: 1, description: goal, status: "pending" }];
+      ledger = [{ seq: 1, description: effectiveGoal, status: "pending" }];
     }
 
     const safeMemory = Array.isArray(memory) ? memory : [];
     db.prepare("INSERT INTO agent_sessions (id, goal, task_ledger, last_device_state, memory) VALUES (?, ?, ?, ?, ?)").run(
-      sessionId, goal, JSON.stringify(ledger), JSON.stringify(device_state || {}), JSON.stringify(safeMemory)
+      sessionId, effectiveGoal, JSON.stringify(ledger), JSON.stringify(device_state || {}), JSON.stringify(safeMemory)
     );
 
     const result = await runAgentStep(sessionId, null, device_state, { memory: safeMemory });
@@ -1886,6 +1939,13 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "go_back", description: "Press the Android back button.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "press_back", description: "Press the Android back button (alias of go_back).", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "press_home", description: "Go to the home screen.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "toggle_notifications", description: "Pull down the notification shade. Use to check/read notifications, not for settings toggles (use execute_local_action for wifi/bluetooth/data).", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "toggle_quick_settings", description: "Open Quick Settings panel (the expanded shade with wifi/bluetooth/flashlight tiles).", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "recent_apps", description: "Open the Recent Apps / app switcher screen.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "lock_screen", description: "Lock the device screen immediately. Only use when the user explicitly asks to lock the phone.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "swipe_coordinates", description: "Swipe upward starting from x/y coordinates (e.g. to dismiss a card or scroll a custom-drawn view tap_element/scroll can't reach).", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
+  { type: "function", function: { name: "long_press_element", description: "Long-press a UI element by its visible text label (opens context menus, drag handles, etc).", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
+  { type: "function", function: { name: "take_native_screenshot", description: "Trigger Android's own screenshot capture (saves to gallery) — different from take_screenshot, which captures for in-agent vision analysis only.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "get_current_app", description: "Return the name of the currently focused app.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "get_current_activity", description: "Return the current Android activity/class.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "take_screenshot", description: "Capture the current screen for later analysis.", parameters: { type: "object", properties: {} } } },
@@ -1988,18 +2048,38 @@ async function runLocalTool(name, args = {}, agentState = null) {
 const SUBAGENT_POOL = [
   { slot: "speed", model: "groq:openai/gpt-oss-20b", kinds: ["lookup", "extract", "classify", "quick"] },
   { slot: "draft", model: "mistral-small-latest", kinds: ["draft", "summarize", "rewrite", "plan"] },
-  { slot: "heavy", model: `go:${GO_MODEL}`, kinds: ["research", "compare", "analyze", "code"] },
+  // Heavy slot follows the expired-Go migration: DeepSeek direct API first
+  // (same model family Go was proxying), Groq 120B when no DeepSeek key.
+  { slot: "heavy", model: (typeof HAS_DEEPSEEK !== "undefined" && HAS_DEEPSEEK) ? `deepseek:${DEEPSEEK_MODEL}` : "groq:openai/gpt-oss-120b", kinds: ["research", "compare", "analyze", "code"] },
 ];
 function pickSubagentModel(kind = "") {
   const k = String(kind).toLowerCase();
   const hit = SUBAGENT_POOL.find(p => p.kinds.some(x => k.includes(x)));
   return (hit || SUBAGENT_POOL[0]).model;
 }
+// Per-kind timeout instead of one fixed 45s for everything: a quick
+// lookup/classify that hangs 45s drags down the WHOLE Promise.all merge
+// (the batch only returns once every slot has settled), while a genuine
+// research/code subtask can legitimately need more than 45s and was getting
+// killed as "FAILED: timeout" even when the provider would have come back
+// with a real answer a few seconds later.
+const SUBAGENT_TIMEOUT_MS = {
+  lookup: 15000, extract: 15000, classify: 12000, quick: 12000,
+  draft: 30000, summarize: 25000, rewrite: 25000, plan: 30000,
+  research: 75000, compare: 60000, analyze: 60000, code: 90000,
+};
+const SUBAGENT_DEFAULT_TIMEOUT_MS = 30000;
+function pickSubagentTimeout(kind = "") {
+  const k = String(kind).toLowerCase();
+  const hit = Object.keys(SUBAGENT_TIMEOUT_MS).find(x => k.includes(x));
+  return hit ? SUBAGENT_TIMEOUT_MS[hit] : SUBAGENT_DEFAULT_TIMEOUT_MS;
+}
 async function runSubagents(subtasks = []) {
   const jobs = (Array.isArray(subtasks) ? subtasks : []).slice(0, 4).map((t, i) => {
     const task = typeof t === "string" ? t : (t.task || t.goal || "");
     const kind = typeof t === "string" ? "" : (t.kind || "");
     const model = pickSubagentModel(kind);
+    const timeoutMs = pickSubagentTimeout(kind);
     const p = mistralChat({
       model,
       messages: [
@@ -2013,7 +2093,7 @@ async function runSubagents(subtasks = []) {
     );
     // Per-subtask timeout so one slow provider can't stall the merge.
     const timeout = new Promise(res => setTimeout(
-      () => res({ index: i, model, ok: false, result: "FAILED: subtask timeout (45s)" }), 45000));
+      () => res({ index: i, model, ok: false, result: `FAILED: subtask timeout (${Math.round(timeoutMs / 1000)}s)` }), timeoutMs));
     return Promise.race([p, timeout]);
   });
   const settled = await Promise.all(jobs);
@@ -2074,6 +2154,9 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- Browse: Use 'search_web' to find information.",
     "- Market/trading news & fundamentals: ALWAYS call 'get_market_news' or 'search_web' to retrieve current live 2025/2026 market news. NEVER cite outdated news from 2024 or earlier memory!",
     "- Market/trading tasks: analysis happens HERE on the server, NOT on the phone. Actually CALL the 'analyze_market' or 'get_market_data' tool (a real function call) and read the returned direction/entry/SL/TP — do not narrate calling it. Only use the phone (open_app MetaTrader5, tap, type) to EXECUTE an order after the analysis is complete.",
+    "",
+    "PHONE UI SKILL — field-tested patterns for operating any app accurately (loaded from server/skills/phone-ui.md — edit that file to teach new patterns):",
+    PHONE_UI_SKILL,
     "",
     "Your Goal is to finish the user's task COMPLETELY. If it takes 10 steps, do 10 steps.",
     "",

@@ -361,6 +361,11 @@ export class MTFStrategyEngine {
         scenario2 = {
           name: "Pullback / Anticipated Re-entry",
           action: activeSide,
+          // Headline entry for a pullback setup is the ZONE itself (anticipated
+          // crossover level, else the 30M EMA21 watch price) — NOT current
+          // price. result.entry picks this up via primaryScenario?.entry, so
+          // WAIT_PULLBACK now reports "wait at the zone" instead of market.
+          entry: estCross ?? pullTargetPrice,
           watch_zone: `${fmt(ema30mSlow)} (30M EMA 21)`,
           anticipated_crossover_level: estCross,
           confirmation_trigger: isLong
@@ -426,6 +431,15 @@ export class MTFStrategyEngine {
       tp: primaryScenario?.tp1 ?? scenario2?.estimated_tp1 ?? null,
       tp2: primaryScenario?.tp2 ?? null,
       rr: primaryScenario?.rr ?? 1.8,
+      // Explicit entry context for downstream consumers (/trade reason line,
+      // position monitor). WAIT_PULLBACK -> the pullback zone as a limit-style
+      // entry; BUY/SELL -> market at current price; else null.
+      entry_ctx: {
+        zone: decision === "WAIT_PULLBACK"
+          ? (scenario2?.anticipated_crossover_level || scenario2?.watch_zone || fmt(price))
+          : ((decision === "BUY" || decision === "SELL") ? fmt(price) : null),
+        type: decision === "WAIT_PULLBACK" ? "pullback_limit" : "market",
+      },
       scenarios: {
         scenario_1_immediate: scenario1,
         scenario_2_pullback_crossover: scenario2,
@@ -487,6 +501,7 @@ export class MTFStrategyEngine {
       tp: analysis.tp,
       tp2: analysis.tp2,
       rr: analysis.rr,
+      entry_ctx: analysis.entry_ctx ?? null,
       scenarios: analysis.scenarios,
       regime: analysis.regime,
       structure_30m: analysis.structure_30m,
