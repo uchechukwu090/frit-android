@@ -678,7 +678,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
     : "conversation";
 
   for (let iter = 0; iter <= MAX_SERVER_TOOL_LOOP; iter++) {
-    const out = await chatWithFallback(modelRole, { messages: fullMessages, tools: AGENT_TOOLS });
+    const out = await chatWithFallback(modelRole, { messages: fullMessages, tools: AGENT_TOOLS, max_tokens: 4000 });
     const msg = out.choices[0].message;
     lastAssistantText = msg.content || "";
     lastToolCalls = extractToolCalls(msg);
@@ -771,7 +771,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
 
       if (isLastIter) {
         // execute them anyway, then force a final summary turn with tool_choice:"none"
-        const finalOut = await chatWithFallback(modelRole, { messages: fullMessages, tools: AGENT_TOOLS, tool_choice: "none" });
+        const finalOut = await chatWithFallback(modelRole, { messages: fullMessages, tools: AGENT_TOOLS, tool_choice: "none", max_tokens: 4000 });
         lastAssistantText = finalOut.choices[0].message.content || "";
         db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_calls) VALUES (?, ?, ?, ?, ?)").run(
           sessionId, fullMessages.length, "assistant", lastAssistantText, null
@@ -843,6 +843,8 @@ CONVERSATION means: greetings, small talk, thanks, "how are you", identity/opini
 
 TASK means: the user wants something DONE — real information retrieved (weather, market prices, analysis, web research, news), code written/run, a file or webpage created, an app opened or controlled on the phone, a message/call/alarm, a trade, or any multi-step work that needs tools.
 
+VAGUE FOLLOW-UPS ("do that for me", "go ahead", "yes", "proceed", "same") ALWAYS reference the history above: if the previous assistant turn proposed, recommended, or described an action, the follow-up is a TASK to perform exactly that — resolve what "that" means from history and do it. Only call it CONVERSATION if there is genuinely nothing actionable anywhere in context. Never answer a follow-up with a generic "let me know what you'd like" when the history already says what they'd like.
+
 Reply with EXACTLY ONE line in this exact format:
 CONVERSATION <your brief, friendly reply>
 or
@@ -866,6 +868,19 @@ async function routeChatOrTask(goal, history = []) {
   return { isTask: true };
 }
 
+// Voice-latency gate: the enhancer costs a full fast-model round trip. Fresh
+// tasks, long messages, and vague follow-ups ("do that", "yes" after a
+// proposal) are worth it; short EXPLICIT commands ("open whatsapp") gain
+// nothing and just add dead air before every voice reply — send those raw.
+function needsEnhancement(goal, history = []) {
+  const g = String(goal || "");
+  if (!Array.isArray(history) || history.length === 0) return true;
+  if (g.length >= 120) return true;
+  const t = g.toLowerCase();
+  if (/(^|\W)(that|this|it|those|these|yes|yeah|yep|ok(ay)?|sure|go ahead|proceed|do it|continue|next|same)(\W|$)/.test(t)) return true;
+  return false;
+}
+
 // Prompt enhancer: vague user commands fail because the brain must guess
 // intent AND tool mapping at once. This cheap fast-model pass rewrites the
 // goal into an explicit, endpoint-aware instruction (naming the exact
@@ -873,12 +888,15 @@ async function routeChatOrTask(goal, history = []) {
 // execution with the stated lot size) before the planner/ledger ever sees it.
 // Runs once per /agent/start on real tasks only (the router above already
 // peeled off chit-chat). Any failure falls back to the raw goal.
-async function enhanceGoalForAgent(rawGoal) {
+async function enhanceGoalForAgent(rawGoal, history = []) {
   try {
+    const histBlock = (Array.isArray(history) ? history.slice(-6) : [])
+      .map(m => `${m.role === "assistant" ? "FRIT" : "User"}: ${String(m.content || "").slice(0, 500)}`)
+      .join("\n");
     const out = await chatWithFallback("fast", {
       messages: [
-        { role: "system", content: "You are a prompt enhancer for FRIT, an Android AI agent with server tools: analyze_market(symbol...), get_market_data(symbol), run_code(code), search_web(query), get_weather, send_whatsapp(contact,message), make_call(number), and phone UI tools (open_app, tap_element, type_text, scroll, read_screen). Rewrite the user's vague command into ONE explicit paragraph: state the intent, name the exact tool/endpoint sequence in order, keep device facts (symbols, lot sizes, names) verbatim. Output ONLY the rewritten instruction, no preamble." },
-        { role: "user", content: String(rawGoal || "") }
+        { role: "system", content: "You are a prompt enhancer for FRIT, an Android AI agent with server tools: analyze_market(symbol...), get_market_data(symbol), run_code(code), search_web(query), get_weather, send_whatsapp(contact,message), make_call(number), and phone UI tools (open_app, tap_element, type_text, scroll, read_screen). Rewrite the user's vague command into ONE explicit paragraph: state the intent, name the exact tool/endpoint sequence in order, keep device facts (symbols, lot sizes, names) verbatim. IMPORTANT: the user often says 'that'/'it' meaning something from the recent chat — resolve pronouns using the history below (e.g. 'do that for me' after a research recommendation = perform that research). Output ONLY the rewritten instruction, no preamble." },
+        { role: "user", content: `${histBlock ? `Recent chat:\n${histBlock}\n\n` : ""}Latest message: ${String(rawGoal || "")}` }
       ]
     });
     const text = out?.choices?.[0]?.message?.content?.trim();
@@ -909,7 +927,10 @@ app.post("/agent/start", requireAuth, async (req, res) => {
   if (!SANDBOX_URL.includes("127.0.0.1")) fetch(`${SANDBOX_URL}/health`).catch(() => {}); // wake sandbox while LLM plans
 
   const sessionId = `sess_${Date.now()}`;
-  const effectiveGoal = await enhanceGoalForAgent(goal);
+  const histArr = Array.isArray(history) ? history : [];
+  const effectiveGoal = needsEnhancement(goal, histArr)
+    ? await enhanceGoalForAgent(goal, histArr)
+    : String(goal || "");
 
   try {
     // Initial Plan / Ledger creation
@@ -1004,7 +1025,10 @@ async function mistralTranscribe(audioBase64, mimeType = "audio/wav") {
       const form = new FormData();
       const ext = cleanMime.split("/")[1] || "wav";
       form.append("file", audioBuffer, { filename: `audio.${ext}`, contentType: cleanMime });
-      form.append("model", "whisper-large-v3-turbo");
+      form.append("model", "whisper-large-v3"); // flagship accuracy — best for accents/noise (Groq's own guidance for error-sensitive use)
+      form.append("language", "en"); // user's English incl. Nigerian accent: improves accuracy + latency
+      form.append("prompt", "Hey Frit, FRIT, OPay, MT5, MetaTrader, XAUUSD, mummy, Airtel."); // guides proper-noun spelling ("frit", not "fritz")
+      form.append("temperature", "0.0");
       form.append("response_format", "json");
       const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
@@ -1131,11 +1155,16 @@ const CRYPTO_SET = new Set([
   "BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD", "ADAUSD"
 ]);
 
+// Binance spot pairs are USDT-quoted (BTCUSDT), NOT raw fiat pairs like
+// "BTCUSD" — api.binance.com has no such symbol, so requests using the old
+// mapping below were silently failing on Binance and falling through to
+// TwelveData for every crypto candle (defeating the point of using Binance
+// as a free fallback).
 const BINANCE_SYM = {
-  BTC: "BTCUSD", ETH: "ETHUSD", SOL: "SOLUSD", BNB: "BNBUSD",
-  XRP: "XRPUSD", DOGE: "DOGEUSD", ADA: "ADAUSD",
-  BTCUSD: "BTCUSD", ETHUSD: "ETHUSD", SOLUSD: "SOLUSD", BNBUSD: "BNBUSD",
-  XRPUSD: "XRPUSD", DOGEUSD: "DOGEUSD", ADAUSD: "ADAUSD",
+  BTC: "BTCUSDT", ETH: "ETHUSDT", SOL: "SOLUSDT", BNB: "BNBUSDT",
+  XRP: "XRPUSDT", DOGE: "DOGEUSDT", ADA: "ADAUSDT",
+  BTCUSD: "BTCUSDT", ETHUSD: "ETHUSDT", SOLUSD: "SOLUSDT", BNBUSD: "BNBUSDT",
+  XRPUSD: "XRPUSDT", DOGEUSD: "DOGEUSDT", ADAUSD: "ADAUSDT",
 };
 
 const COINGECKO_IDS = {
@@ -1173,6 +1202,21 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
   const cached = cacheGet(ck);
   if (cached) return cached;
 
+  // Crypto goes to Binance FIRST (free, no key, ~1200 req/min) so it never
+  // touches the TwelveData quota, which forex/XAU/XAG rely on exclusively.
+  if (CRYPTO_SET.has(sym) && BINANCE_SYM[sym]) {
+    try {
+      const url = `https://api.binance.com/api/v3/klines?symbol=${BINANCE_SYM[sym]}&interval=${toBinanceInterval(iv)}&limit=${Math.min(size, 1000)}`;
+      const res = await fetch(url);
+      const arr = await res.json();
+      if (Array.isArray(arr) && arr.length >= 10) {
+        const candles = normalizeCandles(arr, "binance");
+        cacheSet(ck, candles, 60000);
+        return candles;
+      }
+    } catch (e) { console.error("[Binance candles]", sym, e.message); }
+  }
+
   if (TWELVE_DATA_KEY && TD_SYMBOLS[sym]) {
     try {
       const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(TD_SYMBOLS[sym])}&interval=${iv}&outputsize=${size}&apikey=${TWELVE_DATA_KEY}`;
@@ -1186,7 +1230,8 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
     } catch (e) { console.error("[TwelveData candles]", sym, e.message); }
   }
 
-  if (BINANCE_SYM[sym]) {
+  // Fallback for crypto if Binance somehow failed and TwelveData also has no key/entry
+  if (!CRYPTO_SET.has(sym) && BINANCE_SYM[sym]) {
     try {
       const url = `https://api.binance.com/api/v3/klines?symbol=${BINANCE_SYM[sym]}&interval=${toBinanceInterval(iv)}&limit=${Math.min(size, 1000)}`;
       const res = await fetch(url);
@@ -1208,21 +1253,23 @@ async function fetchSpotPrice(symbol) {
   if (cached) return cached;
   let result = null;
 
-  if (TWELVE_DATA_KEY && TD_SYMBOLS[sym]) {
-    try {
-      const res = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(TD_SYMBOLS[sym])}&apikey=${TWELVE_DATA_KEY}`);
-      const data = await res.json();
-      if (data.price) result = { price: parseFloat(data.price), source: "twelvedata" };
-    } catch (e) { console.error("[TwelveData spot]", sym, e.message); }
-  }
-
-  if (!result && COINGECKO_IDS[sym]) {
+  // Crypto: CoinGecko first (free, no key) so crypto spot checks never touch
+  // the TwelveData quota either — same reasoning as fetchCandles above.
+  if (CRYPTO_SET.has(sym) && COINGECKO_IDS[sym]) {
     try {
       const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${COINGECKO_IDS[sym]}&vs_currencies=usd&include_24hr_change=true`);
       const data = await res.json();
       const id = COINGECKO_IDS[sym];
       if (data[id]) result = { price: data[id].usd, change24h: data[id].usd_24h_change, source: "coingecko" };
     } catch (e) { console.error("[CoinGecko spot]", sym, e.message); }
+  }
+
+  if (!result && TWELVE_DATA_KEY && TD_SYMBOLS[sym]) {
+    try {
+      const res = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(TD_SYMBOLS[sym])}&apikey=${TWELVE_DATA_KEY}`);
+      const data = await res.json();
+      if (data.price) result = { price: parseFloat(data.price), source: "twelvedata" };
+    } catch (e) { console.error("[TwelveData spot]", sym, e.message); }
   }
 
   if (!result && FRANKFURTER_MAP[sym]) {

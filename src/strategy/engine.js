@@ -29,10 +29,18 @@ const FAST_PERIOD = 9;
 const SLOW_PERIOD = 21;
 const RSI_PERIOD = 14;
 const ATR_PERIOD = 14;
+const ADX_PERIOD = 14;
 const VOL_SMA_PERIOD = 20;
 const ATR_SL_MULT = 1.5;
 const MAX_SL_ATR_MULT = 2.5;
 const MIN_RR = 1.5;
+
+// 4H trend is only trusted when ADX is strong RELATIVE TO THAT SYMBOL'S OWN
+// history (percentile rank), not a fixed absolute number — a fixed cutoff
+// (e.g. ADX >= 25) means very different things on XAUUSD vs a quiet FX pair.
+const ADX_STRONG_PERCENTILE = 60;
+const PULLBACK_PROB_THRESHOLD = 55; // >= this -> treat pullback as healthy, wait for zone
+const REVERSAL_PROB_THRESHOLD = 55; // >= this -> treat as real reversal, trade at current price
 
 const SESSION_START_HOUR = 7;  // GMT, London/NY window
 const SESSION_END_HOUR = 17;
@@ -88,6 +96,105 @@ function smaLast(values, period) {
   if (values.length < period) return null;
   const w = values.slice(-period);
   return w.reduce((a, b) => a + b, 0) / period;
+}
+
+// Wilder's DI+/DI-/ADX, returned as full series (aligned to each other, not
+// to the candle index) so we can percentile-rank ADX against its own history.
+function adxSeries(candles, period = 14) {
+  const n = candles.length;
+  if (n < period * 2) return { adx: [], diPlus: [], diMinus: [] };
+  const tr = [], plusDM = [], minusDM = [];
+  for (let i = 1; i < n; i++) {
+    const c = candles[i], p = candles[i - 1];
+    tr.push(trueRange(c));
+    const upMove = c.high - p.high;
+    const downMove = p.low - c.low;
+    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+  }
+  const wilderSmooth = (arr) => {
+    const out = [];
+    let sum = arr.slice(0, period).reduce((a, b) => a + b, 0);
+    out.push(sum);
+    for (let i = period; i < arr.length; i++) {
+      sum = sum - sum / period + arr[i];
+      out.push(sum);
+    }
+    return out;
+  };
+  const trS = wilderSmooth(tr), plusS = wilderSmooth(plusDM), minusS = wilderSmooth(minusDM);
+  const diPlus = [], diMinus = [], dx = [];
+  for (let i = 0; i < trS.length; i++) {
+    const dp = trS[i] === 0 ? 0 : (plusS[i] / trS[i]) * 100;
+    const dm = trS[i] === 0 ? 0 : (minusS[i] / trS[i]) * 100;
+    diPlus.push(dp);
+    diMinus.push(dm);
+    const sum = dp + dm;
+    dx.push(sum === 0 ? 0 : (Math.abs(dp - dm) / sum) * 100);
+  }
+  const adx = [];
+  if (dx.length >= period) {
+    let avg = dx.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    adx.push(avg);
+    for (let i = period; i < dx.length; i++) {
+      avg = (avg * (period - 1) + dx[i]) / period;
+      adx.push(avg);
+    }
+  }
+  return { adx, diPlus, diMinus };
+}
+
+// Percentile rank of the latest value within its own trailing window (0-100).
+// This is the cross-pair fix: "is ADX strong" becomes "strong FOR THIS SYMBOL
+// relative to its own recent range" instead of a fixed number shared across
+// wildly different instruments (XAUUSD vs a quiet FX pair vs BTCUSD).
+function percentileRank(series, lookback = 100) {
+  if (!series.length) return 50;
+  const window = series.slice(-lookback);
+  const last = window[window.length - 1];
+  const below = window.filter(v => v < last).length;
+  return (below / window.length) * 100;
+}
+
+// How deep the current pullback has retraced the prior impulse leg, as a
+// Fibonacci-style ratio. Already symbol-agnostic since it's a ratio, not a
+// raw price distance.
+function computeRetracePct(swings, price, macroSide) {
+  if (macroSide === "BULLISH" && swings.prevLow != null && swings.lastHigh != null && swings.lastHigh !== swings.prevLow) {
+    return ((swings.lastHigh - price) / (swings.lastHigh - swings.prevLow)) * 100;
+  }
+  if (macroSide === "BEARISH" && swings.prevHigh != null && swings.lastLow != null && swings.prevHigh !== swings.lastLow) {
+    return ((price - swings.lastLow) / (swings.prevHigh - swings.lastLow)) * 100;
+  }
+  return null;
+}
+
+// Pullback-vs-reversal probability. Every input here is either a percentile
+// (self-relative to the symbol's own history) or a ratio (already symbol-
+// agnostic), so this one function is meant to be trusted across ALL pairs
+// without per-instrument retuning.
+function scorePullback({ adxPercentile, diSpreadPercentile, retracePct, volRatio }) {
+  let persist = 0, decay = 0;
+
+  if (adxPercentile >= 60) persist += 35;
+  else if (adxPercentile <= 30) decay += 35;
+
+  if (diSpreadPercentile >= 60) persist += 25;
+  else if (diSpreadPercentile <= 30) decay += 25;
+
+  if (retracePct != null) {
+    if (retracePct <= 50) persist += 25;
+    else if (retracePct >= 61.8) decay += 25;
+  }
+
+  if (volRatio <= 1.1) persist += 15;
+  else if (volRatio >= 1.3) decay += 15;
+
+  const total = persist + decay || 1;
+  return {
+    pullbackProb: +(persist / total * 100).toFixed(1),
+    reversalProb: +(decay / total * 100).toFixed(1),
+  };
 }
 
 // Swings detector on 30M array (finds both swing highs and swing lows)
@@ -191,7 +298,8 @@ export class MTFStrategyEngine {
     ]);
 
     const need30M = SLOW_PERIOD + RSI_PERIOD + VOL_SMA_PERIOD + 10;
-    if (!candles30M || candles30M.length < need30M || !candles4H || candles4H.length < SLOW_PERIOD + 5) {
+    const need4H = Math.max(SLOW_PERIOD + 5, ADX_PERIOD * 2 + 5); // ADX needs 2x period to warm up
+    if (!candles30M || candles30M.length < need30M || !candles4H || candles4H.length < need4H) {
       return {
         symbol: sym, decision: "DATA_UNAVAILABLE",
         reason: "Insufficient candle data (need 30M + 4H history)",
@@ -209,8 +317,29 @@ export class MTFStrategyEngine {
     const closes4H = candles4H.map(c => c.close);
     const ema4hFast = emaSeries(closes4H, FAST_PERIOD).at(-1);
     const ema4hSlow = emaSeries(closes4H, SLOW_PERIOD).at(-1);
-    const macroBullish = ema4hFast > ema4hSlow;
-    const macroBearish = ema4hFast < ema4hSlow;
+    const rsi4h = rsiSeries(closes4H, RSI_PERIOD).at(-1) ?? 50;
+    const { adx: adx4hSeries, diPlus: diPlus4hSeries, diMinus: diMinus4hSeries } = adxSeries(candles4H, ADX_PERIOD);
+    const adx4h = adx4hSeries.at(-1) ?? 0;
+    const diPlus4h = diPlus4hSeries.at(-1) ?? 0;
+    const diMinus4h = diMinus4hSeries.at(-1) ?? 0;
+    // ADX judged against THIS symbol's own recent range, not a fixed number —
+    // see ADX_STRONG_PERCENTILE comment above.
+    const adxPercentile4h = percentileRank(adx4hSeries, 100);
+    const diSpread4hSeries = diPlus4hSeries.map((v, i) => Math.abs(v - diMinus4hSeries[i]));
+
+    const ema4hBullish = ema4hFast > ema4hSlow;
+    const ema4hBearish = ema4hFast < ema4hSlow;
+    const rsi4hBullish = rsi4h > 50;
+    const diBullish4h = diPlus4h > diMinus4h;
+    const trendStrong4h = adxPercentile4h >= ADX_STRONG_PERCENTILE;
+
+    // 4H trend requires EMA + RSI + DI to all agree, AND ADX to confirm the
+    // trend has real strength relative to this symbol's own history. Any
+    // disagreement, or a weak/choppy ADX regime, collapses to NEUTRAL —
+    // stricter than EMA alone, which is the point: fewer, more trustworthy
+    // 4H trend calls feeding the 30M execution layer.
+    const macroBullish = trendStrong4h && ema4hBullish && rsi4hBullish && diBullish4h;
+    const macroBearish = trendStrong4h && ema4hBearish && !rsi4hBullish && !diBullish4h;
     const macroTrend = macroBullish ? "BULLISH" : macroBearish ? "BEARISH" : "NEUTRAL";
 
     // =========================================================================
@@ -254,33 +383,52 @@ export class MTFStrategyEngine {
     let isRealReversal = false;
     let reversalSide = null;
 
+    // Pullback vs. real-reversal probability, using only self-relative
+    // (percentile / ratio) features so this scoring holds across every pair
+    // FRIT trades — no per-symbol threshold retuning needed.
+    let pullbackProb = null, reversalProb = null;
+
     if (macroBearish && primaryBullish) {
       pullbackStatus = "BULLISH_PULLBACK_IN_BEAR_TREND";
       const brokeSwingHigh = swings.lastHigh != null && price > swings.lastHigh;
-      const volumeSurging = lastVol > volSma * 1.3;
-      const rsiOverbought = rsiNow >= 62;
+      const retracePct = computeRetracePct(swings, price, "BEARISH");
+      const scored = scorePullback({
+        adxPercentile: adxPercentile4h,
+        diSpreadPercentile: percentileRank(diSpread4hSeries, 100),
+        retracePct,
+        volRatio: lastVol / volSma,
+      });
+      pullbackProb = scored.pullbackProb;
+      reversalProb = scored.reversalProb;
 
-      if (brokeSwingHigh || (volumeSurging && rsiOverbought)) {
+      if (brokeSwingHigh || reversalProb >= REVERSAL_PROB_THRESHOLD) {
         isPullbackHealthy = false;
         isRealReversal = true;
         reversalSide = "BUY";
         pullbackStatus = "INVALID_PULLBACK_REAL_BULLISH_REVERSAL";
       } else {
-        isPullbackHealthy = isCounterTrendVolLow && rsiNow <= 60;
+        isPullbackHealthy = pullbackProb >= PULLBACK_PROB_THRESHOLD;
       }
     } else if (macroBullish && primaryBearish) {
       pullbackStatus = "BEARISH_PULLBACK_IN_BULL_TREND";
       const brokeSwingLow = swings.lastLow != null && price < swings.lastLow;
-      const volumeSurging = lastVol > volSma * 1.3;
-      const rsiOversold = rsiNow <= 38;
+      const retracePct = computeRetracePct(swings, price, "BULLISH");
+      const scored = scorePullback({
+        adxPercentile: adxPercentile4h,
+        diSpreadPercentile: percentileRank(diSpread4hSeries, 100),
+        retracePct,
+        volRatio: lastVol / volSma,
+      });
+      pullbackProb = scored.pullbackProb;
+      reversalProb = scored.reversalProb;
 
-      if (brokeSwingLow || (volumeSurging && rsiOversold)) {
+      if (brokeSwingLow || reversalProb >= REVERSAL_PROB_THRESHOLD) {
         isPullbackHealthy = false;
         isRealReversal = true;
         reversalSide = "SELL";
         pullbackStatus = "INVALID_PULLBACK_REAL_BEARISH_REVERSAL";
       } else {
-        isPullbackHealthy = isCounterTrendVolLow && rsiNow >= 40;
+        isPullbackHealthy = pullbackProb >= PULLBACK_PROB_THRESHOLD;
       }
     }
 
@@ -377,8 +525,12 @@ export class MTFStrategyEngine {
             status: pullbackStatus,
             is_healthy: isPullbackHealthy,
             volume_ok: isCounterTrendVolLow,
-            rsi: Number(rsiNow.toFixed(1)),
-            note: "Pullback volume is low; trend structure remains intact.",
+            pullback_probability: pullbackProb,
+            reversal_probability: reversalProb,
+            adx_percentile_4h: Number(adxPercentile4h.toFixed(1)),
+            note: pullbackProb != null
+              ? `Pullback probability ${pullbackProb}% vs reversal ${reversalProb}%, based on 4H ADX/DI strength (percentile-ranked per symbol) and retracement depth.`
+              : "Not enough swing structure to score retracement depth yet.",
           },
         };
       }
@@ -387,7 +539,7 @@ export class MTFStrategyEngine {
     // Determine primary decision output
     let decision = "WAIT";
     let conf = 50;
-    const reasons = [`4H Macro Trend: ${macroTrend} (EMA 9 vs 21)`];
+    const reasons = [`4H Macro Trend: ${macroTrend} (EMA9/21 + RSI50 + DI+/DI-, gated by ADX percentile ${adxPercentile4h.toFixed(0)})`];
 
     if (isRealReversal && reversalSide) {
       decision = reversalSide;
@@ -401,12 +553,12 @@ export class MTFStrategyEngine {
       reasons.push(`30M Primary Trend: Aligned with 4H (${activeSide})`);
       if (freshCrossUp || freshCrossDown) { conf += 15; reasons.push("Fresh 30M EMA crossover just occurred"); }
       else { conf += 10; reasons.push("Persistent 30M EMA directional alignment"); }
-      if (rsiNow >= 35 && rsiNow <= 65) { conf += 8; reasons.push(`RSI ${rsiNow.toFixed(1)} healthy`); }
+      if (adxPercentile4h >= ADX_STRONG_PERCENTILE) { conf += 8; reasons.push(`4H ADX percentile ${adxPercentile4h.toFixed(0)} — strong trend for this pair`); }
       if (session.ok) { conf += 5; reasons.push(session.reason); }
     } else if (activeSide !== "NEUTRAL") {
       decision = "WAIT_PULLBACK";
-      conf = 45;
-      reasons.push(`4H is ${macroTrend}, but 30M is undergoing a healthy pullback. Refer to Scenario 2 for re-entry.`);
+      conf = 45 + Math.round(((pullbackProb ?? 50) - 50) / 5); // scale slightly with pullback confidence
+      reasons.push(`4H is ${macroTrend}, but 30M is undergoing a healthy pullback (pullback probability ${pullbackProb ?? "n/a"}%). Refer to Scenario 2 for re-entry.`);
     } else {
       reasons.push("4H trend is neutral / transitioning.");
     }
@@ -450,6 +602,11 @@ export class MTFStrategyEngine {
         macro_trend: macroTrend,
         macro_ema_fast: fmt(ema4hFast),
         macro_ema_slow: fmt(ema4hSlow),
+        macro_rsi_4h: Number(rsi4h.toFixed(1)),
+        macro_adx_4h: Number(adx4h.toFixed(1)),
+        macro_adx_percentile_4h: Number(adxPercentile4h.toFixed(1)),
+        macro_di_plus_4h: Number(diPlus4h.toFixed(1)),
+        macro_di_minus_4h: Number(diMinus4h.toFixed(1)),
         primary_ema_fast: fmt(ema30mFast),
         primary_ema_slow: fmt(ema30mSlow),
         anticipated_crossover_price: fmt(anticipatedCrossoverPrice),
@@ -458,9 +615,11 @@ export class MTFStrategyEngine {
         last_swing_high: fmt(swings.lastHigh),
         last_swing_low: fmt(swings.lastLow),
         atr_30m: fmt(atr30M),
-        rsi_30m: Number(rsiNow.toFixed(1)),
+        rsi_30m: Number(rsiNow.toFixed(1)), // informational only — 30M decisions use EMA + pullback probability, not RSI
         pullback_status: pullbackStatus,
         pullback_healthy: isPullbackHealthy,
+        pullback_probability: pullbackProb,
+        reversal_probability: reversalProb,
       },
       guards: {
         session,
