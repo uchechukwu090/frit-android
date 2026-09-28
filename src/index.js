@@ -237,6 +237,30 @@ try {
   console.warn("[skills] phone-ui.md not loaded:", e.message);
 }
 
+// Per-app FLOW skills (server/skills/flows/*.md): the verified UI path for
+// one app+action (button labels, proof-of-success, abort rules), kept in sync
+// with the phone-side automation. Registered by keyword; a missing .md file
+// is skipped silently so the registry doubles as a TODO list. See
+// skills/flows/_TEMPLATE.md to add a new app.
+const APP_FLOW_KEYWORDS = [
+  { keys: ["mt5", "metatrader"], file: "mt5-place-order.md" },
+  { keys: ["voice note", "voicenote", "voice message"], file: "whatsapp-voicenote.md" },
+  { keys: ["opay"], file: "opay-transfer.md" },
+  { keys: ["whatsapp"], file: "whatsapp-send.md" },
+];
+function loadAppFlows(goal = "") {
+  const g = String(goal || "").toLowerCase();
+  const out = [];
+  for (const { keys, file } of APP_FLOW_KEYWORDS) {
+    if (!keys.some(k => g.includes(k))) continue;
+    try {
+      const text = readFileSync(new URL(`./skills/flows/${file}`, import.meta.url), "utf8").trim();
+      if (text) out.push(`APP FLOW (${file}):\n${text}`);
+    } catch (_) { /* not written yet — skip */ }
+  }
+  return out.join("\n\n");
+}
+
 // Same signature as mistralChat, but walks a role's fallback chain on failure
 // (e.g. Groq rate limit exhausted) instead of bubbling the error straight up.
 async function chatWithFallback(role, { messages, tools = null, tool_choice = "auto", temperature, max_tokens }) {
@@ -1998,6 +2022,8 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "take_screenshot", description: "Capture the current screen for later analysis.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "analyze_screenshot", description: "Send the last screenshot to a vision model for UI analysis.", parameters: { type: "object", properties: { prompt: { type: "string" } } } } },
   { type: "function", function: { name: "set_volume", description: "Set media/alarm volume level (0-100).", parameters: { type: "object", properties: { level: { type: "number" } }, required: ["level"] } } },
+  { type: "function", function: { name: "get_app_pin", description: "Return the user's stored app-transaction PIN (e.g. OPay payment PIN) from the on-device vault. Call ONLY when an app screen explicitly demands a PIN you were never given. Never speak, print, or echo the PIN into chat — type it straight into the field with type_text and move on.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "listen_ambient", description: "Record N seconds of ambient room audio and transcribe it. Use for contact voice notes: open the chat, tap play on the voice bubble (speaker), then call this with seconds=30. Returns the transcript.", parameters: { type: "object", properties: { seconds: { type: "number", description: "5-60" } } } } },
 
   // ---- Communication & daily-life tasks (general-purpose) ----
   { type: "function", function: { name: "send_whatsapp", description: "Open a WhatsApp chat with a contact (by name) and draft a message. Then verify and send via UI.", parameters: { type: "object", properties: { contact_name: { type: "string" }, message: { type: "string" } }, required: ["contact_name", "message"] } } },
@@ -2204,6 +2230,8 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "",
     "PHONE UI SKILL — field-tested patterns for operating any app accurately (loaded from server/skills/phone-ui.md — edit that file to teach new patterns):",
     PHONE_UI_SKILL,
+    "",
+    loadAppFlows(goal),
     "",
     "Your Goal is to finish the user's task COMPLETELY. If it takes 10 steps, do 10 steps.",
     "",
