@@ -77,24 +77,9 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const HAS_GROQ = !!GROQ_API_KEY;
 const ZEN_API_KEY = process.env.OPENCODE_ZEN_API_KEY || "";
 const HAS_ZEN = !!ZEN_API_KEY;
-// Direct DeepSeek API — replaces the expired OpenCode Go subscription as the
-// primary agent brain. No monthly commitment (pay-per-token), cheap, native
-// tool calling, and it's the SAME model family Go was proxying to anyway.
-// Get a key at platform.deepseek.com. deepseek-chat = V3.2-class general/tool
-// model; deepseek-reasoner = R1-class, slower/pricier, only worth it for the
-// heaviest subagent research tasks.
+
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const HAS_DEEPSEEK = !!DEEPSEEK_API_KEY;
-// Model id on OpenCode Zen. Now that you're on OpenCode Go ($10/mo, real
-// paid credits), default to the PAID "deepseek-v4-flash" (1M context, native
-// tool calling, generous Go-covered allowance) — not "deepseek-v4-flash-free",
-// which is a shared/limited free pool that was already exhausted.
-// Legacy var kept in case anything external still reads it; the actual
-// primary model selection now happens via GO_MODEL below (see MODELS block).
-// NOTE (Sep 2026 research): the Zen free "deepseek-v4-flash-free" promo ENDED
-// (deprecated upstream). The "big-pickle" free Zen model exists but OpenCode
-// rejects free-tier calls from outside the OpenCode app — it FAILS in a normal
-// server, so it is NOT used here (see AGENT_PRIMARY below).
 const ZEN_MODEL = process.env.OPENCODE_ZEN_MODEL || "deepseek-v4-flash-free";
 const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
 const MISTRAL_FAST_MODEL = process.env.MISTRAL_FAST_MODEL || "mistral-small-latest";
@@ -132,34 +117,15 @@ app.use(cors({ origin: "*" }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // ======================= MODELS =======================
-// Model resolution order: explicit per-role env override -> provider priority.
-// Groq deprecated llama-3.3-70b-versatile AND llama-3.1-8b-instant, shutting
-// down Aug 16, 2026 — migrated per Groq's own recommendation to the GPT-OSS
-// family (openai/gpt-oss-120b / openai/gpt-oss-20b), which also support tool
-// calling.
-//
-// IMPORTANT: OpenCode Go (your $10/mo subscription) and OpenCode Zen
-// (pay-as-you-go wallet) are SEPARATE systems with separate endpoints/model
-// IDs — using the wrong one bills your $0 Zen wallet instead of your Go
-// subscription (this is exactly what was happening before this fix). Go
-// models use the "go:" prefix here; plain Zen free-tier models (a shared,
-// capacity-limited pool, not personal quota) use "zen:".
 const GO_MODEL = process.env.OPENCODE_GO_MODEL || "deepseek-v4-flash"; // -> opencode-go/deepseek-v4-flash
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-flash"; // DeepSeek-V4.1-Flash, native tool calling (legacy deepseek-chat alias still routes here but is deprecated)
-// Primary agent brain. The OpenCode Go $10/mo subscription has EXPIRED, so
-// go:${GO_MODEL} is no longer usable (401s). Replaced with DeepSeek's own
-// direct API: no subscription, pay-per-token, same underlying model family Go
-// was proxying to, and cheap enough (~$0.15-0.60/M off-peak as of 2026-09) that
-// normal usage costs far less than the old $10/mo floor. If you renew Go
-// later, set AGENT_MODEL=go:deepseek-v4-flash to switch back. Override with
-// AGENT_MODEL env at any time.
-const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : `go:${GO_MODEL}`);
+const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : (HAS_GROQ ? "groq:qwen/qwen3.8-27b" : `go:${GO_MODEL}`));
 const MODELS = {
   vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : "mistral-large-latest"),
   agent: AGENT_PRIMARY,
   conversation: process.env.CONVERSATION_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  tools: process.env.TOOLS_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:openai/gpt-oss-120b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  coding: process.env.CODING_MODEL || (HAS_GROQ ? "groq:qwen/qwen3.6-27b" : "codestral-latest"),
+  tools: process.env.TOOLS_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:qwen/qwen3.8-27b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
+  coding: process.env.CODING_MODEL || (HAS_GROQ ? "groq:qwen/qwen3.8-27b" : "codestral-latest"),
   fast: process.env.FAST_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_FAST_MODEL)),
   voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || "voxtral-mini-transcribe-realtime",
   local: process.env.LOCAL_MODEL || "gemma-3n-e2b", // on-device offline fallback (Android), not called here
@@ -179,23 +145,17 @@ function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {
   return MODELS.conversation;
 }
 
-// Runtime fallback chains: if the primary model for a role fails, walk to
-// the next provider instead of throwing "brain disconnected" up to the
-// client. Priority order:
-//   1. OpenCode Go DeepSeek V4 Flash (your $10/mo Go subscription — real
-//      paid quota, 1M context, strong tool calling, ~$60/mo of usage)
-//   2. Groq GPT-OSS 120B (your own quota, tool calling, predictable TPM —
-//      replaces the deprecated Llama 3.3 70B)
-//   3. Gemini 3.6 Flash (solid tool calling, smaller free-tier RPM/RPD)
-//   4. Mistral Large (kept last — weaker observed tool-calling reliability
-//      on multi-field function args, per production logs)
-// Big Pickle / Zen free-tier models are NOT in the chains: OpenCode rejects
-// free-tier calls from outside the OpenCode app.
 function buildFallbackChain(primary) {
   const chain = [primary];
   if (HAS_DEEPSEEK) chain.push(`deepseek:${DEEPSEEK_MODEL}`);
   if (HAS_ZEN) chain.push(`go:${GO_MODEL}`); // harmless to keep listed; simply 401s and falls through if Go is still expired
-  if (HAS_GROQ) chain.push("groq:openai/gpt-oss-120b");
+  if (HAS_GROQ) {
+    // Qwen 3.8 27B first (verified elite agentic/coding/vision scores), GPT-OSS
+    // 120B immediate fallback (cheap, proven in this loop). 3.8 is Groq Preview
+    // tier — on 429/rate-limit the chain falls through to 120B automatically.
+    chain.push("groq:qwen/qwen3.8-27b");
+    chain.push("groq:openai/gpt-oss-120b");
+  }
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
   return [...new Set(chain)];
@@ -210,9 +170,7 @@ function buildVisionFallbackChain(primary) {
     chain.push("groq:qwen/qwen3.8-27b");
     chain.push("groq:qwen/qwen3.6-27b");
   }
-  // Pixtral is DEAD — Mistral retired pixtral-large-latest on 2026-05-31
-  // (every call 400s "model retired"). Mistral Large 3 is multimodal, so the
-  // Mistral-side vision fallback is now mistral-large-latest.
+  
   if (MISTRAL_API_KEY) chain.push("mistral-large-latest");
   return [...new Set(chain)];
 }
@@ -225,11 +183,6 @@ const FALLBACK_CHAINS = {
   fast: buildFallbackChain(MODELS.fast),
 };
 
-// Generic phone-operation skill (merged field knowledge for driving ANY app
-// accurately: tap ladder, text-less icons, keyboard/dialog handling). Loaded
-// once at boot from server/skills/phone-ui.md and injected into every agent
-// system prompt below the TIPS block. Edit the .md to teach the brain new
-// patterns — no code change needed.
 let PHONE_UI_SKILL = "";
 try {
   PHONE_UI_SKILL = readFileSync(new URL("./skills/phone-ui.md", import.meta.url), "utf8").trim();
@@ -237,11 +190,6 @@ try {
   console.warn("[skills] phone-ui.md not loaded:", e.message);
 }
 
-// Per-app FLOW skills (server/skills/flows/*.md): the verified UI path for
-// one app+action (button labels, proof-of-success, abort rules), kept in sync
-// with the phone-side automation. Registered by keyword; a missing .md file
-// is skipped silently so the registry doubles as a TODO list. See
-// skills/flows/_TEMPLATE.md to add a new app.
 const APP_FLOW_KEYWORDS = [
   { keys: ["mt5", "metatrader"], file: "mt5-place-order.md" },
   { keys: ["voice note", "voicenote", "voice message"], file: "whatsapp-voicenote.md" },
@@ -277,9 +225,7 @@ async function chatWithFallback(role, { messages, tools = null, tool_choice = "a
       console.warn(`[chatWithFallback] role=${role} model=${model} unavailable: ${err.message}`);
     }
   }
-  // Every model in the chain failed — surface a clear, distinguishable error
-  // (rather than just the last provider's raw message) so the client/UI can
-  // show something better than a generic "disconnected" for this case.
+  
   const allRateLimited = attempts.every(a => /rate limit|429|tpm|too many requests/i.test(a));
   const err = new Error(
     allRateLimited
@@ -460,15 +406,7 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
     : provider === "deepseek" ? "https://api.deepseek.com/chat/completions"
     : `${MISTRAL_BASE}/chat/completions`;
   const apiKey = provider === "groq" ? GROQ_API_KEY : (provider === "zen" || provider === "go") ? ZEN_API_KEY : provider === "deepseek" ? DEEPSEEK_API_KEY : MISTRAL_API_KEY;
-  // Go's own model catalog uses "opencode-go/<model-id>" — e.g. "go:deepseek-v4-flash"
-  // becomes "opencode-go/deepseek-v4-flash" on the wire, NOT plain "deepseek-v4-flash"
-  // (that bare id is what hits your pay-as-you-go Zen wallet instead).
-  // Go's "opencode-go/<model>" prefix appears to be specific to OpenCode's
-  // own multi-provider config file format — direct HTTP calls to the
-  // Go-scoped endpoint (already provider-specific via the URL) expect the
-  // bare model slug instead, per other integration examples. If this still
-  // 400s, the prefixed form may be needed after all — flag it and we'll flip
-  // it back.
+  
   const cleanModel = provider === "go" ? model.slice(3)
     : (provider === "groq" || provider === "zen" || provider === "deepseek") ? model.slice(model.indexOf(":") + 1)
     : model;
@@ -490,9 +428,7 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
-          // Node's default fetch User-Agent gets blocked by Cloudflare's bot
-          // protection (error 1010) on some providers — notably OpenCode Zen.
-          // A normal browser-style UA avoids that entirely.
+         
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         },
         body: JSON.stringify(body),
@@ -598,7 +534,7 @@ function rewriteSettingsNavigation(tc, goal) {
   const n = tc.function.name;
   const a = tc.function.arguments || {};
   const slowOpen = n === "open_app" && /^settings?$/i.test(String(a.app_name || "").trim());
-  const slowNav = (n === "tap_button" || n === "tap_element") && SETTINGS_NAV_LABEL.test(String(a.label || "").trim());
+  const slowNav = (n === "tap_button") && SETTINGS_NAV_LABEL.test(String(a.label || "").trim());
   if (!slowOpen && !slowNav) return tc;
   return { ...tc, function: { ...tc.function, name: "execute_local_action", arguments: { action: `open ${m[1].toLowerCase()}` } } };
 }
@@ -730,9 +666,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
           badAppCalls.push(tc);
           continue;
         }
-        // Ground against the real installed-apps list (if the device sent
-        // one) so a near-miss like "Messenger" vs "Messages" self-corrects
-        // instead of bouncing back to the model or failing on-device.
+
         const resolved = resolveInstalledApp(appName, deviceStateForPrompt);
         if (resolved && resolved !== appName) {
           tc.function.arguments = { ...tc.function.arguments, app_name: resolved };
@@ -766,12 +700,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
           } catch (err) {
             result = { ok: false, error: err.message };
           }
-          // run_code can produce real files (charts, CSVs, backtest reports).
-          // Collect them for the client response, but strip the raw base64
-          // out of what goes back into the model's own context — feeding
-          // megabytes of encoded image data into every subsequent LLM call
-          // would blow the token budget for no benefit (the model can't see
-          // images this way anyway; it only needs to know a file was made).
+          
           if (name === "run_code" && Array.isArray(result?.data?.artifacts) && result.data.artifacts.length) {
             for (const art of result.data.artifacts) {
               const b64 = art.content_base64 || art.base64 || "";
@@ -812,10 +741,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
 
   const done = androidPending.length === 0;
 
-  // A ledger only represents a real task if something in it is actually
-  // active/pending/attention. A plain chat turn (e.g. "hi") produces zero
-  // Android tool calls too, but there's no task to "complete" — so we must
-  // not force the ledger to "done"/"completed" in that case.
+  
   const hadActiveTask = ledger.some(
     t => t.status === "active" || t.status === "pending" || t.status === "attention"
   );
@@ -892,10 +818,6 @@ async function routeChatOrTask(goal, history = []) {
   return { isTask: true };
 }
 
-// Voice-latency gate: the enhancer costs a full fast-model round trip. Fresh
-// tasks, long messages, and vague follow-ups ("do that", "yes" after a
-// proposal) are worth it; short EXPLICIT commands ("open whatsapp") gain
-// nothing and just add dead air before every voice reply — send those raw.
 function needsEnhancement(goal, history = []) {
   const g = String(goal || "");
   if (!Array.isArray(history) || history.length === 0) return true;
@@ -905,13 +827,6 @@ function needsEnhancement(goal, history = []) {
   return false;
 }
 
-// Prompt enhancer: vague user commands fail because the brain must guess
-// intent AND tool mapping at once. This cheap fast-model pass rewrites the
-// goal into an explicit, endpoint-aware instruction (naming the exact
-// tool/endpoint sequence, e.g. XAUUSD -> analyze_market then phone MT5
-// execution with the stated lot size) before the planner/ledger ever sees it.
-// Runs once per /agent/start on real tasks only (the router above already
-// peeled off chit-chat). Any failure falls back to the raw goal.
 async function enhanceGoalForAgent(rawGoal, history = []) {
   try {
     const histBlock = (Array.isArray(history) ? history.slice(-6) : [])
@@ -919,7 +834,7 @@ async function enhanceGoalForAgent(rawGoal, history = []) {
       .join("\n");
     const out = await chatWithFallback("fast", {
       messages: [
-        { role: "system", content: "You are a prompt enhancer for FRIT, an Android AI agent with server tools: analyze_market(symbol...), get_market_data(symbol), run_code(code), search_web(query), get_weather, send_whatsapp(contact,message), make_call(number), and phone UI tools (open_app, tap_element, type_text, scroll, read_screen). Rewrite the user's vague command into ONE explicit paragraph: state the intent, name the exact tool/endpoint sequence in order, keep device facts (symbols, lot sizes, names) verbatim. IMPORTANT: the user often says 'that'/'it' meaning something from the recent chat — resolve pronouns using the history below (e.g. 'do that for me' after a research recommendation = perform that research). Output ONLY the rewritten instruction, no preamble." },
+        { role: "system", content: "You are a prompt enhancer for FRIT, an Android AI agent with server tools: analyze_market(symbol...), get_market_data(symbol), run_code(code), search_web(query), get_weather, send_whatsapp(contact,message), make_call(number), and phone UI tools (open_app, tap_button, type_text, scroll, read_screen). Rewrite the user's vague command into ONE explicit paragraph: state the intent, name the exact tool/endpoint sequence in order, keep device facts (symbols, lot sizes, names) verbatim. IMPORTANT: the user often says 'that'/'it' meaning something from the recent chat — resolve pronouns using the history below (e.g. 'do that for me' after a research recommendation = perform that research). Output ONLY the rewritten instruction, no preamble." },
         { role: "user", content: `${histBlock ? `Recent chat:\n${histBlock}\n\n` : ""}Latest message: ${String(rawGoal || "")}` }
       ]
     });
@@ -1011,37 +926,12 @@ app.get("/agent/status", requireAuth, (req, res) => {
   res.json({ session, steps });
 });
 
-// STT via Mistral Voxtral (fallback: Groq Whisper, then OpenAI Whisper)
-async function mistralTranscribe(audioBase64, mimeType = "audio/wav") {
-  const base64Data = audioBase64.includes(",") ? audioBase64.split(",")[1] : audioBase64;
-  const audioBuffer = Buffer.from(base64Data, "base64");
-  // Normalize to a bare mime type (strip any codec suffix like ";codecs=opus")
-  // and fall back to wav if the client didn't send one Mistral will accept.
-  const cleanMime = (mimeType || "audio/wav").split(";")[0].trim() || "audio/wav";
 
-  // Try Mistral Voxtral first
-  try {
-    const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${MISTRAL_API_KEY}` },
-      body: JSON.stringify({
-        model: MODELS.voxtral,
-        messages: [
-          { role: "system", content: "Transcribe the user's speech accurately. Return only the transcribed text, no explanations." },
-          { role: "user", content: [{ type: "audio_url", audio_url: { url: `data:${cleanMime};base64,${base64Data}` } }] },
-        ],
-        max_tokens: 800,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const text = data?.choices?.[0]?.message?.content?.trim();
-      if (text) return text;
-    } else {
-      const errBody = await res.text().catch(() => "");
-      console.warn(`[MistralTranscribe] Mistral Voxtral failed: ${res.status} mime=${cleanMime} body=${errBody.slice(0, 300)}`);
-    }
-  } catch (e) { console.warn("[MistralTranscribe] Mistral error:", e.message); }
+// Transcription helper (Mistral/Voxtral primary block removed — Groq Whisper
+// is the live path). Decodes the base64 body once for the fallbacks below.
+async function mistralTranscribe(audio_base64, mime_type = "audio/webm") {
+  const audioBuffer = Buffer.from(String(audio_base64 || ""), "base64");
+  const cleanMime = String(mime_type || "audio/webm").split(";")[0].trim() || "audio/webm";
 
   // Fallback: Groq Whisper
   if (process.env.GROQ_API_KEY) {
@@ -1363,213 +1253,6 @@ async function fetchMarketPrices(symbols = []) {
   return result;
 }
 
-// ======================== TECHNICAL INDICATORS ========================
-function calcATR(candles, period = 14) {
-  if (!candles || candles.length < period + 1) return 0;
-  const trs = [];
-  for (let i = 1; i < candles.length; i++) {
-    const c = candles[i];
-    const p = candles[i - 1];
-    trs.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
-  }
-  const recent = trs.slice(-period);
-  return recent.reduce((a, b) => a + b, 0) / recent.length;
-}
-
-function calcSR(candles) {
-  const window = candles.slice(-50);
-  const swings = findSwings(window, 3);
-  const currentPrice = candles.at(-1)?.close ?? 0;
-  const support = swings.lows.map(s => s.price).filter(p => p < currentPrice).sort((a, b) => b - a)[0] ?? Math.min(...window.map(c => c.low));
-  const resistance = swings.highs.map(s => s.price).filter(p => p > currentPrice).sort((a, b) => a - b)[0] ?? Math.max(...window.map(c => c.high));
-  return { support, resistance };
-}
-
-function findSwings(candles, lookback = 2) {
-  const highs = [];
-  const lows = [];
-  for (let i = lookback; i < candles.length - lookback; i++) {
-    const cur = candles[i];
-    let isHigh = true;
-    let isLow = true;
-    for (let j = i - lookback; j <= i + lookback; j++) {
-      if (j === i) continue;
-      if (candles[j].high >= cur.high) isHigh = false;
-      if (candles[j].low <= cur.low) isLow = false;
-    }
-    if (isHigh) highs.push({ index: i, price: cur.high, time: cur.time });
-    if (isLow) lows.push({ index: i, price: cur.low, time: cur.time });
-  }
-  return { highs, lows };
-}
-
-function detectCandlePattern(candles) {
-  if (!candles || candles.length < 2) return [];
-  const a = candles[candles.length - 2];
-  const b = candles[candles.length - 1];
-  const patterns = [];
-  const aBear = a.close < a.open;
-  const aBull = a.close > a.open;
-  const bBull = b.close > b.open;
-  const bBear = b.close < b.open;
-  if (aBear && bBull && b.open <= a.close && b.close >= a.open) patterns.push("bullish_engulfing");
-  if (aBull && bBear && b.open >= a.close && b.close <= a.open) patterns.push("bearish_engulfing");
-  const body = Math.abs(b.close - b.open);
-  const upperWick = b.high - Math.max(b.open, b.close);
-  const lowerWick = Math.min(b.open, b.close) - b.low;
-  if (body > 0) {
-    if (lowerWick > body * 2 && upperWick < body) patterns.push("pinbar_bullish");
-    if (upperWick > body * 2 && lowerWick < body) patterns.push("pinbar_bearish");
-    if (body < (b.high - b.low) * 0.35) patterns.push("indecision");
-  }
-  return patterns;
-}
-
-// ======================== VOLUME PROFILE (Market Auction) ========================
-function calcAuction(candles, buckets = 40) {
-  if (!candles || candles.length < 10) return null;
-  const window = candles.slice(-100);
-  const totalRawVol = window.reduce((s, c) => s + (c.volume || 0), 0);
-  const hasRealVol = totalRawVol > window.length * 2;
-  const hi = Math.max(...window.map(c => c.high));
-  const lo = Math.min(...window.map(c => c.low));
-  if (hi === lo) return null;
-  const bucketSize = (hi - lo) / buckets;
-  const vap = new Array(buckets).fill(0);
-  for (const c of window) {
-    const rangeProxy = c.high - c.low || bucketSize;
-    const bodySize = Math.abs(c.close - c.open) || rangeProxy * 0.3;
-    const vol = hasRealVol ? (c.volume > 0 ? c.volume : rangeProxy) : rangeProxy * (1 + bodySize / rangeProxy);
-    const candleRange = c.high - c.low || bucketSize;
-    for (let b = 0; b < buckets; b++) {
-      const bLo = lo + b * bucketSize;
-      const bHi = bLo + bucketSize;
-      const overlap = Math.max(0, Math.min(c.high, bHi) - Math.max(c.low, bLo));
-      vap[b] += vol * (overlap / candleRange);
-    }
-  }
-  const pocIdx = vap.indexOf(Math.max(...vap));
-  const poc = lo + (pocIdx + 0.5) * bucketSize;
-  const totalVol = vap.reduce((a, b) => a + b, 0);
-  const target = totalVol * 0.7;
-  let lo_idx = pocIdx, hi_idx = pocIdx, accumulated = vap[pocIdx];
-  while (accumulated < target) {
-    const addLo = lo_idx > 0 ? vap[lo_idx - 1] : 0;
-    const addHi = hi_idx < buckets - 1 ? vap[hi_idx + 1] : 0;
-    if (addLo === 0 && addHi === 0) break;
-    if (addHi >= addLo) { hi_idx++; accumulated += addHi; }
-    else { lo_idx--; accumulated += addLo; }
-  }
-  const vah = lo + (hi_idx + 1) * bucketSize;
-  const val = lo + lo_idx * bucketSize;
-  const sorted = vap.map((v, i) => ({ v, price: lo + (i + 0.5) * bucketSize })).sort((a, b) => b.v - a.v);
-  return {
-    poc, vah, val,
-    hvn: sorted.slice(0, 3).map(x => x.price),
-    lvn: sorted.slice(-5).map(x => x.price),
-    range_hi: hi,
-    range_lo: lo,
-    volume_mode: hasRealVol ? "real" : "proxy",
-  };
-}
-
-function auctionSignal(price, auction) {
-  if (!auction) return { position: "unknown", bias: "neutral", note: "" };
-  const { poc, vah, val } = auction;
-  if (price > vah) return { position: "above_value", bias: "bullish", note: "Price above Value Area — buyers in control." };
-  if (price < val) return { position: "below_value", bias: "bearish", note: "Price below Value Area — sellers in control." };
-  if (price > poc) return { position: "inside_value_upper", bias: "mild_bullish", note: "Inside Value Area above POC — mean reversion risk, watch VAH." };
-  return { position: "inside_value_lower", bias: "mild_bearish", note: "Inside Value Area below POC — mean reversion risk, watch VAL." };
-}
-
-// ==================== VOLATILITY ====================
-function analyzeVolatility(candles, price) {
-  const atr = calcATR(candles, 14);
-  let regime = "normal";
-  if (atr / (price || 1) < 0.0015) regime = "compressed";
-  else if (atr / (price || 1) > 0.005) regime = "expanding";
-  return { atr, regime };
-}
-
-// ==================== SCORING + TRADE PLAN ====================
-function scoreSetup({ price, support, resistance, patterns, auction, auctionSig, mtf, volatility }) {
-  let bull = 0, bear = 0;
-  const atr = volatility?.atr || 1;
-
-  if (auction && auctionSig) {
-    if (auctionSig.bias === "bullish") { bull += 3; bear -= 1; }
-    else if (auctionSig.bias === "bearish") { bear += 3; bull -= 1; }
-    else if (auctionSig.bias === "mild_bullish") bull += 1;
-    else if (auctionSig.bias === "mild_bearish") bear += 1;
-    if (auction.poc && Math.abs(price - auction.poc) / ((auction.vah - auction.val) || 1) < 0.1) {
-      bull += 1;
-      bear += 1;
-    }
-  }
-
-  if (price > support && (price - support) / (price || 1) < 0.003) bull += 2;
-  if (price < resistance && (resistance - price) / (price || 1) < 0.003) bear += 2;
-
-  const levels = [support, resistance];
-  if (auction) levels.push(auction.poc, auction.vah, auction.val);
-  const nearLevel = (p) => levels.some(lvl => lvl && Math.abs(p - lvl) <= atr * 0.5);
-  if (nearLevel(price)) {
-    if (patterns.includes("bullish_engulfing") || patterns.includes("pinbar_bullish")) bull += 2;
-    if (patterns.includes("bearish_engulfing") || patterns.includes("pinbar_bearish")) bear += 2;
-    if (patterns.includes("indecision")) { bull -= 0.5; bear -= 0.5; }
-  }
-
-  if (volatility?.regime === "compressed") { bull -= 0.5; bear -= 0.5; }
-
-  let mtfNote = "4H data unavailable";
-  if (mtf) {
-    if (mtf.trend === "up") { bull += 2; bear -= 1; mtfNote = "4H trend UP - favors longs"; }
-    else if (mtf.trend === "down") { bear += 2; bull -= 1; mtfNote = "4H trend DOWN - favors shorts"; }
-    else mtfNote = "4H trend neutral";
-  }
-
-  let bias = "neutral";
-  const diff = bull - bear;
-  if (diff >= 2) bias = "bullish";
-  if (diff <= -2) bias = "bearish";
-  const confidence = Math.max(5, Math.min(95, Math.round(50 + diff * 6)));
-
-  return { bull_score: bull, bear_score: bear, bias, confidence, mtf_note: mtfNote };
-}
-
-function buildTradePlan({ bias, price, support, resistance, atr, dp }) {
-  if (!price || !atr) return { entry_zone: null, invalidation: null, tp1: null, tp2: null, risk_state: "unknown" };
-  if (bias === "bullish") {
-    const entry1 = price - atr * 0.15;
-    const entry2 = price + atr * 0.15;
-    const invalidation = support > 0 ? support - atr * 0.25 : price - atr * 1.2;
-    const tp1 = resistance > 0 ? resistance : price + atr * 1.2;
-    const tp2 = resistance > 0 ? resistance + atr * 0.8 : price + atr * 2.2;
-    return {
-      entry_zone: `${entry1.toFixed(dp)} - ${entry2.toFixed(dp)}`,
-      invalidation: invalidation.toFixed(dp),
-      tp1: tp1.toFixed(dp),
-      tp2: tp2.toFixed(dp),
-      risk_state: "acceptable",
-    };
-  }
-  if (bias === "bearish") {
-    const entry1 = price - atr * 0.15;
-    const entry2 = price + atr * 0.15;
-    const invalidation = resistance > 0 ? resistance + atr * 0.25 : price + atr * 1.2;
-    const tp1 = support > 0 ? support : price - atr * 1.2;
-    const tp2 = support > 0 ? support - atr * 0.8 : price - atr * 2.2;
-    return {
-      entry_zone: `${entry1.toFixed(dp)} - ${entry2.toFixed(dp)}`,
-      invalidation: invalidation.toFixed(dp),
-      tp1: tp1.toFixed(dp),
-      tp2: tp2.toFixed(dp),
-      risk_state: "acceptable",
-    };
-  }
-  return { entry_zone: null, invalidation: null, tp1: null, tp2: null, risk_state: "no_trade" };
-}
-
 // =================== NEWS FILTER ===================
 const SYMBOL_CURRENCIES = {
   EURUSD: ["EUR", "USD"], GBPUSD: ["GBP", "USD"], USDJPY: ["USD", "JPY"],
@@ -1622,141 +1305,6 @@ async function checkNewsFilter(symbol) {
   return { blocked: false, has_news: false };
 }
 
-// ===================== MTF CONFIRMATION =====================
-async function getMTFBias(symbol) {
-  const sym = String(symbol || "").toUpperCase();
-  const ck = `mtf:${sym}`;
-  const cached = cacheGet(ck);
-  if (cached) return cached;
-  try {
-    const candles4h = await fetchCandles(sym, "4h", 100);
-    if (!candles4h || candles4h.length < 50) return { trend: "neutral", structure: null };
-    const swings = findSwings(candles4h);
-    const recentHighs = swings.highs.slice(-3);
-    const recentLows = swings.lows.slice(-3);
-    const hh = recentHighs.length >= 2 && recentHighs.at(-1).price > recentHighs.at(-2).price;
-    const hl = recentLows.length >= 2 && recentLows.at(-1).price > recentLows.at(-2).price;
-    const lh = recentHighs.length >= 2 && recentHighs.at(-1).price < recentHighs.at(-2).price;
-    const ll = recentLows.length >= 2 && recentLows.at(-1).price < recentLows.at(-2).price;
-    let trend = "neutral";
-    if (hh && hl) trend = "up";
-    else if (lh && ll) trend = "down";
-    const result = { trend, price: candles4h.at(-1)?.close ?? 0 };
-    cacheSet(ck, result, 15 * 60 * 1000);
-    return result;
-  } catch (err) {
-    console.warn("[MTF]", err.message);
-    return { trend: "neutral", structure: null };
-  }
-}
-
-// ===================== MAIN ANALYSIS =====================
-async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
-  const sym = String(symbol || "").toUpperCase();
-  const iv = normalizeInterval(interval);
-  const ck = `analysis:${sym}:${iv}:${customSize || "auto"}`;
-  const cached = cacheGet(ck);
-  if (cached) return cached;
-
-  const [candles, spot, newsCheck, mtf] = await Promise.all([
-    fetchCandles(sym, iv, customSize),
-    fetchSpotPrice(sym),
-    checkNewsFilter(sym),
-    getMTFBias(sym),
-  ]);
-
-  if (newsCheck.blocked) {
-    return {
-      symbol: sym,
-      direction: "NEUTRAL",
-      strength: "NEWS_BLACKOUT",
-      interval: iv,
-      news_filter: newsCheck,
-      trade_plan: { entry_zone: null, invalidation: null, tp1: null, tp2: null, risk_state: "no_trade" },
-      concise_signal: { direction: "STAND DOWN", entry: "N/A", sl: "N/A", tp: "N/A", ai_opinion: `News blackout active. ${newsCheck.reason}` },
-      ai_opinion: `STAND DOWN — ${newsCheck.reason}`,
-    };
-  }
-  if (!candles && !spot) return { symbol: sym, error: `No data for ${sym}` };
-  const price = spot?.price ?? candles?.at(-1)?.close ?? 0;
-  if (!candles || candles.length < 30) return { symbol: sym, price, source: spot?.source, analysis: "Insufficient candle data", candleCount: candles?.length ?? 0 };
-
-  const { support, resistance } = calcSR(candles);
-  const volatility = analyzeVolatility(candles, price);
-  const patterns = detectCandlePattern(candles);
-  const auction = calcAuction(candles);
-  const auctionSig = auctionSignal(price, auction);
-  const score = scoreSetup({ price, support, resistance, patterns, auction, auctionSig, mtf, volatility });
-
-  let direction = "NEUTRAL";
-  if (score.bias === "bullish") direction = "BULLISH";
-  else if (score.bias === "bearish") direction = "BEARISH";
-  let strength = "WEAK";
-  if (score.confidence >= 75) strength = "STRONG";
-  else if (score.confidence >= 60) strength = "MODERATE";
-  const isCrypto = CRYPTO_SET.has(sym);
-  const dp = isCrypto || sym === "XAUUSD" ? 2 : 5;
-
-  const trade_plan = buildTradePlan({ bias: score.bias, price, support, resistance, atr: volatility.atr, dp });
-  trade_plan.method = "none";
-
-  const auctionNote = auctionSig.note ? `Auction: ${auctionSig.note}` : "";
-  const aiOpinion = direction === "NEUTRAL"
-    ? `No clear edge. ${auctionNote}`.trim()
-    : `${direction} ${strength} | ${auctionNote}`.trim();
-
-  // Structure now comes from local swing detection (was smcCrt.structure).
-  const structSwings = findSwings(candles, 3);
-  const sHighs = structSwings.highs.slice(-2), sLows = structSwings.lows.slice(-2);
-  const structTrend = (sHighs.length === 2 && sLows.length === 2)
-    ? (sHighs.at(-1).price > sHighs.at(-2).price && sLows.at(-1).price > sLows.at(-2).price ? "uptrend"
-      : sHighs.at(-1).price < sHighs.at(-2).price && sLows.at(-1).price < sLows.at(-2).price ? "downtrend" : "ranging")
-    : "ranging";
-  const sc = { trend: structTrend };
-  const result = {
-    symbol: sym,
-    price,
-    direction,
-    strength,
-    interval: iv,
-    candleCount: candles.length,
-    source: spot?.source ?? "binance",
-    support: +support.toFixed(dp),
-    resistance: +resistance.toFixed(dp),
-    confidence: score.confidence,
-    structure: {
-      trend: sc.trend || "ranging",
-      last_swing_high: structSwings.highs.at(-1)?.price ? +structSwings.highs.at(-1).price.toFixed(dp) : null,
-      last_swing_low: structSwings.lows.at(-1)?.price ? +structSwings.lows.at(-1).price.toFixed(dp) : null,
-    },
-    volatility: { atr: +volatility.atr.toFixed(dp), regime: volatility.regime },
-    patterns,
-    trade_plan,
-    concise_signal: {
-      direction,
-      entry: trade_plan.entry_zone || "N/A",
-      sl: trade_plan.invalidation || "N/A",
-      tp: trade_plan.tp1 || "N/A",
-      ai_opinion: aiOpinion,
-    },
-    auction: auction ? {
-      poc: +auction.poc.toFixed(dp),
-      vah: +auction.vah.toFixed(dp),
-      val: +auction.val.toFixed(dp),
-      position: auctionSig.position,
-      bias: auctionSig.bias,
-      note: auctionSig.note,
-      hvn: auction.hvn.map(p => +p.toFixed(dp)),
-      lvn: auction.lvn.map(p => +p.toFixed(dp)),
-    } : null,
-    mtf: { trend: mtf?.trend || "unknown", note: score.mtf_note },
-    news_filter: { blocked: false },
-    ai_opinion: aiOpinion,
-    summary: `${sym} @${price.toFixed(dp)} | ${direction}(${strength}) | Conf:${score.confidence} | Structure:${sc.trend || "?"}(4H:${mtf?.trend || "?"}) | VP:${auctionSig.position.replace("_", " ")} POC:${auction?.poc.toFixed(dp) || "?"} VAH:${auction?.vah.toFixed(dp) || "?"} VAL:${auction?.val.toFixed(dp) || "?"} | S:${support.toFixed(dp)} R:${resistance.toFixed(dp)} [${candles.length} ${iv}]`,
-  };
-  cacheSet(ck, result, 60000);
-  return result;
-}
 
 // =================== WEB SEARCH + WEATHER ===================
 async function webSearch(query) {
@@ -1847,39 +1395,7 @@ async function sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason 
   }
 }
 
-// ==================== GSRI RISK OVERLAY ====================
-const GSR1_LOCAL_PATH = process.env.GSR1_SNAPSHOT_PATH || join(__dirname, "gsri_snapshot.json");
-const GSR1_REMOTE_URL = process.env.GSR1_REMOTE_URL || "";
-const GSR1_ALPHA = 0.6;
-const GSR1_MIN_SCALE = 0.2;
-const GSR1_REMOTE_TTL = 5 * 60 * 1000;
-let _gsriRemoteCache = null;
 
-async function getGsriSnapshot() {
-  try {
-    const raw = readFileSync(GSR1_LOCAL_PATH, "utf8");
-    const data = JSON.parse(raw);
-    const snap = Array.isArray(data) ? data.at(-1) : data;
-    if (snap && typeof snap === "object") return snap;
-  } catch { /* absent or malformed */ }
-  if (GSR1_REMOTE_URL) {
-    const now = Date.now();
-    if (_gsriRemoteCache && now - _gsriRemoteCache.ts < GSR1_REMOTE_TTL) return _gsriRemoteCache.snap;
-    try {
-      const r = await fetch(GSR1_REMOTE_URL, { signal: AbortSignal.timeout(6000) });
-      if (r.ok) {
-        const data = await r.json();
-        const snap = Array.isArray(data) ? data.at(-1) : data;
-        if (snap) { _gsriRemoteCache = { snap, ts: now }; return snap; }
-      }
-    } catch (e) { console.warn("[GSRI] Remote fetch failed:", e.message); }
-  }
-  return { Risk_Score: 0.8, Alert: 1, source: "fallback" };
-}
-
-function gsriLotScale(riskScore) {
-  return Math.max(GSR1_MIN_SCALE, 1.0 - GSR1_ALPHA * Number(riskScore));
-}
 
 // ==================== TRADE MEMORY ====================
 // SQLite-backed (survives restarts) with an in-memory Map as the read cache.
@@ -2003,18 +1519,16 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "read_screen", description: "Read visible text from the screen. Use this frequently to observe state and verify the result of every action.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "read_screen_structured", description: "Return exact coordinates of UI elements. Essential for precise clicking.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "tap_button", description: "Tap a button by its visible label/text. If it reports not-found, the phone auto-tries coordinate fallback + scroll — then re-read the screen and retry with tap_coordinates from read_screen_structured.", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
-  { type: "function", function: { name: "tap_element", description: "Tap a UI element by its text label (same as tap_button).", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
   { type: "function", function: { name: "tap_coordinates", description: "Tap specific x/y coordinates. Use when text-based tapping fails.", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
   { type: "function", function: { name: "type_text", description: "Type text into the focused input field.", parameters: { type: "object", properties: { value: { type: "string" }, field: { type: "string" } }, required: ["value"] } } },
   { type: "function", function: { name: "scroll", description: "Scroll the UI in a direction.", parameters: { type: "object", properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] } }, required: ["direction"] } } },
   { type: "function", function: { name: "go_back", description: "Press the Android back button.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "press_back", description: "Press the Android back button (alias of go_back).", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "press_home", description: "Go to the home screen.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "toggle_notifications", description: "Pull down the notification shade. Use to check/read notifications, not for settings toggles (use execute_local_action for wifi/bluetooth/data).", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "toggle_quick_settings", description: "Open Quick Settings panel (the expanded shade with wifi/bluetooth/flashlight tiles).", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "recent_apps", description: "Open the Recent Apps / app switcher screen.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "lock_screen", description: "Lock the device screen immediately. Only use when the user explicitly asks to lock the phone.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "swipe_coordinates", description: "Swipe upward starting from x/y coordinates (e.g. to dismiss a card or scroll a custom-drawn view tap_element/scroll can't reach).", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
+  { type: "function", function: { name: "swipe_coordinates", description: "Swipe upward starting from x/y coordinates (e.g. to dismiss a card or scroll a custom-drawn view tap_button/scroll can't reach).", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"] } } },
   { type: "function", function: { name: "long_press_element", description: "Long-press a UI element by its visible text label (opens context menus, drag handles, etc).", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } } },
   { type: "function", function: { name: "take_native_screenshot", description: "Trigger Android's own screenshot capture (saves to gallery) — different from take_screenshot, which captures for in-agent vision analysis only.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "get_current_app", description: "Return the name of the currently focused app.", parameters: { type: "object", properties: {} } } },
@@ -2042,14 +1556,11 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
   { type: "function", function: { name: "get_market_data", description: "Fetch live spot prices for one or more symbols (e.g. XAUUSD, BTCUSD).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_market_news", description: "Fetch real-time financial, fundamental, and macroeconomic news for any trading symbol (XAUUSD, BTCUSD, Forex, Stocks) for the current date/year.", parameters: { type: "object", properties: { symbol: { type: "string" }, query: { type: "string" } } } } },
-  { type: "function", function: { name: "analyze_market", description: "Run the MTFStrategyEngine multi-timeframe analysis on a symbol (returns regime, structure, direction/decision, entry, SL, TP, confidence).", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, balance: { type: "number" }, risk_percent: { type: "number" } }, required: ["symbol"] } } },
-  { type: "function", function: { name: "get_market_quote", description: "Fetch a quick market quote for a symbol.", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "place_mt5_trade", description: "Place a real market order on MetaTrader 5 via the phone's MT5 agent. Use this after market analysis confirms a high-confidence entry signal.", parameters: { type: "object", properties: { symbol: { type: "string" }, action: { type: "string", enum: ["BUY", "SELL"] }, volume: { type: "number" }, sl: { type: "number" }, tp: { type: "number" } }, required: ["symbol", "action", "volume"] } } },
   { type: "function", function: { name: "modify_mt5_order", description: "Modify SL/TP of an open MT5 position via guided on-device UI steps (Trade tab -> long-press -> Modify). If unsure about MT5 menu layout, call search_web first (e.g. 'MT5 android modify SL TP steps').", parameters: { type: "object", properties: { symbol: { type: "string" }, sl: { type: "number" }, tp: { type: "number" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "close_mt5_order", description: "Close an open MT5 position via guided on-device UI steps (Trade tab -> long-press -> Close).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_mt5_positions", description: "Read currently visible MT5 positions from the phone screen (symbol, side, volume, P/L). Call read_screen first if empty.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "get_acp_status", description: "Get the Automated Conviction Proxy for a symbol (direction, confidence, SMC signal, crash regime).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
-  { type: "function", function: { name: "get_gsri_status", description: "Get the GSRI risk snapshot.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "get_systems_status", description: "Get overall server system status.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "wait_and_verify", description: "Wait a moment before verifying state (use after actions that take time).", parameters: { type: "object", properties: { delay_ms: { type: "number" } } } } },
   { type: "function", function: { name: "assert_text_visible", description: "Verify that text is visible on the last screen state.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
@@ -2121,9 +1632,9 @@ async function runLocalTool(name, args = {}, agentState = null) {
 const SUBAGENT_POOL = [
   { slot: "speed", model: "groq:openai/gpt-oss-20b", kinds: ["lookup", "extract", "classify", "quick"] },
   { slot: "draft", model: "mistral-small-latest", kinds: ["draft", "summarize", "rewrite", "plan"] },
-  // Heavy slot follows the expired-Go migration: DeepSeek direct API first
-  // (same model family Go was proxying), Groq 120B when no DeepSeek key.
-  { slot: "heavy", model: (typeof HAS_DEEPSEEK !== "undefined" && HAS_DEEPSEEK) ? `deepseek:${DEEPSEEK_MODEL}` : "groq:openai/gpt-oss-120b", kinds: ["research", "compare", "analyze", "code"] },
+  // Heavy slot follows the Qwen migration: 3.8-27B leads research/code
+  // (SWE-Pro 61.7, OSWorld-Verified 84.3), DeepSeek direct if keyed.
+  { slot: "heavy", model: (typeof HAS_GROQ !== "undefined" && HAS_GROQ) ? "groq:qwen/qwen3.8-27b" : ((typeof HAS_DEEPSEEK !== "undefined" && HAS_DEEPSEEK) ? `deepseek:${DEEPSEEK_MODEL}` : "groq:openai/gpt-oss-120b"), kinds: ["research", "compare", "analyze", "code"] },
 ];
 function pickSubagentModel(kind = "") {
   const k = String(kind).toLowerCase();
@@ -2194,7 +1705,7 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "# FRIT Mobile Agent Execution Mindset:",
     "- UI Asynchrony: Android UIs do not refresh instantly. After executing a structural tap or typing text, always assume an animation or network lag of 300-800ms.",
     "- Flaky Element Matching: Resource IDs change between app updates, and text labels may contain leading/trailing whitespaces. Always use fuzzy substring matching if an exact match fails.",
-    "- Coordination Safety: Never issue raw coordinates (tap_coordinates) unless element-based text anchors (tap_element, tap_button) are entirely absent from the structured screen dump. Bounding boxes shift based on device display scaling and DPI variations.",
+    "- Coordination Safety: Never issue raw coordinates (tap_coordinates) unless element-based text anchors (tap_button) are entirely absent from the structured screen dump. Bounding boxes shift based on device display scaling and DPI variations.",
     "- Recovery: If an execution path blocks or fields are missing, do not hallucinate success. Tap go_back, re-examine the screen text structure, or call take_screenshot to confirm the visual layer.",
     "",
     "1. OBSERVE: Use 'read_screen' or 'read_screen_structured' to see what's on screen.",
@@ -2208,7 +1719,7 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- Only call DEVICE-CONTROL tools (open_app, tap, type, scroll, go_back, press_home) when the user's message clearly asks for a phone action. For greetings or small talk with no request in them, reply in plain conversational text with ZERO tool calls — do not invent a phone task out of a greeting like 'hi'.",
     "- This restriction does NOT apply to server-side analysis/data tools (analyze_market, get_market_data, search_web, run_code, get_weather). If the user asks a question those tools can answer — e.g. 'what's your analysis on XAUUSD', 'search X', 'what's the weather' — CALL the relevant tool immediately. A question is still a request; don't treat 'they didn't say an imperative command' as a reason to skip the tool and answer from memory instead.",
     "- For 'open_app': the 'app_name' argument must be ONLY the literal app name (e.g. 'WhatsApp', 'Messenger') — never a sentence, instruction, or task description. Open the app first, THEN use separate tool calls (read_screen, tap, type) to carry out the actual task once it's open.",
-    "- SETTINGS TOGGLES (bluetooth/wifi/data/airplane/location/battery): step 1 call 'execute_local_action' (e.g. 'open bluetooth') — it lands directly on the right page. Step 2 'read_screen', then 'tap_element' the toggle. Step 3 'read_screen' to confirm it flipped. Step 4 call 'return_to_frit'. Never navigate Settings menus manually.",
+    "- SETTINGS TOGGLES (bluetooth/wifi/data/airplane/location/battery): step 1 call 'execute_local_action' (e.g. 'open bluetooth') — it lands directly on the right page. Step 2 'read_screen', then 'tap_button' the toggle. Step 3 'read_screen' to confirm it flipped. Step 4 call 'return_to_frit'. Never navigate Settings menus manually.",
     "- DIVISION OF LABOR: the phone's local engine owns launching apps and system shortcuts (open_app, execute_local_action). You own analysis, decisions, and every tap/type INSIDE an app. Never navigate to an app manually; launch it, then act on the screen text the launch returns.",
     "- If the device state below lists 'Installed apps', ONLY target names from that list with open_app — do not guess an app exists if it isn't listed. If it's not there, tell the user instead of trying anyway.",
     "- UNFAMILIAR APP UI (Opay, Facebook, MT5, any app you haven't driven in THIS session): BEFORE tapping blindly, spend ONE 'search_web' call on the exact flow — e.g. 'Opay Android app how to transfer money steps 2026', 'Facebook Android app create post steps'. Combine that walkthrough with the live screen text and NEVER second-guess: screen text always wins over the article when they disagree. Skip the search only for apps/flows you already completed successfully in this session.",
@@ -2226,7 +1737,8 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- Run Code: Use 'run_code' for complex logic, math, or data processing. Don't guess calculations.",
     "- Browse: Use 'search_web' to find information.",
     "- Market/trading news & fundamentals: ALWAYS call 'get_market_news' or 'search_web' to retrieve current live 2025/2026 market news. NEVER cite outdated news from 2024 or earlier memory!",
-    "- Market/trading tasks: analysis happens HERE on the server, NOT on the phone. Actually CALL the 'analyze_market' or 'get_market_data' tool (a real function call) and read the returned direction/entry/SL/TP — do not narrate calling it. Only use the phone (open_app MetaTrader5, tap, type) to EXECUTE an order after the analysis is complete.",
+     "- Market/trading tasks: analysis happens HERE on the server, NOT on the phone. Actually CALL the 'analyze_market' or 'get_market_data' tool (a real function call) and read the returned direction/entry/SL/TP — do not narrate calling it. Only use the phone (open_app MetaTrader5, tap, type) to EXECUTE an order after the analysis is complete.",
+     "- TRADING NUMBERS DISCIPLINE: report the engine's decision/entry_zone/scenario/pullback_health fields VERBATIM. NEVER invent MACD, Bollinger, ADX/DI, or session values the tools did not return — if you want an indicator the engine lacks, compute it with run_code from real candles, never from memory. When decision is WAIT_PULLBACK, present ONLY the pullback-zone entry (limit-style); never substitute a market entry. When a healthy pullback exists, scenario_2 IS the trade — scenario_1 immediates apply only when the engine is aligned.",
     "",
     "PHONE UI SKILL — field-tested patterns for operating any app accurately (loaded from server/skills/phone-ui.md — edit that file to teach new patterns):",
     PHONE_UI_SKILL,
@@ -2419,6 +1931,49 @@ app.post("/market/batch", async (req, res) => {
     res.status(500).json({ error: "Batch fetch failed", details: err.message });
   }
 });
+
+// Compatibility: the legacy local-scoring analyzeSymbol was removed; route
+// through MTFStrategyEngine and reshape to the legacy contract that
+// /market/analyze, /trade (legacy branch) and /acp/status still expect.
+async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
+  const r = await mtfStrategy.analyze(String(symbol || "XAUUSD").toUpperCase(), { interval });
+  const dir = r.decision === "BUY" ? "BULLISH" : r.decision === "SELL" ? "BEARISH" : "NEUTRAL";
+  const strength = r.confidence >= 75 ? "STRONG" : r.confidence >= 60 ? "MODERATE" : "WEAK";
+  return {
+    symbol: String(symbol || "XAUUSD").toUpperCase(),
+    price: parseFloat(r.price) || 0,
+    direction: dir,
+    strength,
+    interval,
+    confidence: r.confidence,
+    trade_plan: {
+      entry_zone: r.entry ?? null,
+      invalidation: r.sl ?? null,
+      tp1: r.tp ?? null,
+      tp2: r.tp2 ?? null,
+      risk_state: dir === "NEUTRAL" ? "no_trade" : "acceptable",
+    },
+    concise_signal: {
+      direction: dir,
+      entry: r.entry || "N/A",
+      sl: r.sl || "N/A",
+      tp: r.tp || "N/A",
+      ai_opinion: r.reason || "",
+    },
+    news_filter: { blocked: false },
+    mtf: { trend: r.regime?.macro_trend || "unknown" },
+    engine_decision: r.decision,
+    scenarios: r.scenarios ?? null,
+    source: "engine-shim",
+  };
+}
+
+// GSRI file-snapshot path was removed; neutral pass-through so /trade,
+// /gsri/status and /acp/status keep working (never blocks, never scales).
+async function getGsriSnapshot() {
+  return { Risk_Score: 0, Alert: 0, Date: "stub", source: "removed-neutral" };
+}
+function gsriLotScale(score) { return 1; }
 
 app.all("/market/analyze", requireAuth, async (req, res) => {
   try {
