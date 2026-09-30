@@ -1560,7 +1560,6 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "modify_mt5_order", description: "Modify SL/TP of an open MT5 position via guided on-device UI steps (Trade tab -> long-press -> Modify). If unsure about MT5 menu layout, call search_web first (e.g. 'MT5 android modify SL TP steps').", parameters: { type: "object", properties: { symbol: { type: "string" }, sl: { type: "number" }, tp: { type: "number" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "close_mt5_order", description: "Close an open MT5 position via guided on-device UI steps (Trade tab -> long-press -> Close).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_mt5_positions", description: "Read currently visible MT5 positions from the phone screen (symbol, side, volume, P/L). Call read_screen first if empty.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_acp_status", description: "Get the Automated Conviction Proxy for a symbol (direction, confidence, SMC signal, crash regime).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_systems_status", description: "Get overall server system status.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "wait_and_verify", description: "Wait a moment before verifying state (use after actions that take time).", parameters: { type: "object", properties: { delay_ms: { type: "number" } } } } },
   { type: "function", function: { name: "assert_text_visible", description: "Verify that text is visible on the last screen state.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
@@ -1812,18 +1811,18 @@ const FRAME_BUFFER_SIZE = 10;
 // ==================== ROUTES ====================
 app.get("/", (_req, res) => {
   res.json({
-    name: "FRIT SMC+CRT Trading Engine & Mistral AI Orchestrator",
-    description: "Pure SMC+CRT + Volume Profile + GSRI — no indicators. Single Mistral API ecosystem.",
+    name: "FRIT engine.js Trading Engine & Mistral AI Orchestrator",
+    description: "Single trading engine (server/src/strategy/engine.js). Single Mistral API ecosystem.",
     status: "online",
     endpoints: {
       core: ["/health", "/agent/start", "/agent/resume", "/agent/status"],
-      market: ["/market/quote", "/market/batch", "/market/analyze", "/trade", "/gsri/status"],
+      market: ["/market/quote", "/market/batch", "/market/analyze", "/trade"],
       positions: ["/positions", "/positions/status", "/positions/resolve"],
-      strategy: ["/enhanced/analyze", "/market/strategy", "/strategy/status", "/systems/status", "/acp/status"],
+      strategy: ["/enhanced/analyze", "/market/strategy", "/strategy/status", "/systems/status"],
       memory: ["/memory/trade"],
       screen: ["/screen/frame", "/screen/analyze-frame", "/screen/status"],
       transcribe: ["/transcribe"],
-      tools: ["/tools/search", "/acp/status"],
+      tools: ["/tools/search"],
     utility: ["/weather"],
     sandbox: ["/sandbox/run"],
   },
@@ -1932,9 +1931,8 @@ app.post("/market/batch", async (req, res) => {
   }
 });
 
-// Compatibility: the legacy local-scoring analyzeSymbol was removed; route
-// through MTFStrategyEngine and reshape to the legacy contract that
-// /market/analyze, /trade (legacy branch) and /acp/status still expect.
+// Compatibility shim: /market/analyze legacy contract, backed ONLY by
+// MTFStrategyEngine (server/src/strategy/engine.js) — the single trading engine.
 async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   const r = await mtfStrategy.analyze(String(symbol || "XAUUSD").toUpperCase(), { interval });
   const dir = r.decision === "BUY" ? "BULLISH" : r.decision === "SELL" ? "BEARISH" : "NEUTRAL";
@@ -1968,13 +1966,6 @@ async function analyzeSymbol(symbol, interval = "1h", customSize = null) {
   };
 }
 
-// GSRI file-snapshot path was removed; neutral pass-through so /trade,
-// /gsri/status and /acp/status keep working (never blocks, never scales).
-async function getGsriSnapshot() {
-  return { Risk_Score: 0, Alert: 0, Date: "stub", source: "removed-neutral" };
-}
-function gsriLotScale(score) { return 1; }
-
 app.all("/market/analyze", requireAuth, async (req, res) => {
   try {
     const body = req.body || {};
@@ -1993,150 +1984,68 @@ app.all("/market/analyze", requireAuth, async (req, res) => {
   }
 });
 
-// ==================== TRADE ENDPOINT ====================
+// ==================== TRADE ENDPOINT (engine.js only) ====================
+// MTFStrategyEngine (server/src/strategy/engine.js) is the single trading
+// engine. /trade always runs through it — no legacy/GSRI/ACP branches.
 app.post("/trade", requireAuth, async (req, res) => {
-  const { symbol, action, risk_percent = 1, balance, reason = "", interval = "1h", pipeline = "original" } = req.body || {};
-  if (!symbol || !action) return res.status(400).json({ error: "symbol and action required" });
-  if (!["buy", "sell"].includes(action)) return res.status(400).json({ error: "action must be buy or sell" });
-
-  if (pipeline === "enhanced") {
-    try {
-      // MTFStrategyEngine is the single analysis brain for trading decisions.
-      const result = await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
-
-      if (["NO_TRADE", "WAIT", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
-        return res.status(200).json({ status: "blocked", ...result });
-      }
-      const tradeResult = await sendToMT5Bridge({
-        symbol: symbol.toUpperCase(),
-        action: result.decision === "BUY" ? "buy" : "sell",
-        lotSize: result.lot_size,
-        entry: result.entry,
-        sl: result.sl,
-        tp: result.tp,
-        reason: reason || `MTF v1 pipeline: conf=${result.confidence}% regime=${result.regime?.trend} struct=${result.structure?.trend} zone=${result.entry_ctx?.zone}`,
-      });
-
-      // Additive: watch this position until TP/SL is hit (paper-first by design).
-      let position = null;
-      if (tradeResult.status !== "failed" && result.sl && result.tp) {
-        try {
-          position = positionMonitor.register({
-            symbol: symbol.toUpperCase(),
-            action: result.decision === "BUY" ? "buy" : "sell",
-            lotSize: result.lot_size,
-            entry: result.entry,
-            sl: result.sl,
-            tp: result.tp,
-            source: "mtf_v1",
-            reason: reason || `conf=${result.confidence}%`,
-          });
-        } catch (e) { console.warn("[PositionMonitor] /trade register failed:", e.message); }
-      }
-
-      return res.json({
-        status: "submitted",
-        pipeline: "mtf_v1",
-        symbol: symbol.toUpperCase(),
-        action: result.decision === "BUY" ? "buy" : "sell",
-        lotSize: result.lot_size,
-        entry: result.entry,
-        sl: result.sl,
-        tp: result.tp,
-        tp2: result.tp2,
-        rr: result.rr,
-        confidence: result.confidence,
-        regime: result.regime,
-        structure: result.structure,
-        entry_ctx: result.entry_ctx,
-        guards: result.guards,
-        mt5_result: tradeResult,
-        position_id: position?.id ?? null,
-      });
-    } catch (err) {
-      console.error("[/trade enhanced]", err.message);
-      return res.status(500).json({ error: "Enhanced trade failed", details: err.message });
-    }
-  }
-
-  if (!reason) return res.status(400).json({ error: "reason required — AI must justify every trade" });
+  const { symbol, risk_percent = 1, balance, reason = "", interval = "1h" } = req.body || {};
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
 
   try {
-    const gsriSnap = await getGsriSnapshot();
-    const gsriScore = parseFloat(gsriSnap?.Risk_Score ?? 0.8);
-    const gsriAlert = parseInt(gsriSnap?.Alert ?? 1);
-    const gsriScale = gsriLotScale(gsriScore);
-    const gsriDate = gsriSnap?.Date ?? "unknown";
-    if (gsriAlert === 1) {
-      return res.status(200).json({
-        status: "blocked_by_gsri",
-        reason: `GSRI Alert active — Risk_Score=${gsriScore.toFixed(3)}, date=${gsriDate}. New entries blocked during elevated systemic risk.`,
-        gsri: { score: gsriScore, alert: gsriAlert, scale: 0, date: gsriDate, source: gsriSnap?.source || "file" },
-      });
+    const result = await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
+
+    if (["NO_TRADE", "WAIT", "WAIT_PULLBACK", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
+      return res.status(200).json({ status: "blocked", ...result });
     }
-
-    const analysis = await analyzeSymbol(symbol, interval);
-    if (analysis.news_filter?.blocked) return res.status(200).json({ status: "blocked", reason: analysis.ai_opinion });
-
-    const entry = parseFloat(analysis.trade_plan?.entry_zone?.split("-")[0]) || analysis.price;
-    const sl = parseFloat(analysis.trade_plan?.invalidation) || 0;
-    const tp = parseFloat(analysis.trade_plan?.tp1) || 0;
-    if (!sl) return res.status(400).json({ error: "Could not determine stop loss from analysis" });
-
-    const accountBalance = balance || 1000;
-    const rawLot = calculateLotSize({ symbol, balance: accountBalance, riskPercent: risk_percent, entry, stopLoss: sl });
-    const lotSize = parseFloat((rawLot * gsriScale).toFixed(2));
-
     const tradeResult = await sendToMT5Bridge({
       symbol: symbol.toUpperCase(),
-      action,
-      lotSize,
-      entry,
-      sl,
-      tp,
-      reason,
+      action: result.decision === "BUY" ? "buy" : "sell",
+      lotSize: result.lot_size,
+      entry: result.entry,
+      sl: result.sl,
+      tp: result.tp,
+      reason: reason || `engine.js: conf=${result.confidence}% regime=${result.regime?.macro_trend} zone=${result.entry_ctx?.zone}`,
     });
 
-    addTradeMemory(symbol, { direction: action, pattern: analysis.patterns?.join(", ") || "none", outcome: "pending", note: reason });
-
-    // Additive: watch this position until TP/SL is hit.
+    // Additive: watch this position until TP/SL is hit (paper-first by design).
     let position = null;
-    if (tradeResult.status !== "failed" && sl && tp) {
+    if (tradeResult.status !== "failed" && result.sl && result.tp) {
       try {
         position = positionMonitor.register({
           symbol: symbol.toUpperCase(),
-          action,
-          lotSize,
-          entry,
-          sl,
-          tp,
-          source: "trade",
-          reason,
+          action: result.decision === "BUY" ? "buy" : "sell",
+          lotSize: result.lot_size,
+          entry: result.entry,
+          sl: result.sl,
+          tp: result.tp,
+          source: "engine_js",
+          reason: reason || `conf=${result.confidence}%`,
         });
       } catch (e) { console.warn("[PositionMonitor] /trade register failed:", e.message); }
     }
 
-    res.json({
+    return res.json({
       status: "submitted",
+      pipeline: "engine_js",
       symbol: symbol.toUpperCase(),
-      action,
-      lotSize,
-      raw_lot: rawLot,
-      entry,
-      sl,
-      tp,
-      risk_percent,
-      balance_used: accountBalance,
-      reason,
+      action: result.decision === "BUY" ? "buy" : "sell",
+      lotSize: result.lot_size,
+      entry: result.entry,
+      sl: result.sl,
+      tp: result.tp,
+      tp2: result.tp2,
+      rr: result.rr,
+      confidence: result.confidence,
+      regime: result.regime,
+      structure: result.structure_30m,
+      entry_ctx: result.entry_ctx,
+      guards: result.guards,
       mt5_result: tradeResult,
-      analysis_confidence: analysis.confidence,
-      mtf_note: analysis.mtf?.note,
-      gsri: { score: gsriScore, alert: gsriAlert, scale: gsriScale, date: gsriDate },
       position_id: position?.id ?? null,
     });
   } catch (err) {
     console.error("[/trade]", err.message);
-    res.status(500).json({ error: "Trade failed", details: err.message });
+    return res.status(500).json({ error: "Trade failed", details: err.message });
   }
 });
 
@@ -2155,20 +2064,6 @@ app.post("/positions/resolve", requireAuth, (req, res) => {
   if (!id) return res.status(400).json({ error: "id required" });
   const result = positionMonitor.resolve(id, outcome, close_price ?? null, note || "");
   res.json(result.ok ? result : { ok: false, error: result.error });
-});
-
-app.get("/gsri/status", requireAuth, async (req, res) => {
-  try {
-    const snap = await getGsriSnapshot();
-    const score = parseFloat(snap?.Risk_Score ?? 0.8);
-    res.json({
-      snapshot: snap,
-      lot_scale: gsriLotScale(score),
-      entries_allowed: parseInt(snap?.Alert ?? 1) === 0,
-    });
-  } catch (err) {
-    res.status(500).json({ error: "GSRI status failed", details: err.message });
-  }
 });
 
 app.post("/memory/trade", requireAuth, (req, res) => {
@@ -2217,7 +2112,7 @@ app.post("/sandbox/run", requireAuth, async (req, res) => {
   }
 });
 
-// ==================== WEB SEARCH & CONVICTION PROXY ====================
+// ==================== WEB SEARCH ====================
 // /tools/search — raw web-search endpoint used by the agent brain (search_web tool)
 // and by any client that wants real-time info without going through the LLM.
 app.post("/tools/search", requireAuth, async (req, res) => {
@@ -2228,32 +2123,6 @@ app.post("/tools/search", requireAuth, async (req, res) => {
     res.json({ ok: true, ...data });
   } catch (err) {
     console.error("[/tools/search]", err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// /acp/status — Automated Conviction Proxy: a lightweight composite of every
-// signal the server already computes for a symbol (engine analysis + crash
-// regime). Lets the brain/UI gauge conviction cheaply.
-app.get("/acp/status", requireAuth, async (req, res) => {
-  const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
-  try {
-    const analysis = await analyzeSymbol(sym, "1h", null);
-    const gsri = (await getGsriSnapshot()) || {};
-    const gsriObj = typeof gsri === "object" ? gsri : {};
-    res.json({
-      symbol: sym,
-      direction: analysis.direction || "UNKNOWN",
-      confidence: analysis.confidence ?? null,
-      price: analysis.price ?? null,
-      strength: analysis.strength ?? null,
-      paper_trades: null,
-      crash_regime: gsriObj.Crash_Phase || "unknown",
-      crash_risk_score: gsriObj.Risk_Score ?? null,
-      timestamp: Date.now(),
-    });
-  } catch (err) {
-    console.error("[/acp/status]", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -2307,10 +2176,10 @@ app.get("/tasks/trade-schedule", requireAuth, (_req, res) => {
   res.json(tradeScheduler.status());
 });
 
-// System status (MTFStrategyEngine + scheduler + positions).
+// System status (engine.js + scheduler + positions).
 app.get("/systems/status", requireAuth, (_req, res) => {
   res.json({
-    engine: "mtf_v1",
+    engine: "engine_js",
     strategy: mtfStrategy.cacheStatus(),
     scheduler: tradeScheduler.status(),
     positions: positionMonitor.status(),
@@ -2326,16 +2195,12 @@ app.use((err, _req, res, _next) => {
 // ====== START ======
 app.listen(PORT, () => {
   console.log(`
-FRIT - SMC+CRT Trading Engine & Mistral AI Orchestrator
+FRIT - engine.js Trading Engine & Mistral AI Orchestrator
 Port : ${String(PORT).padEnd(5)}
-Pure SMC+CRT (no indicator lag):
- - Candle Range Theory (CRT)
- - Smart Money Concepts (OB, FVG, CHoCH, Liquidity)
- - Market Structure (HH/HL, LH/LL, BOS)
- - Volume Profile (POC, VAH, VAL)
- - GSRI systemic risk overlay
- - News filter (FF calendar — 30 min blackout)
- - Multi-timeframe confirmation (4H swing structure)
+Single trading engine (server/src/strategy/engine.js):
+ - 30M primary + 4H confirmation (EMA 9/21 + RSI + DI, ADX percentile gate)
+ - News filter (FF calendar — 30 min advisory)
+ - Multi-timeframe confirmation (4H trend regime)
 Single Mistral ecosystem:
  - Mistral Medium — chat + agentic + vision
  - Voxtral Mini — STT
