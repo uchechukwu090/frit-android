@@ -119,19 +119,13 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // ======================= MODELS =======================
 const GO_MODEL = process.env.OPENCODE_GO_MODEL || "deepseek-v4-flash"; // -> opencode-go/deepseek-v4-flash
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-flash"; // DeepSeek-V4.1-Flash, native tool calling (legacy deepseek-chat alias still routes here but is deprecated)
-// Cost stack (Sep 2026): DeepSeek direct is primary — best intelligence-per-
-// dollar (V3-class, native tool calling, automatic context caching so the big
-// repeated system prompt costs ~10% after the first turn). Groq Qwen 3.8 27B
-// is OUT: reasoning-burn on output tokens made it the most expensive link.
-// Groq remains as fast fallback via Llama 3.3 70B (cheap, solid tools) and
-// Kimi K2 Instruct (agentic specialist, Groq free tier eligible).
-const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : (HAS_GROQ ? "groq:llama-3.3-70b-versatile" : `go:${GO_MODEL}`));
+const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : (HAS_GROQ ? "groq:qwen/qwen3.8-27b" : `go:${GO_MODEL}`));
 const MODELS = {
   vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : "mistral-large-latest"),
   agent: AGENT_PRIMARY,
   conversation: process.env.CONVERSATION_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  tools: process.env.TOOLS_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:llama-3.3-70b-versatile" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  coding: process.env.CODING_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : (HAS_GROQ ? "groq:llama-3.3-70b-versatile" : "codestral-latest")),
+  tools: process.env.TOOLS_MODEL || (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : HAS_ZEN ? `go:${GO_MODEL}` : (HAS_GROQ ? "groq:qwen/qwen3.8-27b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
+  coding: process.env.CODING_MODEL || (HAS_GROQ ? "groq:qwen/qwen3.8-27b" : "codestral-latest"),
   fast: process.env.FAST_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_FAST_MODEL)),
   voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || "voxtral-mini-transcribe-realtime",
   local: process.env.LOCAL_MODEL || "gemma-3n-e2b", // on-device offline fallback (Android), not called here
@@ -156,12 +150,11 @@ function buildFallbackChain(primary) {
   if (HAS_DEEPSEEK) chain.push(`deepseek:${DEEPSEEK_MODEL}`);
   if (HAS_ZEN) chain.push(`go:${GO_MODEL}`); // harmless to keep listed; simply 401s and falls through if Go is still expired
   if (HAS_GROQ) {
-    // No Qwen, no GPT-OSS 120B in the loop: Qwen burned cash on reasoning
-    // output tokens; 120B misfires tool calls (worse than an error on a
-    // trading app). Kimi K2 first (agentic specialist), Llama 3.3 70B next
-    // (cheap, fast, reliable tools). Unknown IDs just 404 and fall through.
-    chain.push("groq:moonshotai/kimi-k2-instruct");
-    chain.push("groq:llama-3.3-70b-versatile");
+    // Qwen 3.8 27B first (verified elite agentic/coding/vision scores), GPT-OSS
+    // 120B immediate fallback (cheap, proven in this loop). 3.8 is Groq Preview
+    // tier — on 429/rate-limit the chain falls through to 120B automatically.
+    chain.push("groq:qwen/qwen3.8-27b");
+    chain.push("groq:openai/gpt-oss-120b");
   }
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
@@ -172,9 +165,10 @@ function buildVisionFallbackChain(primary) {
   const chain = [primary];
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (HAS_GROQ) {
-    // Llama 4 Scout: multimodal, cheap, fast on Groq. (Kimi K2 on Groq is
-    // text-only, so it can't cover vision.)
-    chain.push("groq:meta-llama/llama-4-scout-17b-16e-instruct");
+    // Groq vision-capable Qwen models (both confirmed vision in Groq docs):
+    // qwen3.8-27b first (newer, vision + tool use + JSON mode), 3.5 as backup.
+    chain.push("groq:qwen/qwen3.8-27b");
+    chain.push("groq:qwen/qwen3.6-27b");
   }
   
   if (MISTRAL_API_KEY) chain.push("mistral-large-latest");
@@ -1723,7 +1717,7 @@ const SUBAGENT_POOL = [
   { slot: "draft", model: "mistral-small-latest", kinds: ["draft", "summarize", "rewrite", "plan"] },
   // Heavy slot follows the Qwen migration: 3.8-27B leads research/code
   // (SWE-Pro 61.7, OSWorld-Verified 84.3), DeepSeek direct if keyed.
-    { slot: "heavy", model: (typeof HAS_DEEPSEEK !== "undefined" && HAS_DEEPSEEK) ? `deepseek:${DEEPSEEK_MODEL}` : ((typeof HAS_GROQ !== "undefined" && HAS_GROQ) ? "groq:llama-3.3-70b-versatile" : "groq:openai/gpt-oss-120b"), kinds: ["research", "compare", "analyze", "code"] },
+  { slot: "heavy", model: (typeof HAS_GROQ !== "undefined" && HAS_GROQ) ? "groq:qwen/qwen3.8-27b" : ((typeof HAS_DEEPSEEK !== "undefined" && HAS_DEEPSEEK) ? `deepseek:${DEEPSEEK_MODEL}` : "groq:openai/gpt-oss-120b"), kinds: ["research", "compare", "analyze", "code"] },
 ];
 function pickSubagentModel(kind = "") {
   const k = String(kind).toLowerCase();
