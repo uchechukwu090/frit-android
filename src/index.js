@@ -849,6 +849,75 @@ async function enhanceGoalForAgent(rawGoal, history = []) {
   return rawGoal;
 }
 
+// ==================== DETERMINISTIC MARKET PRE-ROUTE ====================
+// Pure quote/analysis goals are answered straight from the trading engine
+// (Twelve Data spot + MTF strategy) instead of entering the LLM loop, where
+// the brain sometimes narrates analysis from memory instead of calling
+// analyze_market/get_market_data. Trade EXECUTION ("buy X 0.01") is NOT
+// short-circuited — orders stay inside the agent loop with its verification
+// and confirmation discipline.
+const MARKET_SYMBOL_MAP = {
+  bitcoin: "BTCUSD", btcusd: "BTCUSD", btc: "BTCUSD",
+  ethereum: "ETHUSD", ethusd: "ETHUSD", eth: "ETHUSD",
+  solana: "SOLUSD", solusd: "SOLUSD",
+  gold: "XAUUSD", xauusd: "XAUUSD", silver: "XAGUSD", xagusd: "XAGUSD",
+  eurusd: "EURUSD", gbpusd: "GBPUSD", usdjpy: "USDJPY", usdchf: "USDCHF",
+  audusd: "AUDUSD", usdcad: "USDCAD", nzdusd: "NZDUSD",
+  nas100: "NAS100", nasdaq: "NAS100", us30: "US30", spx500: "SPX500", us500: "US500",
+};
+function marketKeyHit(t, key) {
+  // Short keys (btc/eth) need word boundaries — "whether" is not Ethereum.
+  return key.length <= 3 ? new RegExp(`\\b${key}\\b`).test(t) : t.includes(key);
+}
+function extractMarketSymbol(text) {
+  const t = String(text || "").toLowerCase();
+  for (const k of Object.keys(MARKET_SYMBOL_MAP).sort((a, b) => b.length - a.length)) {
+    if (marketKeyHit(t, k)) return MARKET_SYMBOL_MAP[k];
+  }
+  const m = t.match(/\b[a-z]{6,7}\b/);
+  if (m) {
+    const w = m[0].toUpperCase();
+    if (/USD$|JPY$|CHF$|CAD$/.test(w)) return w;
+  }
+  return "BTCUSD";
+}
+function hasMarketContext(t) {
+  if (/\bmt5\b|forex|crypto|\bmarket\b|\blot\b|\btrade\b|\btrading\b/.test(t)) return true;
+  return Object.keys(MARKET_SYMBOL_MAP).some(k => marketKeyHit(t, k));
+}
+// Returns { kind: "quote"|"analysis", symbol } or null. Trade orders return
+// null on purpose so they stay in the agent loop (confirmation discipline).
+function detectMarketGoal(rawGoal) {
+  const t = String(rawGoal || "").toLowerCase();
+  if (!hasMarketContext(t)) return null;
+  const side = /\bbuy\b|\bsell\b|\blong\b|\bshort\b/.test(t);
+  const num = /\d+(\.\d+)?/.test(t);
+  if (side && num) return null; // real order -> agent loop
+  if (/price|quote|\brate\b|how much|cost of/.test(t)) return { kind: "quote", symbol: extractMarketSymbol(t) };
+  if (/analy|signal|forecast|predict|chart|outlook|\btrade\b|\btrading\b|\bmt5\b|\bbuy\b|\bsell\b|\blong\b|\bshort\b/.test(t)) {
+    return { kind: "analysis", symbol: extractMarketSymbol(t) };
+  }
+  return null;
+}
+function formatQuote(symbol, prices) {
+  const q = prices && prices[symbol];
+  if (!q || q.error || !q.price) return `${symbol}: live price unavailable right now.`;
+  const ch = Number(q.change24h || 0);
+  return `${symbol}: ${q.price} ${q.currency || "USD"} (24h ${ch >= 0 ? "+" : ""}${ch.toFixed(2)}%) — live engine quote.`;
+}
+function formatEngineAnalysis(symbol, a) {
+  if (!a || typeof a !== "object") return `${symbol}: engine returned no data.`;
+  if (a.decision === "DATA_UNAVAILABLE") return `${symbol}: live data unavailable (${a.reason || "no candles"}).`;
+  const L = [`${a.symbol || symbol} live engine: ${a.decision}${a.direction ? ` (${a.direction})` : ""}${a.confidence != null ? ` — confidence ${a.confidence}%` : ""}`];
+  if (a.price != null) L.push(`Price: ${a.price}`);
+  if (a.entry != null) L.push(`Entry: ${a.entry}`);
+  if (a.sl != null) L.push(`SL: ${a.sl}`);
+  if (a.tp != null) L.push(`TP: ${a.tp}`);
+  if (Array.isArray(a.reasons) && a.reasons.length) L.push(`Reasons: ${a.reasons.slice(0, 4).join("; ")}`);
+  if (a.entry_ctx && a.entry_ctx.zone != null) L.push(`Entry zone (${a.entry_ctx.type || "limit"}): ${a.entry_ctx.zone}`);
+  return L.join("\n");
+}
+
 app.post("/agent/start", requireAuth, async (req, res) => {
   const { goal, device_state, memory, history } = req.body;
   if (!goal) return res.status(400).json({ error: "Goal required" });
@@ -861,6 +930,21 @@ app.post("/agent/start", requireAuth, async (req, res) => {
     }
   } catch (_) {
     // Router failed — fall through to the agent loop rather than erroring out.
+  }
+
+  // Deterministic market pre-route: engine data first, LLM never invents prices.
+  try {
+    const mg = detectMarketGoal(goal);
+    if (mg) {
+      if (mg.kind === "quote") {
+        const prices = await fetchMarketPrices([mg.symbol]);
+        return res.json({ done: true, assistant_text: formatQuote(mg.symbol, prices) });
+      }
+      const analysis = await mtfStrategy.analyze(mg.symbol, {});
+      return res.json({ done: true, assistant_text: formatEngineAnalysis(mg.symbol, analysis) });
+    }
+  } catch (e) {
+    console.warn("[agent/start] market pre-route failed, using agent loop:", e.message);
   }
 
   if (!SANDBOX_URL.includes("127.0.0.1")) fetch(`${SANDBOX_URL}/health`).catch(() => {}); // wake sandbox while LLM plans
