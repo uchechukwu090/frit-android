@@ -19,7 +19,35 @@
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-const ENGINE_WEIGHT = { duckduckgo: 1.0, bing: 0.9, brave: 0.8 };
+const ENGINE_WEIGHT = { duckduckgo: 1.0, bing: 0.9, brave: 0.8, braveapi: 1.1 };
+
+// 1h digest cache — search results don't change minute to minute; this also
+// shields us when an engine bot-walls us mid-day.
+const _searchCache = new Map();
+const SEARCH_TTL_MS = 60 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _searchCache.entries()) if (now > v.exp) _searchCache.delete(k);
+}, 10 * 60 * 1000).unref?.();
+
+// Brave official API (free tier key, no funding needed). Skipped when unset.
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY || "";
+async function searchBraveApi(query) {
+  if (!BRAVE_API_KEY) throw new Error("BRAVE_API_KEY unset");
+  const res = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=10&freshness=py`, {
+    headers: { "X-Subscription-Token": BRAVE_API_KEY, Accept: "application/json" },
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (!res.ok) throw new Error(`Brave API HTTP ${res.status}`);
+  const data = await res.json();
+  return (data.web?.results || []).slice(0, 10).map(r => ({
+    title: r.title || "",
+    url: cleanUrl(r.url || ""),
+    snippet: (r.description || "").slice(0, 300),
+    engine: "braveapi",
+    published: r.page_age || r.age || "",
+  }));
+}
 
 // ---------------------------------------------------------------------------
 // HTML helpers
@@ -185,18 +213,46 @@ async function searchBrave(query) {
 }
 
 // ---------------------------------------------------------------------------
-// Aggregation
+// Page fetch + date extraction
 // ---------------------------------------------------------------------------
+// Snippets lie by omission — the agent was citing pages it never opened.
+// Fetch the top-3 result pages and extract readable text (fail-soft: snippet
+// survives when fetch dies). Also pull publish dates so 2024 news stops
+// leaking into "current" answers.
+function extractDate(html) {
+  const m = html.match(/<meta[^>]+(?:article:published_time|publish_date|datePublished|og:updated_time|article:modified_time)[^>]+content="([^"]+)"/i)
+    || html.match(/<time[^>]+datetime="([^"]+)"/i)
+    || html.match(/"datePublished"\s*:\s*"([^"]+)"/i);
+  if (!m) return "";
+  const d = new Date(m[1]);
+  return isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+}
+
+async function fetchPageText(url) {
+  const html = await fetchHtml(url, 10_000);
+  const date = extractDate(html);
+  const text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<header[\s\S]*?<\/header>/gi, " ")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, " ");
+  const paras = [...text.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)]
+    .map(p => stripTags(p[1]))
+    .filter(p => p.length > 40);
+  const body = (paras.slice(0, 12).join("\n") || stripTags(text)).replace(/\s+/g, " ").trim();
+  return { text: body.slice(0, 1500), date };
+}
 function normalizeHost(url) {
   try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url; }
 }
 
-function dedupeAndRank(engines) {
+function dedupeAndRank(named) {
   const seen = new Set();
   const ranked = [];
-  for (const engine of engines) {
-    const weight = ENGINE_WEIGHT[engine] || 0.7;
-    for (const r of engine) {
+  for (const { name, rows } of named) {
+    const weight = ENGINE_WEIGHT[name] || 0.7;
+    for (const r of rows || []) {
       if (!r.url || !r.title) continue;
       const key = `${normalizeHost(r.url)}|${r.title.toLowerCase().replace(/\W+/g, " ").trim().slice(0, 60)}`;
       if (seen.has(key)) continue;
@@ -217,48 +273,70 @@ function dedupeAndRank(engines) {
 export async function deepSearch(query, mode = "text") {
   const q = String(query || "").trim();
   if (!q) return { ok: false, error: "query required" };
+  const cacheKey = `${mode}:${q.toLowerCase()}`;
+  const hit = _searchCache.get(cacheKey);
+  if (hit && Date.now() < hit.exp) return { ...hit.val, cached: true };
 
   const attempts = [
     { name: "duckduckgo", fn: () => searchDuckDuckGo(q) },
     { name: "bing", fn: () => searchBing(q) },
     { name: "brave", fn: () => searchBrave(q) },
+    { name: "braveapi", fn: () => searchBraveApi(q) },
   ];
 
-  const engineResults = [];
+  const named = [];
   const failures = [];
   // Fire all engines in parallel but isolate failures so one blocked/bot-walled
   // engine never kills the whole search.
   await Promise.all(
     attempts.map(async ({ name, fn }) => {
       try {
-        engineResults.push(await fn());
+        named.push({ name, rows: await fn() });
       } catch (err) {
         failures.push(`${name} (${err.message})`);
       }
     })
   );
 
-  const results = dedupeAndRank(engineResults);
+  const results = dedupeAndRank(named);
 
   if (!results.length && failures.length) {
     return { ok: false, query: q, error: `All search engines failed: ${failures.join(" | ")}` };
   }
 
+  // Open the top-3 pages and attach real content + publish dates (fail-soft).
+  await Promise.all(results.slice(0, 3).map(async (r) => {
+    try {
+      const page = await fetchPageText(r.url);
+      if (page.text) r.page_text = page.text;
+      if (page.date) r.published = page.date;
+    } catch { /* snippet survives */ }
+  }));
+
   if (mode === "structured") {
-    return {
+    const out = {
       ok: true,
       query: q,
       total: results.length,
       engines: { queried: attempts.map(a => a.name), failed: failures },
       results,
     };
+    _searchCache.set(cacheKey, { exp: Date.now() + SEARCH_TTL_MS, val: out });
+    return out;
   }
 
-  // Compact text digest — readable by the LLM brain in one shot.
-  const digest = results.map((r, i) => `${i + 1}. ${r.title} — ${r.url}\n   ${(r.snippet || "(no snippet)").slice(0, 220)}`).join("\n");
+  // Compact text digest — readable by the LLM brain in one shot. Opened pages
+  // carry real quotes + dates; warn the brain off undated items for news queries.
+  const digest = results.map((r, i) => {
+    const date = r.published ? ` [${r.published}]` : "";
+    const extra = r.page_text ? `\n   > ${r.page_text.slice(0, 400)}` : "";
+    return `${i + 1}. ${r.title}${date} — ${r.url}\n   ${(r.snippet || "(no snippet)").slice(0, 220)}${extra}`;
+  }).join("\n");
   const intro = results.length
     ? `Top ${results.length} results for "${q}":`
     : `No results found for "${q}".`;
   const failNote = failures.length ? `\n[engines unavailable: ${failures.join(", ")}]` : "";
-  return { ok: true, query: q, total: results.length, data: `${intro}\n${digest}${failNote}` };
+  const out = { ok: true, query: q, total: results.length, data: `${intro}\n${digest}${failNote}` };
+  _searchCache.set(cacheKey, { exp: Date.now() + SEARCH_TTL_MS, val: out });
+  return out;
 }

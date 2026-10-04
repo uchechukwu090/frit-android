@@ -9,10 +9,21 @@
 //                      existing EMA alignment defines the active trend regime.
 // - Dual Scenarios   :
 //     1. Immediate Entry  : Triggered when 30M aligns with 4H.
-//     2. Pullback Re-entry: Calculated target zone (50-61.8% Fib / EMA 21)
-//        and anticipated crossover level before it happens.
+//     2. Pullback Re-entry: STRUCTURE-ANCHORED Fib zone (50-61.8% retracement
+//        of the last 30M impulse leg, 30M EMA 21 only as a confluence filter).
+//        Spot-EMA levels and one-step crossover math are NEVER published as
+//        entries — the former migrates before price arrives, the latter solves
+//        a one-bar crash print, not a pullback level (see fibPullbackZone).
 // - Pullback Health  : Detects exhaustion vs real reversal using 30M volume,
 //                      RSI, and swing structure without any extra API calls.
+// - Cost gating      : Every published setup is repriced through the retail
+//                      cost model (spread + commission + slippage, costs.js).
+//                      netRR < 1.0 suppresses the setup — a trade that loses
+//                      money even when directionally right is not a setup.
+// - Range module     : When 4H is NEUTRAL the trend engine stands down and a
+//                      mean-reversion range engine takes the floor: proven edges
+//                      (2+ touches each), EMA compression, RSI-confirmed fades,
+//                      breakout invalidation. Full rules in detectRange().
 // - Hybrid TP/SL     :
 //     - TP1: Nearest 30M swing liquidity pool capped at 1.5x ATR (high win-rate).
 //     - TP2: 2.5x ATR runner.
@@ -20,6 +31,8 @@
 // - Zero Extra API Calls: Pullback health, structure breaks, and levels are
 //   computed directly on the 30M array to preserve Twelve Data free tier limits.
 // ============================================================================
+
+import { applyCosts, NET_RR_BLOCK, NET_RR_WEAK } from "./costs.js";
 
 const CACHE_TTL_MS = { "4h": 40 * 60 * 1000, "30m": 10 * 60 * 1000 };
 const MAX_REQUESTS_PER_MINUTE = 6;
@@ -224,6 +237,7 @@ function detectSwings(candles, lookback = 3) {
 }
 
 // Calculate the anticipated price at which EMA 9 will cross EMA 21
+// DIAGNOSTIC ONLY — do NOT use as an entry (see fibPullbackZone below).
 function calculateAnticipatedCrossoverPrice(ema9, ema21) {
   const alpha9 = 2 / (FAST_PERIOD + 1);   // 0.20
   const alpha21 = 2 / (SLOW_PERIOD + 1); // 0.090909
@@ -231,6 +245,184 @@ function calculateAnticipatedCrossoverPrice(ema9, ema21) {
   const denominator = alpha9 - alpha21;
   if (denominator === 0) return null;
   return numerator / denominator;
+}
+
+// ---------------------------------------------------------------------------
+// Structure-anchored pullback zone (the fix for EMA-spot entries).
+//
+// Why the old "EMA21 spot + one-step crossover price" fails in live markets:
+//  1. EMA21 is a MOVING target. A resting limit at "where EMA21 is now"
+//     fills late or on the wrong side, because EMA21 itself migrates toward
+//     price during the pullback. Spot prints of dynamic averages are stale
+//     the moment after they are read.
+//  2. The one-step crossover price answers "what single close would force
+//     EMA9 == EMA21 on the NEXT bar?" In a healthy trend that print sits
+//     absurdly far from market (e.g. EMA9=1.1000, EMA21=1.0980 → P*≈1.0833,
+//     ~8x ATR away). That is a crash print, not a pullback level — price only
+//     ever gets there on a full reversal, at which point a long limit is the
+//     worst possible fill.
+// What the market DOES respect: prior impulse structure. Pullbacks terminate
+// at Fib retracements of the leg that created the trend (50-61.8% is where
+// profit-taking exhausts and trend followers re-enter), confirmed by the
+// slower average passing through the same band. So:
+//  - ANCHOR = 50-61.8% Fib band of the last 30M impulse leg (prevLow→lastHigh
+//    for longs, prevHigh→lastLow for shorts). Entry at the deeper (61.8%) edge.
+//  - FILTER = 30M EMA21 must lie inside/near the band (±0.15 ATR) for full
+//    confidence; a Fib zone without EMA confluence still trades, flagged.
+//  - INVALIDATION = 78.6% retracement (close beyond = leg failed, stand down).
+//    SL sits beyond invalidation + buffer, capped at MAX_SL_ATR_MULT.
+//  - TP1 = impulse extreme (pays only if RR >= MIN_RR, else 1.5R projection),
+//    TP2 = 2.5R runner (unchanged runner logic).
+// Returns null when nothing tradeable exists (leg too small = Fib ratios are
+// noise; zone >2 ATR away = chasing; RR < MIN_RR = bad business). Null means
+// "publish NO pullback level this run" — strictly better than a fake level.
+// All distances are ATR-relative, so this holds across XAUUSD, FX and crypto.
+// ---------------------------------------------------------------------------
+function fibPullbackZone({ swings, macroSide, emaSlow, atr, price }) {
+  const isLong = macroSide === "BUY";
+  const legStart = isLong ? swings.prevLow : swings.prevHigh;
+  const legEnd = isLong ? swings.lastHigh : swings.lastLow;
+  const legRange = (legStart != null && legEnd != null) ? Math.abs(legEnd - legStart) : 0;
+
+  // --- Path 1 (preferred): real impulse structure ---------------------------
+  // Leg must span >= 1 ATR or the Fib ratios slice noise, not structure.
+  const legOk = legStart != null && legEnd != null &&
+    (isLong ? legEnd > legStart : legStart > legEnd) && legRange >= atr;
+  if (legOk) {
+    const lvl = (pct) => isLong ? legEnd - pct * legRange : legEnd + pct * legRange;
+    const fib50 = lvl(0.50);
+    const fib618 = lvl(0.618);
+    const fib786 = lvl(0.786);
+    const entry = fib618; // deeper edge = better R:R; confirmation trigger forbids front-running it
+    const invalidation = fib786;
+
+    const lo = Math.min(fib50, fib618);
+    const hi = Math.max(fib50, fib618);
+    const tol = 0.15 * atr;
+    const confluence = emaSlow != null && emaSlow >= lo - tol && emaSlow <= hi + tol;
+
+    let slDist = Math.abs(entry - invalidation) + 0.15 * atr;
+    slDist = Math.min(slDist, MAX_SL_ATR_MULT * atr); // cap (existing regime)
+    slDist = Math.max(slDist, 0.75 * atr);             // floor (survive noise)
+    const sl = isLong ? entry - slDist : entry + slDist;
+
+    // TP1 pays at the impulse extreme; if the extreme is too close to pay
+    // MIN_RR, there is no business case — fall back to a 1.5R projection so
+    // reported RR never advertises a sub-standard trade.
+    const extremePays = Math.abs(legEnd - entry) >= MIN_RR * slDist;
+    const tp1 = extremePays
+      ? legEnd
+      : (isLong ? entry + 1.5 * slDist : entry - 1.5 * slDist);
+    const tp2 = isLong ? entry + 2.5 * slDist : entry - 2.5 * slDist;
+    const rr = slDist > 0 ? Math.abs(tp1 - entry) / slDist : 0;
+
+    if (Math.abs(entry - price) > 2 * atr) return null; // too far — chasing, not a setup
+    // Epsilon: a computed rr of exactly MIN_RR (e.g. the 1.5R projection)
+    // can land at 1.4999999999999998 in floating point — that is NOT a fail.
+    if (rr < MIN_RR - 1e-9) return null;                 // bad business — no level
+
+    return {
+      entry, zoneLow: lo, zoneHigh: hi, fib50, fib618, fib786, invalidation,
+      sl, tp1, tp2, rr, confluence, weak: false, legStart, legEnd,
+    };
+  }
+
+  // --- Path 2 (weak fallback): trend too young for a swing leg ---------------
+  // EMA21 band, explicitly flagged weak so the brain treats it as a WATCH
+  // level, never a resting-limit grade zone.
+  if (emaSlow == null) return null;
+  const slDist = ATR_SL_MULT * atr;
+  const entry = emaSlow;
+  if (Math.abs(entry - price) > 2 * atr) return null;
+  const sl = isLong ? entry - slDist : entry + slDist;
+  return {
+    entry,
+    zoneLow: entry - 0.25 * atr, zoneHigh: entry + 0.25 * atr,
+    fib50: null, fib618: null, fib786: null, invalidation: sl,
+    sl,
+    tp1: isLong ? entry + 1.5 * slDist : entry - 1.5 * slDist,
+    tp2: isLong ? entry + 2.5 * slDist : entry - 2.5 * slDist,
+    rr: 1.5, confluence: false, weak: true, legStart: null, legEnd: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// RANGE ENGINE — for choppy markets where the trend engine must stand down.
+//
+// When 4H is NEUTRAL the worst thing a trend system can do is keep trading.
+// This module fades PROVEN range edges instead. Rules, in order (all must
+// pass — a range fade with one missing ingredient is just a guess):
+//  1. PROVEN EDGES: >=2 swing highs within 0.25 ATR of the ceiling AND >=2
+//     swing lows within 0.25 ATR of the floor. One touch is noise.
+//  2. TRADEABLE WIDTH: 1.5–6 ATR. Tighter and costs eat the move (a 1R gross
+//     win is ~0.5R net on XAUUSD); wider and it is a trend leg, not a range.
+//  3. EMA COMPRESSION (relative): |EMA9 − EMA21| under 25% of range width and
+//     under 0.5 ATR. Judged against the range because the drift to the edge
+//     always opens the averages somewhat; a real trend leg blows past both.
+//  4. PRICE AT AN EDGE: within 0.3 ATR of floor (fade up) or ceiling (fade
+//     down). Mid-range is a no-trade — never chase the middle.
+//  5. RSI CONFIRMATION: fade up needs RSI <= 55 (no buying into a rocket),
+//     fade down needs RSI >= 45. Mild by design — extremes rarely print, and
+//     waiting for RSI<30 at range lows misses most valid fades.
+// Usage: limit order AT the edge (not market mid-range), SL beyond the edge +
+// 0.35 ATR buffer, TP1 = midline, TP2 = opposite edge. INVALIDATION = 30M
+// close beyond the edge + buffer: the range is broken, stand down — never
+// flip to breakout-chasing inside this module.
+// Returns { range:true, tradable, ... } — tradable:false with a `why` string
+// still documents the range so the brain can watch it without trading it.
+// ---------------------------------------------------------------------------
+function detectRange({ swings, atr, emaFast, emaSlow, rsiNow, price }) {
+  const highs = ((swings.highs || []).map(h => h.price)).slice(0, 4);
+  const lows = ((swings.lows || []).map(l => l.price)).slice(0, 4);
+  if (highs.length < 2 || lows.length < 2) return null; // not enough structure to judge
+  const upper = Math.max(...highs);
+  const lower = Math.min(...lows);
+  if (!(upper > lower)) return null;
+  const width = upper - lower;
+  const base = { range: true, upper, lower, width, widthAtr: width / atr };
+  if (width < 1.5 * atr) return { ...base, tradable: false, why: `range too tight (${(width / atr).toFixed(1)} ATR) — costs would eat the move` };
+  if (width > 6 * atr) return { ...base, tradable: false, why: `range too wide (${(width / atr).toFixed(1)} ATR) — this is a trend leg, not a range` };
+  const tol = 0.25 * atr;
+  const touchesUp = highs.filter(h => Math.abs(h - upper) <= tol).length;
+  const touchesLo = lows.filter(l => Math.abs(l - lower) <= tol).length;
+  if (touchesUp < 2 || touchesLo < 2) {
+    return { ...base, tradable: false, touchesUp, touchesLo, why: `edges unproven (${touchesUp} ceiling / ${touchesLo} floor touches — need 2+ each)` };
+  }
+  // EMA compression (relative, not absolute): the drift to the edge always
+  // separates the averages somewhat, so the knot is judged against the range
+  // itself — gap must be under 25% of width AND under 0.5 ATR. A genuine trend
+  // leg opens the gap far beyond both within a few bars.
+  const maxGap = Math.min(0.5 * atr, 0.25 * width);
+  if (Math.abs(emaFast - emaSlow) > maxGap) {
+    return { ...base, tradable: false, touchesUp, touchesLo, why: "EMAs apart — trending, not ranging" };
+  }
+  const edgeTol = 0.3 * atr;
+  const atLower = Math.abs(price - lower) <= edgeTol;
+  const atUpper = Math.abs(price - upper) <= edgeTol;
+  if (!atLower && !atUpper) {
+    return { ...base, tradable: false, touchesUp, touchesLo, why: "price mid-range — never chase the middle, wait for an edge" };
+  }
+  const side = atLower ? "BUY" : "SELL";
+  if (side === "BUY" && rsiNow > 55) {
+    return { ...base, tradable: false, touchesUp, touchesLo, why: `RSI ${rsiNow.toFixed(0)} too hot to fade up from the floor` };
+  }
+  if (side === "SELL" && rsiNow < 45) {
+    return { ...base, tradable: false, touchesUp, touchesLo, why: `RSI ${rsiNow.toFixed(0)} too cold to fade down from the ceiling` };
+  }
+  const edge = side === "BUY" ? lower : upper;
+  const sl = side === "BUY" ? edge - 0.35 * atr : edge + 0.35 * atr;
+  const slDist = Math.abs(edge - sl); // = 0.35 ATR by construction
+  const mid = (upper + lower) / 2;
+  const opposite = side === "BUY" ? upper : lower;
+  const tp1 = mid;
+  const tp2 = opposite;
+  const rr = slDist > 0 ? Math.abs(tp1 - edge) / slDist : 0;
+  if (rr < MIN_RR - 1e-9) return { ...base, tradable: false, touchesUp, touchesLo, why: "geometry pays below minimum RR" };
+  return {
+    ...base, tradable: true, side, touchesUp, touchesLo,
+    edge, entry: edge, sl, tp1, tp2, rr, mid,
+    invalidation: sl, // 30M close beyond edge+buffer = range broken
+  };
 }
 
 function sessionStatus(symbol) {
@@ -253,6 +445,9 @@ export class MTFStrategyEngine {
     this.checkNewsFilter = deps.checkNewsFilter;
     this.calculateLotSize = deps.calculateLotSize;
     this.addTradeMemory = deps.addTradeMemory;
+    // Optional: pullback journal recorder (journal.js via index.js). Every
+    // published actionable setup is recorded for accuracy scoring.
+    this.recordSetup = deps.recordSetup || null;
     this._cache = new Map();
     this._requestTimes = [];
     this.stats = { api_calls: 0, cache_hits: 0, rate_limited: 0, last_run: null };
@@ -449,6 +644,8 @@ export class MTFStrategyEngine {
 
     let scenario1 = null;
     let scenario2 = null;
+    let scenarioRange = null;
+    let rangeInfo = null;
 
     if (isRealReversal && reversalSide) {
       // RULE: When the pullback checker observes that a real reversal move is playing out,
@@ -497,43 +694,135 @@ export class MTFStrategyEngine {
         };
       }
 
-      // Scenario 2: Pullback & Anticipated Crossover Entry (only if pullback is healthy)
+      // Scenario 2: structure-anchored Fib pullback zone (only if healthy).
+      // fibPullbackZone returns null when no tradeable structure exists — in
+      // that case NO level is published (a missing level beats a fake one).
       if (activeSide !== "NEUTRAL" && isPullbackHealthy) {
         const isLong = activeSide === "BUY";
-        const pullTargetPrice = fmt(ema30mSlow);
+        const zone = fibPullbackZone({
+          swings, macroSide: activeSide, emaSlow: ema30mSlow, atr: atr30M, price,
+        });
+        // One-step crossover math kept as a diagnostic only — never an entry.
         const estCross = anticipatedCrossoverPrice ? fmt(anticipatedCrossoverPrice) : null;
-        const slDist = ATR_SL_MULT * atr30M;
-        const estSl = isLong ? (pullTargetPrice ? pullTargetPrice - slDist : price - slDist) : (pullTargetPrice ? pullTargetPrice + slDist : price + slDist);
-        const estTp1 = isLong ? (estSl ? pullTargetPrice + 2 * slDist : price + 2 * slDist) : (estSl ? pullTargetPrice - 2 * slDist : price - 2 * slDist);
 
-        scenario2 = {
-          name: "Pullback / Anticipated Re-entry",
-          action: activeSide,
-          // Headline entry for a pullback setup is the ZONE itself (anticipated
-          // crossover level, else the 30M EMA21 watch price) — NOT current
-          // price. result.entry picks this up via primaryScenario?.entry, so
-          // WAIT_PULLBACK now reports "wait at the zone" instead of market.
-          entry: estCross ?? pullTargetPrice,
-          watch_zone: `${fmt(ema30mSlow)} (30M EMA 21)`,
-          anticipated_crossover_level: estCross,
-          confirmation_trigger: isLong
-            ? `Wait for 30M candle rejection at ~${pullTargetPrice} and EMA 9 curving back above EMA 21`
-            : `Wait for 30M candle rejection at ~${pullTargetPrice} and EMA 9 curving back below EMA 21`,
-          estimated_sl: fmt(estSl),
-          estimated_tp1: fmt(estTp1),
-          pullback_health: {
-            status: pullbackStatus,
-            is_healthy: isPullbackHealthy,
-            volume_ok: isCounterTrendVolLow,
-            pullback_probability: pullbackProb,
-            reversal_probability: reversalProb,
-            adx_percentile_4h: Number(adxPercentile4h.toFixed(1)),
-            note: pullbackProb != null
-              ? `Pullback probability ${pullbackProb}% vs reversal ${reversalProb}%, based on 4H ADX/DI strength (percentile-ranked per symbol) and retracement depth.`
-              : "Not enough swing structure to score retracement depth yet.",
-          },
-        };
+        if (zone != null) {
+          const band = `${fmt(Math.min(zone.zoneLow, zone.zoneHigh))} – ${fmt(Math.max(zone.zoneLow, zone.zoneHigh))}`;
+          scenario2 = {
+            name: zone.weak ? "Pullback Watch (EMA21, no structure yet)" : "Pullback / Fib Re-entry",
+            action: activeSide,
+            // Headline entry is the ZONE edge — NOT current price. result.entry
+            // picks this up via primaryScenario?.entry, so WAIT_PULLBACK
+            // reports "wait at the zone" instead of market.
+            entry: fmt(zone.entry),
+            entry_band: band,
+            watch_zone: zone.weak
+              ? `${fmt(ema30mSlow)} (30M EMA 21 — no swing leg yet, WATCH ONLY, not a limit grade level)`
+              : `${band} (50-61.8% Fib of ${fmt(zone.legStart)}→${fmt(zone.legEnd)}${zone.confluence ? `, EMA21 confluence @${fmt(ema30mSlow)}` : ", no EMA confluence — Fib structure only"})`,
+            anticipated_crossover_level: estCross,
+            confirmation_trigger: isLong
+              ? `Wait for 30M rejection INSIDE ${band} and EMA 9 curving back above EMA 21 — do NOT front-run the band edge, do NOT market-buy into the fall`
+              : `Wait for 30M rejection INSIDE ${band} and EMA 9 curving back below EMA 21 — do NOT front-run the band edge, do NOT market-sell into the rally`,
+            invalidation: `Zone dead on 30M CLOSE beyond ${fmt(zone.invalidation)} — stand down and wait for new structure, never average down`,
+            estimated_sl: fmt(zone.sl),
+            estimated_tp1: fmt(zone.tp1),
+            estimated_tp2: fmt(zone.tp2),
+            rr: Number(zone.rr.toFixed(2)),
+            fib_confluence: zone.confluence,
+            zone_weak: zone.weak,
+            pullback_health: {
+              status: pullbackStatus,
+              is_healthy: isPullbackHealthy,
+              volume_ok: isCounterTrendVolLow,
+              pullback_probability: pullbackProb,
+              reversal_probability: reversalProb,
+              adx_percentile_4h: Number(adxPercentile4h.toFixed(1)),
+              note: pullbackProb != null
+                ? `Pullback probability ${pullbackProb}% vs reversal ${reversalProb}%, based on 4H ADX/DI strength (percentile-ranked per symbol) and retracement depth.` +
+                  (zone.weak ? " Zone is EMA-watch only (no swing leg to anchor Fib yet)." : ` Fib zone ${band}${zone.confluence ? " with EMA21 confluence." : " (Fib structure, no EMA confluence)."}`)
+                : "Not enough swing structure to score retracement depth yet.",
+            },
+          };
+        } else {
+          scenario2 = null; // untradeable zone (too far / no structure / RR < 1.5) — never chase
+        }
       }
+    }
+
+    // ---- Range module: only when the trend engine has nothing (macro NEUTRAL,
+    // no reversal in progress). Costs gate applies identically: a fade whose
+    // net RR is negative after spread/commission/slippage is not published.
+    if (macroTrend === "NEUTRAL" && !isRealReversal) {
+      rangeInfo = detectRange({
+        swings, atr: atr30M, emaFast: ema30mFast, emaSlow: ema30mSlow,
+        rsiNow, price,
+      });
+      if (rangeInfo && rangeInfo.tradable) {
+        const rc = applyCosts({ symbol: sym, entry: rangeInfo.entry, sl: rangeInfo.sl, tp: rangeInfo.tp1 });
+        if (!rc.blocked) {
+          const rBand = `${fmt(rangeInfo.edge)} edge (±${fmt(0.3 * atr30M)})`;
+          scenarioRange = {
+            name: "Range Fade (limit at proven edge)",
+            action: rangeInfo.side,
+            entry: fmt(rangeInfo.entry),
+            entry_band: rBand,
+            watch_zone: `${rBand} of ${fmt(rangeInfo.lower)} – ${fmt(rangeInfo.upper)} (${rangeInfo.touchesLo} floor / ${rangeInfo.touchesUp} ceiling touches, width ${(rangeInfo.width / atr30M).toFixed(1)} ATR)`,
+            confirmation_trigger: rangeInfo.side === "BUY"
+              ? `Limit buy AT the floor ${fmt(rangeInfo.edge)} on 30M rejection (wick + RSI holding) — never market-buy mid-range`
+              : `Limit sell AT the ceiling ${fmt(rangeInfo.edge)} on 30M rejection (wick + RSI holding) — never market-sell mid-range`,
+            invalidation: `Range dead on 30M CLOSE beyond ${fmt(rangeInfo.invalidation)} — stand down, do NOT flip to breakout-chasing`,
+            estimated_sl: fmt(rangeInfo.sl),
+            estimated_tp1: fmt(rangeInfo.tp1),
+            estimated_tp2: fmt(rangeInfo.tp2),
+            rr: Number(rangeInfo.rr.toFixed(2)),
+            costs: rc,
+            range_touches: `${rangeInfo.touchesLo}L/${rangeInfo.touchesUp}U`,
+            range_width_atr: Number(rangeInfo.widthAtr.toFixed(1)),
+          };
+          if (this.recordSetup) {
+            try {
+              this.recordSetup({
+                symbol: sym, strategy: "range_fade", direction: rangeInfo.side,
+                entry: rangeInfo.entry, zoneLow: Math.min(rangeInfo.edge - 0.3 * atr30M, rangeInfo.edge + 0.3 * atr30M),
+                zoneHigh: Math.max(rangeInfo.edge - 0.3 * atr30M, rangeInfo.edge + 0.3 * atr30M),
+                sl: rangeInfo.sl, tp1: rangeInfo.tp1, plannedRR: rangeInfo.rr,
+                confluence: true, pullbackProb: null,
+                note: `range ${fmt(rangeInfo.lower)}-${fmt(rangeInfo.upper)} ${rangeInfo.touchesLo}L/${rangeInfo.touchesUp}U touches`,
+              });
+            } catch { /* journal best-effort */ }
+          }
+        } else {
+          rangeInfo = { ...rangeInfo, tradable: false, why: `costs eat the fade (net RR ${rc.netRR} — spread/slip wider than the edge geometry pays)` };
+        }
+      }
+    }
+
+    // ---- Cost gate on the trend pullback zone too (same honesty rule). ----
+    if (scenario2 && !scenario2.zone_weak) {
+      const tc = applyCosts({ symbol: sym, entry: Number(scenario2.entry), sl: Number(scenario2.estimated_sl), tp: Number(scenario2.estimated_tp1) });
+      scenario2.costs = tc;
+      if (tc.blocked) {
+        scenario2 = null; // negative after costs even when right — not a setup
+      } else if (this.recordSetup) {
+        try {
+          this.recordSetup({
+            symbol: sym, strategy: "trend_pullback",
+            direction: scenario2.action, entry: Number(scenario2.entry),
+            zoneLow: scenario2.entry_band ? Number(String(scenario2.entry_band).split("–")[0]) : null,
+            zoneHigh: scenario2.entry_band ? Number(String(scenario2.entry_band).split("–")[1]) : null,
+            sl: Number(scenario2.estimated_sl), tp1: Number(scenario2.estimated_tp1),
+            plannedRR: scenario2.rr, confluence: !!scenario2.fib_confluence,
+            pullbackProb, note: `4H ${macroTrend}, pullback ${pullbackProb ?? "n/a"}%`,
+          });
+        } catch { /* journal best-effort */ }
+      }
+    } else if (scenario2 && this.recordSetup) {
+      scenario2.costs = applyCosts({ symbol: sym, entry: Number(scenario2.entry), sl: Number(scenario2.estimated_sl), tp: Number(scenario2.estimated_tp1) });
+    }
+
+    // ---- Cost gate on immediate (market) entries: BUY/SELL execute at
+    // market, so a blocked net RR downgrades the whole decision to WAIT. ----
+    if (scenario1) {
+      scenario1.costs = applyCosts({ symbol: sym, entry: Number(scenario1.entry), sl: Number(scenario1.sl), tp: Number(scenario1.tp1) });
     }
 
     // Determine primary decision output
@@ -558,9 +847,51 @@ export class MTFStrategyEngine {
     } else if (activeSide !== "NEUTRAL") {
       decision = "WAIT_PULLBACK";
       conf = 45 + Math.round(((pullbackProb ?? 50) - 50) / 5); // scale slightly with pullback confidence
+      // Zone quality moves the needle: Fib+EMA confluence earns confidence,
+      // a weak EMA-watch zone (or no zone at all) surrenders it.
+      if (scenario2) {
+        if (!scenario2.zone_weak && scenario2.fib_confluence) { conf += 8; reasons.push("Fib 50-61.8% zone backed by EMA21 confluence — high-quality wait"); }
+        else if (scenario2.zone_weak) { conf -= 8; reasons.push("No swing leg yet — EMA-watch only, NOT a limit grade level"); }
+      } else {
+        conf -= 5;
+        reasons.push("No tradeable pullback zone right now (too far / sub-standard RR) — patience, not a market entry");
+      }
       reasons.push(`4H is ${macroTrend}, but 30M is undergoing a healthy pullback (pullback probability ${pullbackProb ?? "n/a"}%). Refer to Scenario 2 for re-entry.`);
+    } else if (scenarioRange) {
+      // Macro NEUTRAL + proven range edges + price at an edge = fade the edge.
+      decision = "WAIT_RANGE";
+      conf = 55 + Math.min((rangeInfo.touchesUp + rangeInfo.touchesLo), 6);
+      if ((rangeInfo.side === "BUY" && rsiNow < 35) || (rangeInfo.side === "SELL" && rsiNow > 65)) {
+        conf += 5;
+        reasons.push("RSI deeply stretched at the edge — exhaustion favors the fade");
+      }
+      if (scenarioRange.costs && scenarioRange.costs.weak) {
+        conf -= 8;
+        reasons.push(`Costs consume ${scenarioRange.costs.costPctOfRisk}% of risk (net RR ${scenarioRange.costs.netRR}) — fade only with full confluence`);
+      }
+      if (!session.ok) { conf -= 5; reasons.push("Outside liquid session — range edges are less trustworthy now"); }
+      conf = Math.min(conf, 80);
+      reasons.push(`4H NEUTRAL — trend engine stands down. Range ${fmt(rangeInfo.lower)} – ${fmt(rangeInfo.upper)} (${rangeInfo.touchesLo} floor / ${rangeInfo.touchesUp} ceiling touches). Price at the ${rangeInfo.side === "BUY" ? "floor" : "ceiling"}: limit-fade toward midline, invalidation on close beyond the edge.`);
     } else {
-      reasons.push("4H trend is neutral / transitioning.");
+      if (rangeInfo && rangeInfo.range && rangeInfo.why) {
+        reasons.push(`Range watched but NOT traded: ${rangeInfo.why}.`);
+      } else {
+        reasons.push("4H trend is neutral / transitioning.");
+      }
+    }
+
+    // Costs kill market entries: an aligned/reversal BUY/SELL with netRR < 1
+    // after spread/commission/slippage becomes WAIT — executing it would lock
+    // in negative expectancy. Weak (not blocked) costs just cost confidence.
+    if ((decision === "BUY" || decision === "SELL") && scenario1 && scenario1.costs) {
+      if (scenario1.costs.blocked) {
+        reasons.push(`Market entry blocked: costs consume ${scenario1.costs.costPctOfRisk ?? "?"}% of risk (net RR ${scenario1.costs.netRR}) — a win would still lose money. Standing down.`);
+        decision = "WAIT";
+        conf = 40;
+      } else if (scenario1.costs.weak) {
+        conf -= 8;
+        reasons.push(`High friction: costs consume ${scenario1.costs.costPctOfRisk}% of risk (net RR ${scenario1.costs.netRR}) — size down or skip`);
+      }
     }
 
     // News advisory adjustments
@@ -569,7 +900,7 @@ export class MTFStrategyEngine {
       if (news.recommendation) reasons.push(`Advisory: ${news.recommendation}`);
     }
 
-    const primaryScenario = scenario1 || scenario2;
+    const primaryScenario = scenario1 || scenario2 || scenarioRange;
     const result = {
       symbol: sym,
       price: fmt(price),
@@ -579,22 +910,25 @@ export class MTFStrategyEngine {
       confidence: Math.max(20, Math.min(95, conf)),
       reasons,
       entry: primaryScenario?.entry ?? (scenario2 ? fmt(price) : null),
-      sl: primaryScenario?.sl ?? scenario2?.estimated_sl ?? null,
-      tp: primaryScenario?.tp1 ?? scenario2?.estimated_tp1 ?? null,
-      tp2: primaryScenario?.tp2 ?? null,
+      sl: primaryScenario?.sl ?? scenario2?.estimated_sl ?? scenarioRange?.estimated_sl ?? null,
+      tp: primaryScenario?.tp1 ?? scenario2?.estimated_tp1 ?? scenarioRange?.estimated_tp1 ?? null,
+      tp2: primaryScenario?.tp2 ?? scenarioRange?.estimated_tp2 ?? null,
       rr: primaryScenario?.rr ?? 1.8,
+      costs: primaryScenario?.costs ?? null, // net-RR after spread/commission/slippage (costs.js)
       // Explicit entry context for downstream consumers (/trade reason line,
-      // position monitor). WAIT_PULLBACK -> the pullback zone as a limit-style
-      // entry; BUY/SELL -> market at current price; else null.
+      // position monitor). WAIT_* -> limit-style zone; BUY/SELL -> market.
       entry_ctx: {
         zone: decision === "WAIT_PULLBACK"
-          ? (scenario2?.anticipated_crossover_level || scenario2?.watch_zone || fmt(price))
-          : ((decision === "BUY" || decision === "SELL") ? fmt(price) : null),
-        type: decision === "WAIT_PULLBACK" ? "pullback_limit" : "market",
+          ? (scenario2?.entry_band || scenario2?.watch_zone || null)
+          : decision === "WAIT_RANGE"
+            ? (scenarioRange?.entry_band || scenarioRange?.watch_zone || null)
+            : ((decision === "BUY" || decision === "SELL") ? fmt(price) : null),
+        type: decision === "WAIT_PULLBACK" ? "pullback_limit" : decision === "WAIT_RANGE" ? "range_limit" : "market",
       },
       scenarios: {
         scenario_1_immediate: scenario1,
         scenario_2_pullback_crossover: scenario2,
+        scenario_range_fade: scenarioRange,
       },
       regime: {
         timeframe_primary: "30m",
@@ -620,6 +954,15 @@ export class MTFStrategyEngine {
         pullback_healthy: isPullbackHealthy,
         pullback_probability: pullbackProb,
         reversal_probability: reversalProb,
+        range_30m: rangeInfo && rangeInfo.range ? {
+          upper: fmt(rangeInfo.upper),
+          lower: fmt(rangeInfo.lower),
+          width_atr: Number(rangeInfo.widthAtr.toFixed(1)),
+          touches_ceiling: rangeInfo.touchesUp ?? null,
+          touches_floor: rangeInfo.touchesLo ?? null,
+          tradable: !!scenarioRange,
+          why: rangeInfo.why || (scenarioRange ? "edges proven, price at edge, fading toward midline" : null),
+        } : null,
       },
       guards: {
         session,
@@ -633,7 +976,13 @@ export class MTFStrategyEngine {
     if (decision === "BUY" || decision === "SELL") {
       result.reason = `Aligned 4H + 30M ${macroTrend} setup. ${primaryScenario?.condition || ""}`;
     } else if (decision === "WAIT_PULLBACK") {
-      result.reason = `4H is ${macroTrend}; 30M pullback in progress. Watch anticipated level ~${scenario2?.anticipated_crossover_level || scenario2?.watch_zone}`;
+      result.reason = scenario2
+        ? `4H is ${macroTrend}; 30M pullback in progress. Wait for the Fib zone ${scenario2.entry_band || scenario2.watch_zone} — ${scenario2.zone_weak ? "EMA-watch only, no limit order" : "limit at the zone edge on rejection, never chase"}. Dead on close beyond ${scenario2.invalidation ? scenario2.invalidation.replace(/^Zone dead on 30M CLOSE beyond /, "") : "?"}`
+        : `4H is ${macroTrend}; 30M pullback in progress but no tradeable zone right now (too far to chase or RR < ${MIN_RR}) — stand by for new structure, do NOT market-enter.`;
+    } else if (decision === "WAIT_RANGE") {
+      result.reason = scenarioRange
+        ? `4H NEUTRAL — range ${scenarioRange.watch_zone}. ${scenarioRange.confirmation_trigger}. ${scenarioRange.invalidation}.`
+        : "4H NEUTRAL with range structure nearby — waiting for price to reach a proven edge.";
     } else {
       result.reason = reasons[reasons.length - 1] || "Waiting for clear alignment";
     }
@@ -660,6 +1009,7 @@ export class MTFStrategyEngine {
       tp: analysis.tp,
       tp2: analysis.tp2,
       rr: analysis.rr,
+      costs: analysis.costs ?? null,
       entry_ctx: analysis.entry_ctx ?? null,
       scenarios: analysis.scenarios,
       regime: analysis.regime,

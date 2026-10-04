@@ -6,12 +6,16 @@ import dotenv from "dotenv";
 import fetch from "node-fetch";
 import FormData from "form-data";
 import Database from "better-sqlite3";
+import crypto from "crypto";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { MTFStrategyEngine } from "./strategy/engine.js";
 import { TradeTaskScheduler } from "./strategy/scheduler.js";
 import { PositionMonitor } from "./strategy/position_monitor.js";
+import { PullbackJournal } from "./strategy/journal.js";
+import { PortfolioRisk } from "./strategy/risk.js";
+import { getSymbolCost, costToUsd } from "./strategy/costs.js";
 import { deepSearch } from "./deep_search.js";
 
 dotenv.config();
@@ -21,7 +25,51 @@ const PORT = Number(process.env.PORT || 8787);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ========================= PERSISTENCE (SQLite) =====================
-const db = new Database(join(__dirname, "../frit.db"));
+// Render's local disk is EPHEMERAL (wipes on restart) unless a persistent disk
+// is mounted at /data. DB_PATH selects the safe location automatically:
+//   DB_PATH env > /data/frit.db (if /data exists) > ./frit.db (dev only).
+// Off-site safety: hourly + on-approve backups to Supabase Storage (free 1GB),
+// restored automatically on boot when the local file is missing. Worst case:
+// <1 hour of data at risk. Boot logs a loud warning when fully ephemeral.
+import { existsSync as _existsSync, mkdirSync as _mkdirSync } from "fs";
+import { writeFileSync as _writeFileSync, readFileSync as _readFileSync, statSync as _statSync } from "fs";
+const _dataDir = "/data";
+const DB_PATH = process.env.DB_PATH || (_existsSync(_dataDir) ? join(_dataDir, "frit.db") : join(__dirname, "../frit.db"));
+const EPHEMERAL_DB = DB_PATH === join(__dirname, "../frit.db") && process.env.NODE_ENV === "production";
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY || "";
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "frit-backups";
+const HAS_REMOTE_BACKUP = !!(SUPABASE_URL && SUPABASE_KEY);
+async function supaBucket() {
+  // Create bucket once (idempotent — 409 means it exists).
+  await fetch(`${SUPABASE_URL}/storage/v1/bucket`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ name: SUPABASE_BUCKET, public: false }),
+    signal: AbortSignal.timeout(20_000),
+  }).catch(() => {});
+}
+async function restoreFromBackup() {
+  if (!HAS_REMOTE_BACKUP || _existsSync(DB_PATH)) return false;
+  try {
+    await supaBucket();
+    const r = await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/frit-latest.db`, {
+      headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY },
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!r.ok) { console.warn(`[backup] no remote backup to restore (HTTP ${r.status})`); return false; }
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length < 100) return false;
+    _writeFileSync(DB_PATH, buf);
+    console.log(`[backup] restored frit.db from Supabase (${buf.length} bytes)`);
+    return true;
+  } catch (e) {
+    console.warn("[backup] restore failed:", e.message);
+    return false;
+  }
+}
+await restoreFromBackup();
+const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 // Initialize Tables
@@ -54,6 +102,85 @@ db.exec(`
     note TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS wallet_accounts (
+    user_id TEXT PRIMARY KEY,
+    balance_kobo INTEGER DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS wallet_txns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    amount_kobo INTEGER,
+    kind TEXT,
+    note TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS spent_txids (
+    txid TEXT PRIMARY KEY,
+    payment_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT,
+    payload TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS api_keys (
+    key_hash TEXT PRIMARY KEY,
+    user_id TEXT,
+    label TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS pending_payments (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    tier TEXT,
+    amount_kobo INTEGER,
+    reference TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS subscriptions (
+    user_id TEXT PRIMARY KEY,
+    tier TEXT DEFAULT 'free',
+    status TEXT DEFAULT 'active',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS activation_codes (
+    code TEXT PRIMARY KEY,
+    tier TEXT,
+    status TEXT DEFAULT 'unused',
+    user_id TEXT,
+    expires_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS usage_daily (
+    user_id TEXT,
+    day TEXT,
+    turns INTEGER DEFAULT 0,
+    clips INTEGER DEFAULT 0,
+    images INTEGER DEFAULT 0,
+    stt_mins INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+  );
+  CREATE TABLE IF NOT EXISTS creative_jobs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    kind TEXT,
+    status TEXT DEFAULT 'pending',
+    prompt TEXT,
+    result_url TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    tier TEXT,
+    rating INTEGER,
+    message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migrations — older frit.db files predate these columns and CREATE TABLE IF
@@ -69,18 +196,49 @@ const stepCols = db.prepare("PRAGMA table_info(agent_steps)").all().map(c => c.n
 if (!stepCols.includes("tool_call_id")) {
   db.exec("ALTER TABLE agent_steps ADD COLUMN tool_call_id TEXT");
 }
+// Subscriptions need expiry (older frit.db files lack it).
+const subCols = db.prepare("PRAGMA table_info(subscriptions)").all().map(c => c.name);
+if (!subCols.includes("expires_at")) {
+  db.exec("ALTER TABLE subscriptions ADD COLUMN expires_at DATETIME");
+}
+const sessCols = db.prepare("PRAGMA table_info(agent_sessions)").all().map(c => c.name);
+if (!sessCols.includes("user_id")) {
+  db.exec("ALTER TABLE agent_sessions ADD COLUMN user_id TEXT DEFAULT 'default'");
+}
+// Pending payments: purpose distinguishes sub vs wallet-topup orders.
+const ppCols = db.prepare("PRAGMA table_info(pending_payments)").all().map(c => c.name);
+if (!ppCols.includes("purpose")) {
+  db.exec("ALTER TABLE pending_payments ADD COLUMN purpose TEXT DEFAULT 'sub'");
+}
+// Money trail: hash-chained ledger rows (older DBs lack the columns).
+const txnCols = db.prepare("PRAGMA table_info(wallet_txns)").all().map(c => c.name);
+if (!txnCols.includes("prev_hash")) {
+  db.exec("ALTER TABLE wallet_txns ADD COLUMN prev_hash TEXT DEFAULT 'GENESIS'");
+}
+if (!txnCols.includes("tx_hash")) {
+  db.exec("ALTER TABLE wallet_txns ADD COLUMN tx_hash TEXT DEFAULT ''");
+}
 
 // ========================= ENVIRONMENT ==============================
+// OpenRouter is now the single LLM/STT/image gateway (Groq + DeepSeek removed).
+// Paid lowest-cost: primary=z-ai/glm-5.3-flash, fast=openai/gpt-oss-20b.
+// Free tier (:free, 1000/day after $10 credits) sits BEHIND paid in every chain.
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const HAS_OR = !!OPENROUTER_API_KEY;
+const OR_PRIMARY = process.env.OR_PRIMARY_MODEL || "z-ai/glm-5.3-flash";
+const OR_FAST = process.env.OR_FAST_MODEL || "openai/gpt-oss-20b";
+const OR_DRAFT = process.env.OR_DRAFT_MODEL || "qwen/qwen3-30b-a3b-2507";
+const OR_IMAGE_MODEL = process.env.OR_IMAGE_MODEL || "google/gemini-2.5-flash-image";
+const OR_STT_MODEL = process.env.OR_STT_MODEL || "openai/whisper-large-v3";
+const OR_VIDEO_MODEL = process.env.OR_VIDEO_MODEL || "google/veo-3.1-lite"; // cheapest OpenRouter video-gen default (720p 4-8s)
+// Free-tier models (zero token cost, count against 1000/day quota):
+const OR_FREE_FAST = process.env.OR_FREE_FAST || "openai/gpt-oss-20b:free";
+const OR_FREE_DRAFT = process.env.OR_FREE_DRAFT || "qwen/qwen3-30b-a3b-2507:free";
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const HAS_GROQ = !!GROQ_API_KEY;
 const ZEN_API_KEY = process.env.OPENCODE_ZEN_API_KEY || "";
 const HAS_ZEN = !!ZEN_API_KEY;
-
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
-const HAS_DEEPSEEK = !!DEEPSEEK_API_KEY;
-const ZEN_MODEL = process.env.OPENCODE_ZEN_MODEL || "deepseek-v4-flash-free";
+const ZEN_MODEL = process.env.OPENCODE_ZEN_MODEL || "glm-5.3-flash";
 const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
 const MISTRAL_FAST_MODEL = process.env.MISTRAL_FAST_MODEL || "mistral-small-latest";
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
@@ -89,23 +247,86 @@ const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.co
 // the server attaches it when forwarding run_code calls.
 const SANDBOX_AUTH = process.env.SANDBOX_AUTH || process.env.SANDBOX_AUTH_TOKEN || "";
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
+// Admin actions (approve/mint/refunds/ledger) use a DIFFERENT token so a
+// leaked app token can never mint tiers or credit wallets. Falls back to
+// AUTH_TOKEN only if unset (dev) — production must set ADMIN_TOKEN.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const HAS_ADMIN_SPLIT = !!ADMIN_TOKEN;
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || "";
+// Monetization (manual bank transfer — fill these, never commit real ones):
+const PAY_BANK_NAME = process.env.PAY_BANK_NAME || "";
+const PAY_ACCOUNT_NUMBER = process.env.PAY_ACCOUNT_NUMBER || "";
+const PAY_ACCOUNT_NAME = process.env.PAY_ACCOUNT_NAME || "";
 
 // ========================== VALIDATION =============================
 if (!AUTH_TOKEN) {
   console.error("[FATAL] AUTH_TOKEN missing — mandatory for agentic security!");
   process.exit(1);
 }
-if (!HAS_GROQ && !GEMINI_API_KEY && !MISTRAL_API_KEY) {
-  console.error("[FATAL] All provider keys missing — set at least one in .env");
+if (!HAS_OR && !GEMINI_API_KEY && !MISTRAL_API_KEY) {
+  console.error("[FATAL] All provider keys missing — set OPENROUTER_API_KEY in .env");
   process.exit(1);
+}
+if (!HAS_ADMIN_SPLIT) {
+  console.warn("[WARN] ADMIN_TOKEN unset — admin routes fall back to AUTH_TOKEN. Set ADMIN_TOKEN in production!");
+}
+if (EPHEMERAL_DB) {
+  console.warn("[WARN] frit.db is on EPHEMERAL disk — wallets/subs/ledgers WILL be wiped on restart. Mount a persistent disk at /data or set DB_PATH.");
+} else {
+  console.log(`[DB] using ${DB_PATH}`);
 }
 
 // ========================== MIDDLEWARE ==============================
+// Identity: per-user API keys (sha256 stored). requireAuth resolves the caller
+// to req.authUser. Master AUTH_TOKEN still works (dev/legacy) but then the
+// caller may assert any user_id. Admin routes need ADMIN_TOKEN separately.
+function hashKey(k) { return crypto.createHash("sha256").update(String(k)).digest("hex"); }
 function requireAuth(req, res, next) {
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (token !== AUTH_TOKEN) return res.status(401).json({ error: "Unauthorized" });
+  if (AUTH_TOKEN && token === AUTH_TOKEN) {
+    req.authUser = null; // master token: legacy path, user_id self-asserted
+    return next();
+  }
+  if (token) {
+    const row = db.prepare("SELECT user_id FROM api_keys WHERE key_hash = ?").get(hashKey(token));
+    if (row) {
+      req.authUser = row.user_id;
+      return next();
+    }
+  }
+  return res.status(401).json({ error: "Unauthorized" });
+}
+// Bound identity: user-key callers CANNOT spoof user_id; master-token callers
+// (dev) may. Every money/quota endpoint must use this, never raw body.
+function boundUser(req, fallback = "default") {
+  if (req.authUser) return req.authUser;
+  return String(req.body?.user_id || req.query?.user_id || fallback);
+}
+// Simple per-user rate limits (in-memory; single instance).
+const _rl = new Map();
+function rateLimit({ windowMs, max, costly = false }) {
+  return (req, res, next) => {
+    const id = req.authUser || req.ip || "anon";
+    const key = `${costly ? "c:" : ""}${id}`;
+    const now = Date.now();
+    let rec = _rl.get(key);
+    if (!rec || now > rec.reset) { rec = { n: 0, reset: now + windowMs }; _rl.set(key, rec); }
+    if (++rec.n > max) return res.status(429).json({ error: "Rate limited — slow down" });
+    next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _rl.entries()) if (now > v.reset) _rl.delete(k);
+}, 60_000).unref?.();
+const limitNormal = rateLimit({ windowMs: 60_000, max: 90 });
+const limitCostly = rateLimit({ windowMs: 60_000, max: 12, costly: true });
+function requireAdmin(req, res, next) {
+  const header = req.headers["authorization"] || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const want = HAS_ADMIN_SPLIT ? ADMIN_TOKEN : AUTH_TOKEN;
+  if (!want || token !== want) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
@@ -117,23 +338,20 @@ app.use(cors({ origin: "*" }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // ======================= MODELS =======================
-const GO_MODEL = process.env.OPENCODE_GO_MODEL || "deepseek-v4-flash"; // -> opencode-go/deepseek-v4-flash
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-flash"; // DeepSeek-V4.1-Flash, native tool calling (legacy deepseek-chat alias still routes here but is deprecated)
-// Cost stack (free-first, verified Sep 30 2026): Groq free tier needs no card
-// (~30 RPM / ~1K req/day / 100-500K tok/day — fine for personal use, tight for
-// heavy scheduling). Kimi K2 -0905 (versioned ID) leads agent/tools: best free
-// agentic tool-caller. Llama 3.3 70B next: most reliable free tools. Funded
-// DeepSeek stays in-chain AFTER the free links, so a topped-up key gets used
-// via fallthrough without blocking free traffic. Qwen 3.8 (reasoning-burn
-// cost) and GPT-OSS 120B (wrong tool calls) are out of every chain.
-const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_GROQ ? "groq:moonshotai/kimi-k2-instruct-0905" : (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))));
+// Cost stack (OpenRouter-only, verified Oct 2026):
+// primary brain = z-ai/glm-5.3-flash ($0.15/$0.50, 1M ctx, Terminal-Bench 84.3).
+// NOT z-ai/glm-5.3 ($1.40/$4.40, 9x cost). No DeepSeek, no Groq anywhere.
+// fast = openai/gpt-oss-20b ($0.02/$0.10) — the gpt-oss-20b-class slot.
+// draft = qwen 30B-class cheap. Free :free models sit AFTER paid in chains.
+const GO_MODEL = process.env.OPENCODE_GO_MODEL || "glm-5.3-flash";
+const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL)));
 const MODELS = {
-  vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : "mistral-large-latest"),
+  vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : (HAS_OR ? `openrouter:${OR_PRIMARY}` : "mistral-large-latest")),
   agent: AGENT_PRIMARY,
-  conversation: process.env.CONVERSATION_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  tools: process.env.TOOLS_MODEL || (HAS_GROQ ? "groq:moonshotai/kimi-k2-instruct-0905" : (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  coding: process.env.CODING_MODEL || (HAS_GROQ ? "groq:moonshotai/kimi-k2-instruct-0905" : (HAS_DEEPSEEK ? `deepseek:${DEEPSEEK_MODEL}` : "codestral-latest")),
-  fast: process.env.FAST_MODEL || (HAS_GROQ ? "groq:openai/gpt-oss-20b" : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_FAST_MODEL)),
+  conversation: process.env.CONVERSATION_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
+  tools: process.env.TOOLS_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL)),
+  coding: process.env.CODING_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "codestral-latest"),
+  fast: process.env.FAST_MODEL || (HAS_OR ? `openrouter:${OR_FAST}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_FAST_MODEL)),
   voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || "voxtral-mini-transcribe-realtime",
   local: process.env.LOCAL_MODEL || "gemma-3n-e2b", // on-device offline fallback (Android), not called here
 };
@@ -153,14 +371,16 @@ function pickModel({ hasImage = false, mode = "auto", taskType = "general" } = {
 }
 
 function buildFallbackChain(primary) {
+  // Paid OpenRouter first, then FREE :free quota (1000/day), then legacy keys.
+  // Free is preemptible/429-prone — never primary, always fallback.
   const chain = [primary];
-  if (HAS_GROQ) {
-    // Free links first (unknown IDs 404 and fall through harmlessly).
-    chain.push("groq:moonshotai/kimi-k2-instruct-0905");
-    chain.push("groq:llama-3.3-70b-versatile");
+  if (HAS_OR) {
+    if (primary !== `openrouter:${OR_PRIMARY}`) chain.push(`openrouter:${OR_PRIMARY}`);
+    if (primary !== `openrouter:${OR_FAST}`) chain.push(`openrouter:${OR_FAST}`);
+    chain.push(`openrouter:${OR_FREE_FAST}`);
+    chain.push(`openrouter:${OR_FREE_DRAFT}`);
   }
-  if (HAS_DEEPSEEK) chain.push(`deepseek:${DEEPSEEK_MODEL}`); // skipped fast on 402/401 when unfunded
-  if (HAS_ZEN) chain.push(`go:${GO_MODEL}`); // harmless to keep listed; simply 401s and falls through if Go is still expired
+  if (HAS_ZEN) chain.push(`go:${GO_MODEL}`);
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
   return [...new Set(chain)];
@@ -169,12 +389,7 @@ function buildFallbackChain(primary) {
 function buildVisionFallbackChain(primary) {
   const chain = [primary];
   if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
-  if (HAS_GROQ) {
-    // Llama 4 Scout: multimodal, fast and free on Groq. (Kimi K2 on Groq is
-    // text-only, so it can't cover vision.)
-    chain.push("groq:meta-llama/llama-4-scout-17b-16e-instruct");
-  }
-  
+  if (HAS_OR) chain.push(`openrouter:${OR_PRIMARY}`); // GLM-5.3-Flash is natively multimodal
   if (MISTRAL_API_KEY) chain.push("mistral-large-latest");
   return [...new Set(chain)];
 }
@@ -355,7 +570,7 @@ async function geminiChat({ model, messages, tools = null, temperature = 0.7, ma
     }];
   }
 
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(90_000) });
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || JSON.stringify(data));
 
@@ -384,18 +599,14 @@ async function geminiChat({ model, messages, tools = null, temperature = 0.7, ma
 }
 
 // Resolve which provider a model string belongs to.
-// "groq:..."  -> Groq (OpenAI-compatible /chat/completions, supports tool calls)
-// "zen:..."   -> OpenCode Zen pay-as-you-go (billed against your Zen wallet balance)
-// "go:..."    -> OpenCode Go subscription (billed against your $10/mo Go allowance,
-//                 a SEPARATE endpoint + model-id format from plain Zen — using the
-//                 wrong one silently drains your $0 Zen wallet instead of Go credits)
+// "openrouter:..." -> OpenRouter (single gateway for LLM/STT/image)
+// "zen:..."/"go:..." -> OpenCode Zen/Go (legacy opt fallback)
 // "gemini-*"  -> Gemini native generateContent (vision; tools unsupported here)
 // otherwise    -> Mistral (OpenAI-compatible chat completions, supports tool calls)
 function resolveProvider(model) {
-  if (typeof model === "string" && model.startsWith("groq:")) return "groq";
+  if (typeof model === "string" && model.startsWith("openrouter:")) return "openrouter";
   if (typeof model === "string" && model.startsWith("go:")) return "go";
   if (typeof model === "string" && model.startsWith("zen:")) return "zen";
-  if (typeof model === "string" && model.startsWith("deepseek:")) return "deepseek";
   if (typeof model === "string" && model.startsWith("gemini")) return "gemini";
   return "mistral";
 }
@@ -404,15 +615,15 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
   const provider = resolveProvider(model);
   if (provider === "gemini") return geminiChat({ model, messages, tools, temperature, max_tokens });
 
-  const base = provider === "groq" ? "https://api.groq.com/openai/v1/chat/completions"
+  const base = provider === "openrouter" ? "https://openrouter.ai/api/v1/chat/completions"
     : provider === "go" ? "https://opencode.ai/zen/go/v1/chat/completions"
     : provider === "zen" ? "https://opencode.ai/zen/v1/chat/completions"
-    : provider === "deepseek" ? "https://api.deepseek.com/chat/completions"
     : `${MISTRAL_BASE}/chat/completions`;
-  const apiKey = provider === "groq" ? GROQ_API_KEY : (provider === "zen" || provider === "go") ? ZEN_API_KEY : provider === "deepseek" ? DEEPSEEK_API_KEY : MISTRAL_API_KEY;
+  const apiKey = provider === "openrouter" ? OPENROUTER_API_KEY : (provider === "zen" || provider === "go") ? ZEN_API_KEY : MISTRAL_API_KEY;
   
   const cleanModel = provider === "go" ? model.slice(3)
-    : (provider === "groq" || provider === "zen" || provider === "deepseek") ? model.slice(model.indexOf(":") + 1)
+    : provider === "openrouter" ? model.slice("openrouter:".length)
+    : provider === "zen" ? model.slice(model.indexOf(":") + 1)
     : model;
 
   const body = { model: cleanModel, messages, temperature, max_tokens };
@@ -432,18 +643,21 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
-         
+          ...(provider === "openrouter" ? { "HTTP-Referer": "https://frit.local", "X-Title": "FRIT" } : {}),
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(90_000), // hung providers must not pin workers forever
       });
       const data = await res.json();
       if (!res.ok) {
         lastError = new Error(data?.message || data?.error?.message || JSON.stringify(data));
         const retryable = res.status === 429 || (res.status === 400 && /tool_use_failed|Failed to call a function/i.test(lastError.message));
         if (retryable && attempt < retries) {
-          // Groq/Mistral 429 bodies say "Please try again in 11.495s" — honor
+          // OpenRouter/Mistral 429 bodies say "Please try again in 11.495s" — honor
           // that instead of a fixed backoff that may be shorter than needed.
+          // Free :free models 429 far more often (spare capacity) — falls through
+          // to next chain link via chatWithFallback.
           const hinted = lastError.message.match(/try again in ([\d.]+)s/i);
           const waitMs = hinted ? Math.ceil(parseFloat(hinted[1]) * 1000) + 500 : attempt * 2000;
           await new Promise(r => setTimeout(r, waitMs));
@@ -466,7 +680,7 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
 // same brain turn; only Android-UI actions are returned as pending_actions for
 // the phone edge. Every resume verifies the last action batch with a cheap
 // second model and updates the ledger (done / failed / re-plan).
-const MAX_SERVER_TOOL_LOOP = 8;
+const MAX_SERVER_TOOL_LOOP = 12;
 
 function getActiveSubtask(ledger) {
   if (!Array.isArray(ledger) || !ledger.length) return null;
@@ -552,7 +766,10 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
   }
 
   const steps = db.prepare("SELECT * FROM agent_steps WHERE session_id = ? ORDER BY step_n ASC").all(sessionId);
-  const messages = steps.map(s => ({
+  // Sliding window: long sessions would otherwise explode context + cost.
+  // Server keeps full history in SQLite; the brain sees the last 40 steps.
+  const windowed = steps.length > 40 ? steps.slice(-40) : steps;
+  const messages = windowed.map(s => ({
     role: s.role,
     content: s.content,
     ...(s.tool_calls ? { tool_calls: JSON.parse(s.tool_calls) } : {}),
@@ -610,6 +827,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
     tradeMemory: formatTradeMemoryForGoal(session.goal),
     verification,
     lastFailure: getLastFailureNote(ledger),
+    userProfile: mergedDeviceState?.user_profile || null,
   }) + `\n\nCURRENT OBJECTIVE: ${activeSubtask?.description || session.goal}`;
 
   const fullMessages = [{ role: "system", content: systemPrompt }, ...messages];
@@ -633,8 +851,8 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
 
   const hasImage = !!(deviceStateForPrompt.user_image && steps.length === 0);
   const modelToUse = pickModel({ hasImage, mode: opts.mode || "auto", taskType: "automation" });
-  // Route through the fallback chain for whichever role this resolved to, so a
-  // Groq rate limit (e.g. openai/gpt-oss-120b) doesn't kill the whole turn.
+  // Route through the fallback chain for whichever role this resolved to, so an
+  // OpenRouter rate limit / free-tier 429 doesn't kill the whole turn.
   const modelRole = modelToUse === MODELS.vision ? "vision"
     : modelToUse === MODELS.agent ? "agent"
     : modelToUse === MODELS.fast ? "fast"
@@ -797,6 +1015,8 @@ CONVERSATION means: greetings, small talk, thanks, "how are you", identity/opini
 
 TASK means: the user wants something DONE — real information retrieved (weather, market prices, analysis, web research, news), code written/run, a file or webpage created, an app opened or controlled on the phone, a message/call/alarm, a trade, or any multi-step work that needs tools.
 
+STYLE (both kinds): mirror the user's live tone, don't force a fixed personality. A fresh/neutral chat → warm neutral. Official signals (email, job application, bank/complaint, "Dear Sir", formal request) → act official: full sentences, structured, no slang. Casual signals (slang, pidgin, short chatty lines, jokes) → mirror casually and keep it short and human. The stored user profile tone is only the baseline default — the live chat mode always wins.
+
 VAGUE FOLLOW-UPS ("do that for me", "go ahead", "yes", "proceed", "same") ALWAYS reference the history above: if the previous assistant turn proposed, recommended, or described an action, the follow-up is a TASK to perform exactly that — resolve what "that" means from history and do it. Only call it CONVERSATION if there is genuinely nothing actionable anywhere in context. Never answer a follow-up with a generic "let me know what you'd like" when the history already says what they'd like.
 
 Reply with EXACTLY ONE line in this exact format:
@@ -922,9 +1142,12 @@ function formatEngineAnalysis(symbol, a) {
   return L.join("\n");
 }
 
-app.post("/agent/start", requireAuth, async (req, res) => {
+app.post("/agent/start", requireAuth, limitNormal, async (req, res) => {
   const { goal, device_state, memory, history } = req.body;
   if (!goal) return res.status(400).json({ error: "Goal required" });
+  const uid = boundUser(req);
+  const cap = checkCap(uid, "turn");
+  if (!cap.ok) return res.status(402).json({ error: cap.message });
 
   // Fast pre-route: pure conversation never touches the agentic loop.
   try {
@@ -981,11 +1204,12 @@ app.post("/agent/start", requireAuth, async (req, res) => {
     }
 
     const safeMemory = Array.isArray(memory) ? memory : [];
-    db.prepare("INSERT INTO agent_sessions (id, goal, task_ledger, last_device_state, memory) VALUES (?, ?, ?, ?, ?)").run(
-      sessionId, effectiveGoal, JSON.stringify(ledger), JSON.stringify(device_state || {}), JSON.stringify(safeMemory)
+    db.prepare("INSERT INTO agent_sessions (id, goal, task_ledger, last_device_state, memory, user_id) VALUES (?, ?, ?, ?, ?, ?)").run(
+      sessionId, effectiveGoal, JSON.stringify(ledger), JSON.stringify(device_state || {}), JSON.stringify(safeMemory), uid
     );
 
     const result = await runAgentStep(sessionId, null, device_state, { memory: safeMemory });
+    db.prepare("UPDATE usage_daily SET turns = turns + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
     res.json(result);
   } catch (err) {
     console.error("[agent/start]", err);
@@ -993,64 +1217,70 @@ app.post("/agent/start", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/agent/resume", requireAuth, async (req, res) => {
+app.post("/agent/resume", requireAuth, limitNormal, async (req, res) => {
   const { sessionId, tool_results, device_state } = req.body;
   if (!sessionId || !tool_results) return res.status(400).json({ error: "sessionId and tool_results required" });
 
   try {
+    const sess = db.prepare("SELECT user_id FROM agent_sessions WHERE id = ?").get(sessionId);
+    const uid = String(sess?.user_id || "default");
+    const cap = checkCap(uid, "turn");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
     const result = await runAgentStep(sessionId, tool_results, device_state);
+    db.prepare("UPDATE usage_daily SET turns = turns + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
     res.json(result);
   } catch (err) {
     res.status(err.code === "ALL_MODELS_UNAVAILABLE" ? 503 : 500).json({ error: err.message, code: err.code || "UNKNOWN" });
   }
 });
 
-app.get("/agent/status", requireAuth, (req, res) => {
+app.get("/agent/status", requireAuth, limitNormal, (req, res) => {
   const { sessionId } = req.query;
   const session = db.prepare("SELECT * FROM agent_sessions WHERE id = ?").get(sessionId);
   if (!session) return res.status(404).json({ error: "Not found" });
+  if (req.authUser && session.user_id && session.user_id !== req.authUser) {
+    return res.status(403).json({ error: "not your session" });
+  }
 
   const steps = db.prepare("SELECT * FROM agent_steps WHERE session_id = ? ORDER BY step_n ASC").all(sessionId);
   res.json({ session, steps });
 });
 
 
-// Transcription helper (Mistral/Voxtral primary block removed — Groq Whisper
-// is the live path). Decodes the base64 body once for the fallbacks below.
+// Transcription via OpenRouter STT (whisper-large-v3 for accuracy).
+// POST https://openrouter.ai/api/v1/audio/transcriptions with JSON input_audio.
 async function mistralTranscribe(audio_base64, mime_type = "audio/webm") {
-  const audioBuffer = Buffer.from(String(audio_base64 || ""), "base64");
-  const cleanMime = String(mime_type || "audio/webm").split(";")[0].trim() || "audio/webm";
+  const b64 = String(audio_base64 || "");
+  if (!b64 || !OPENROUTER_API_KEY) return "";
+  const fmt = String(mime_type || "audio/webm").split(";")[0].trim().split("/")[1] || "wav";
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://frit.local",
+        "X-Title": "FRIT",
+      },
+      body: JSON.stringify({
+        model: OR_STT_MODEL, // openai/whisper-large-v3 (accuracy pick over turbo)
+        input_audio: { data: b64, format: fmt },
+        language: "en",
+      }),
+    });
+    if (res.ok) {
+      const d = await res.json();
+      if (d.text) return d.text;
+    }
+    console.warn(`[Transcribe] OpenRouter STT failed: ${res.status}`);
+  } catch (e) { console.warn("[Transcribe] OpenRouter STT error:", e.message); }
 
-  // Fallback: Groq Whisper
-  if (process.env.GROQ_API_KEY) {
-    try {
-      const form = new FormData();
-      const ext = cleanMime.split("/")[1] || "wav";
-      form.append("file", audioBuffer, { filename: `audio.${ext}`, contentType: cleanMime });
-      form.append("model", "whisper-large-v3"); // flagship accuracy — best for accents/noise (Groq's own guidance for error-sensitive use)
-      form.append("language", "en"); // user's English incl. Nigerian accent: improves accuracy + latency
-      form.append("prompt", "Hey Frit, FRIT, OPay, MT5, MetaTrader, XAUUSD, mummy, Airtel."); // guides proper-noun spelling ("frit", not "fritz")
-      form.append("temperature", "0.0");
-      form.append("response_format", "json");
-      const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, ...form.getHeaders() },
-        body: form,
-      });
-      if (res.ok) {
-        const d = await res.json();
-        if (d.text) return d.text;
-      }
-      console.warn(`[MistralTranscribe] Groq failed: ${res.status}`);
-    } catch (e) { console.warn("[MistralTranscribe] Groq error:", e.message); }
-  }
-
-  // Fallback: OpenAI Whisper
+  // Fallback: OpenAI Whisper (only if key present)
   if (process.env.OPENAI_API_KEY) {
     try {
+      const audioBuffer = Buffer.from(b64, "base64");
       const form = new FormData();
-      const ext = cleanMime.split("/")[1] || "wav";
-      form.append("file", audioBuffer, { filename: `audio.${ext}`, contentType: cleanMime });
+      form.append("file", audioBuffer, { filename: `audio.${fmt}`, contentType: mime_type });
       form.append("model", "whisper-1");
       form.append("response_format", "json");
       const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
@@ -1062,11 +1292,295 @@ async function mistralTranscribe(audio_base64, mime_type = "audio/webm") {
         const d = await res.json();
         if (d.text) return d.text;
       }
-      console.warn(`[MistralTranscribe] OpenAI failed: ${res.status}`);
-    } catch (e) { console.warn("[MistralTranscribe] OpenAI error:", e.message); }
+      console.warn(`[Transcribe] OpenAI failed: ${res.status}`);
+    } catch (e) { console.warn("[Transcribe] OpenAI error:", e.message); }
   }
 
   return "";
+}
+
+// Image generation via OpenRouter Images API.
+async function generateImage(prompt, opts = {}) {
+  if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY missing");
+  const res = await fetch("https://openrouter.ai/api/v1/images", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://frit.local",
+      "X-Title": "FRIT",
+    },
+    body: JSON.stringify({
+      model: OR_IMAGE_MODEL, // google/gemini-2.5-flash-image
+      prompt: String(prompt || ""),
+      ...(opts.aspect_ratio ? { aspect_ratio: opts.aspect_ratio } : {}),
+      ...(opts.n ? { n: opts.n } : {}),
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || `Image gen HTTP ${res.status}`);
+  return data;
+}
+
+// BEFORE-MATH OF PRODUCTION: physical grounding pass for image/video prompts.
+// Generators don't know a man is ~1.7m and a car ~4.5m — so a cheap fast-model
+// pass first computes real sizes, relative scale, camera (focal/angle/height)
+// and depth order, then rewrites the prompt with explicit proportions +
+// negative prompt. Output feeds generate_image/generate_video, never the raw brief.
+async function groundScene(brief) {
+  const out = await chatWithFallback("fast", {
+    messages: [
+      { role: "system", content: "You are a physical grounding engine. Given a scene brief, output ONLY JSON: {subjects:[{name, real_size_m, position, size_in_frame}], camera:{focal_mm, angle, height}, depth_order:[...], lighting, enriched_prompt, negative_prompt}. enriched_prompt MUST state explicit relative proportions, camera and distance. negative_prompt forbids wrong scale (tiny people, oversized objects, warped perspective)." },
+      { role: "user", content: String(brief || "").slice(0, 2000) },
+    ],
+    temperature: 0.2, max_tokens: 700,
+  });
+  const text = out.choices?.[0]?.message?.content || "";
+  const parsed = safeJsonParse(text.match(/\{[\s\S]*\}/)?.[0] || "", null);
+  if (parsed?.enriched_prompt) return parsed;
+  return { subjects: [], camera: {}, depth_order: [], lighting: "", enriched_prompt: String(brief || ""), negative_prompt: "tiny people, oversized objects, warped proportions, wrong scale" };
+}
+
+// Video generation via OpenRouter Videos API (async: submit -> poll -> download).
+// Cheap default: google/veo-3.1-lite 720p 4-8s. Alt: minimax/hailuo, alibaba/wan-2.6.
+function orVideoHeaders() {
+  return {
+    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    "Content-Type": "application/json",
+    "HTTP-Referer": "https://frit.local",
+    "X-Title": "FRIT",
+  };
+}
+async function submitVideo(prompt, opts = {}) {
+  if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY missing");
+  const res = await fetch("https://openrouter.ai/api/v1/videos", {
+    method: "POST",
+    headers: orVideoHeaders(),
+    body: JSON.stringify({
+      model: opts.model || OR_VIDEO_MODEL,
+      prompt: String(prompt || ""),
+      duration: opts.duration || 4,
+      resolution: opts.resolution || "720p",
+      aspect_ratio: opts.aspect_ratio || "16:9",
+      generate_audio: opts.generate_audio || false,
+      ...(opts.frame_images ? { frame_images: opts.frame_images } : {}),
+      ...(opts.input_references ? { input_references: opts.input_references } : {}),
+    }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || `Video submit HTTP ${res.status}`);
+  return data; // { id, polling_url, status }
+}
+async function pollVideo(jobId) {
+  const res = await fetch(`https://openrouter.ai/api/v1/videos/${encodeURIComponent(jobId)}`, {
+    headers: orVideoHeaders(),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || `Video poll HTTP ${res.status}`);
+  return data;
+}
+async function downloadVideo(jobId, index = 0) {
+  const res = await fetch(`https://openrouter.ai/api/v1/videos/${encodeURIComponent(jobId)}/content?index=${index}`, {
+    headers: orVideoHeaders(),
+    signal: AbortSignal.timeout(300_000),
+  });
+  if (!res.ok) throw new Error(`Video content HTTP ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// Wallet helpers (kobo integers, no float drift). Every movement writes a
+// hash-chained ledger row: tx_hash = sha256(prev_hash|...). Verify with
+// GET /admin/ledger/verify. Balance mutations run inside a transaction so
+// concurrent overage debits can't double-spend.
+function assertKobo(n, { min = 1, max = 100_000_000_00 } = {}) {
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`amount must be an integer ${min}..${max} kobo`);
+  return n;
+}
+function appendLedger(user_id, amount_kobo, kind, note) {
+  const prev = db.prepare("SELECT tx_hash FROM wallet_txns ORDER BY id DESC LIMIT 1").get();
+  const prev_hash = prev?.tx_hash || "GENESIS";
+  const ts = new Date().toISOString();
+  const tx_hash = crypto.createHash("sha256").update(`${prev_hash}|${user_id}|${amount_kobo}|${kind}|${note}|${ts}`).digest("hex");
+  db.prepare("INSERT INTO wallet_txns (user_id, amount_kobo, kind, note, created_at, prev_hash, tx_hash) VALUES (?, ?, ?, ?, ?, ?, ?)").run(user_id, amount_kobo, kind, note, ts, prev_hash, tx_hash);
+}
+function walletBalance(user_id) {
+  const row = db.prepare("SELECT balance_kobo FROM wallet_accounts WHERE user_id = ?").get(user_id);
+  return row?.balance_kobo ?? 0;
+}
+function walletCredit(user_id, amount_kobo, note = "") {
+  assertKobo(amount_kobo);
+  const run = db.transaction(() => {
+    db.prepare("INSERT INTO wallet_accounts (user_id, balance_kobo) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET balance_kobo = balance_kobo + ?, updated_at = CURRENT_TIMESTAMP").run(user_id, amount_kobo, amount_kobo);
+    appendLedger(user_id, amount_kobo, "credit", note);
+  });
+  run();
+  return walletBalance(user_id);
+}
+function walletSpend(user_id, amount_kobo, note = "") {
+  assertKobo(amount_kobo);
+  const run = db.transaction(() => {
+    const row = db.prepare("SELECT balance_kobo FROM wallet_accounts WHERE user_id = ?").get(user_id);
+    const bal = row?.balance_kobo ?? 0;
+    if (bal < amount_kobo) throw new Error(`Insufficient wallet balance (${bal} < ${amount_kobo} kobo)`);
+    db.prepare("UPDATE wallet_accounts SET balance_kobo = balance_kobo - ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?").run(amount_kobo, user_id);
+    appendLedger(user_id, -amount_kobo, "spend", note);
+  });
+  run();
+  return walletBalance(user_id);
+}
+const SUB_TIERS = {
+  // USD-pegged: naira price computed LIVE at subscribe time (ngnPerUsd).
+  // $10 Creator / $26 Pro. Caps bind worst-case cost ≈ price; overage covers the rest.
+  free: { usd: 0, days: 3650, turns_day: 15, clips_mo: 0, images_mo: 10, stt_min_mo: 30 },
+  creator: { usd: 10, days: 30, turns_day: 40, clips_mo: 8, images_mo: 100, stt_min_mo: 120 },
+  pro: { usd: 26, days: 30, turns_day: 100, clips_mo: 25, images_mo: 400, stt_min_mo: 480 },
+  owner: { usd: 0, days: 365000, turns_day: 999999, clips_mo: 999999, images_mo: 999999, stt_min_mo: 999999 },
+};
+// Live USD->NGN (keyless er-api, 6h cache, falls back to 1500).
+let _fxCache = { rate: 1500, exp: 0 };
+async function ngnPerUsd() {
+  if (Date.now() < _fxCache.exp) return _fxCache.rate;
+  try {
+    const r = await fetch("https://open.er-api.com/v6/latest/USD", { signal: AbortSignal.timeout(15_000) });
+    const d = await r.json();
+    if (d.rates?.NGN) _fxCache = { rate: Number(d.rates.NGN), exp: Date.now() + 6 * 3600e3 };
+  } catch (e) { console.warn("[FX]", e.message); }
+  return _fxCache.rate;
+}
+const tierNaira = (tier, rate) => Math.round(SUB_TIERS[tier].usd * rate * 100);
+// Per-unit wallet overage (excessive users stay profitable — billed in kobo):
+const OVERAGE = { turn_kobo: 2500, clip_kobo: 40000, image_kobo: 4000, stt_min_kobo: 1000 };
+const MASTER_CODE = process.env.MASTER_CODE || "";
+const BTC_ADDRESS = process.env.BTC_ADDRESS || ""; // native Bitcoin (bc1/1/3…) — empty until you add one
+const USDT_TRON_ADDRESS = process.env.USDT_TRON_ADDRESS || "";
+// Binance deposits: BOTH assets live on BNB Smart Chain (BEP20) at ONE address
+// (your BTC here is BTCB — pegged BTC, not native BTC, so mempool.space can't
+// see it; BSC public RPC can, keyless).
+const BSC_ADDRESS = (process.env.BSC_ADDRESS || "").toLowerCase();
+const BSC_RPC = process.env.BSC_RPC || "https://bsc-dataseed.binance.org/";
+const BSC_TOKENS = {
+  usdt: { contract: "0x55d398a7e2f2100c2afca4aa5a4be64d0f2452b50", decimals: 18, usd: 1 },
+  btcb: { contract: "0x7130d987a9e31d56f7ba9fd9a99d33047c6e216", decimals: 18, usd: null }, // priced live via Binance ticker
+};
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df288b6e9";
+async function bscRpc(method, params) {
+  const r = await fetch(BSC_RPC, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(`BSC RPC: ${d.error.message}`);
+  return d.result;
+}
+async function btcPriceUSD() {
+  // Binance public ticker (keyless). Falls back to mempool price feed.
+  try {
+    const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", { signal: AbortSignal.timeout(15_000) });
+    const d = await r.json();
+    if (Number(d.price) > 0) return Number(d.price);
+  } catch {}
+  const r = await fetch("https://mempool.space/api/v1/prices", { signal: AbortSignal.timeout(15_000) });
+  const d = await r.json();
+  return Number(d.USD || 0);
+}
+// Keyless BEP20 verify: receipt logs must show `token` transferring >= expected
+// base units to YOUR BSC address, with >= 12 confirmations. Covers USDT + BTCB.
+async function verifyBscTx(txhash, asset, expectedUnits) {
+  if (!BSC_ADDRESS) throw new Error("BSC receiving address not configured");
+  const token = BSC_TOKENS[asset];
+  if (!token) throw new Error(`unknown asset ${asset}`);
+  const cleanTx = String(txhash).trim();
+  const receipt = await bscRpc("eth_getTransactionReceipt", [cleanTx]);
+  if (!receipt || !receipt.blockNumber) throw new Error("tx not found (yet) — wait for broadcast and retry");
+  const latest = await bscRpc("eth_blockNumber", []);
+  const confs = parseInt(latest, 16) - parseInt(receipt.blockNumber, 16);
+  let paid = 0n;
+  for (const log of receipt.logs || []) {
+    if (String(log.address || "").toLowerCase() !== token.contract) continue;
+    if (!log.topics || log.topics[0] !== TRANSFER_TOPIC || log.topics.length < 3) continue;
+    const to = ("0x" + log.topics[2].slice(-40)).toLowerCase();
+    if (to !== BSC_ADDRESS) continue;
+    paid += BigInt(log.data || "0x0");
+  }
+  const need = BigInt(Math.floor(Number(expectedUnits) * 0.97));
+  if (paid < need) throw new Error(`tx pays ${paid} base units to us, expected ~${need}`);
+  return { paid_units: paid.toString(), confirmed: confs >= 12, confirmations: confs };
+}
+
+// Short typeable passcode, e.g. "7KQ2-9MXD" (Crockford base32, no 0/O/1/I).
+function makePasscode() {
+  const chars = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+  const bytes = crypto.randomBytes(8);
+  let s = "";
+  for (let i = 0; i < 8; i++) s += chars[bytes[i] % chars.length];
+  return `${s.slice(0, 4)}-${s.slice(4)}`;
+}
+function makeActivationCode() {
+  return `FRIT-${makePasscode()}-${makePasscode().slice(0, 4)}`;
+}
+// Subscription time: tier is active only while expires_at is in the future.
+// Expired -> falls back to free caps (never hard-locks the user out).
+function activeTier(user_id) {
+  const sub = db.prepare("SELECT tier, expires_at FROM subscriptions WHERE user_id = ? AND status = 'active'").get(user_id);
+  if (sub && sub.expires_at && new Date(sub.expires_at).getTime() > Date.now() && SUB_TIERS[sub.tier]) {
+    return sub.tier;
+  }
+  return "free";
+}
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function monthStr() { return new Date().toISOString().slice(0, 7); }
+function getUsage(user_id, day = todayStr()) {
+  let row = db.prepare("SELECT * FROM usage_daily WHERE user_id = ? AND day = ?").get(user_id, day);
+  if (!row) {
+    db.prepare("INSERT INTO usage_daily (user_id, day) VALUES (?, ?)").run(user_id, day);
+    row = { user_id, day, turns: 0, clips: 0, images: 0, stt_mins: 0 };
+  }
+  return row;
+}
+function monthUsage(user_id) {
+  const rows = db.prepare("SELECT * FROM usage_daily WHERE user_id = ? AND day LIKE ?").all(user_id, `${monthStr()}%`);
+  return rows.reduce((a, r) => ({ turns: a.turns + r.turns, clips: a.clips + r.clips, images: a.images + r.images, stt_mins: a.stt_mins + r.stt_mins }), { turns: 0, clips: 0, images: 0, stt_mins: 0 });
+}
+// Cap check: returns {ok} or {ok:false, overage_kobo, message}. Overage debits wallet.
+function checkCap(user_id, kind) {
+  const tier = activeTier(user_id);
+  const t = SUB_TIERS[tier];
+  const u = getUsage(user_id);
+  const m = monthUsage(user_id);
+  if (kind === "turn" && u.turns >= t.turns_day) {
+    if (walletBalance(user_id) < OVERAGE.turn_kobo) return { ok: false, message: `Daily turn cap reached (${tier}). Top up wallet — overage ₦${OVERAGE.turn_kobo / 100}/turn.` };
+    walletSpend(user_id, OVERAGE.turn_kobo, "turn overage");
+  }
+  if (kind === "clip" && m.clips >= t.clips_mo) {
+    if (walletBalance(user_id) < OVERAGE.clip_kobo) return { ok: false, message: `Monthly clip cap reached (${tier}). Top up — overage ₦${OVERAGE.clip_kobo / 100}/clip.` };
+    walletSpend(user_id, OVERAGE.clip_kobo, "clip overage");
+  }
+  if (kind === "image" && m.images >= t.images_mo) {
+    if (walletBalance(user_id) < OVERAGE.image_kobo) return { ok: false, message: `Monthly image cap reached (${tier}). Top up — overage ₦${OVERAGE.image_kobo / 100}/image.` };
+    walletSpend(user_id, OVERAGE.image_kobo, "image overage");
+  }
+  if (kind === "stt" && m.stt_mins >= t.stt_min_mo) {
+    if (walletBalance(user_id) < OVERAGE.stt_min_kobo) return { ok: false, message: `Monthly voice cap reached (${tier}). Top up — overage ₦${OVERAGE.stt_min_kobo / 100}/min.` };
+    walletSpend(user_id, OVERAGE.stt_min_kobo, "stt overage");
+  }
+  return { ok: true, tier };
+}
+// Keyless NATIVE-BTC verify via mempool.space (only for bc1/1/3… addresses —
+// NOT for BTCB-on-BSC, which verifyBscTx handles). USDT-Tron has no keyless
+// API (trongrid needs a key) -> manual approve path in /billing/pending.
+async function verifyBtcTx(txid, expectedSats) {
+  const r = await fetch(`https://mempool.space/api/tx/${encodeURIComponent(txid)}`, { signal: AbortSignal.timeout(20_000) });
+  if (!r.ok) throw new Error("tx not found (yet) — wait for broadcast and retry");
+  const tx = await r.json();
+  let paid = 0;
+  for (const o of tx.vout || []) {
+    if (o.scriptpubkey_address === BTC_ADDRESS) paid += Number(o.value || 0);
+  }
+  if (paid < expectedSats * 0.97) throw new Error(`tx pays ${paid} sats to us, expected ~${expectedSats}`);
+  return { paid_sats: paid, confirmed: !!tx.status?.confirmed };
 }
 
 function extractToolCalls(msg) {
@@ -1564,17 +2078,46 @@ positionMonitor.start();
 // Multi-timeframe directional engine — default brain for /trade enhanced and
 // /enhanced/analyze. Runs on Twelve Data free tier (8 credits/min) with its
 // own cache + rate budget. See docs/STRATEGY.md.
+// Additive layers: PullbackJournal (auto-records every published setup +
+// scores accuracy), PortfolioRisk (pre-trade account guards). Neither changes
+// the engine's signal logic — they record it and gate its execution.
+const pullbackJournal = new PullbackJournal({ db });
+const portfolioRisk = new PortfolioRisk({ db, pipConfig: PIP_CONFIG });
 const mtfStrategy = new MTFStrategyEngine({
   fetchCandles,
   checkNewsFilter,
   calculateLotSize,
   addTradeMemory,
+  recordSetup: (setup) => pullbackJournal.record(setup),
 });
+
+// Every 30 min, replay 30M candles and resolve journaled setups (win/loss/
+// expired). Only symbols with pending rows cost API calls; engine + fetch
+// caches absorb the rest. Failures never crash the server.
+setInterval(async () => {
+  try {
+    const r = await pullbackJournal.resolvePending({ fetchCandles });
+    if (r.checked) console.log(`[PullbackJournal] auto-resolve: checked=${r.checked} resolved=${r.resolved} expired=${r.expired}`);
+  } catch (e) {
+    console.warn("[PullbackJournal] auto-resolve failed:", e.message);
+  }
+}, 30 * 60 * 1000);
+
+// Shared pre-trade gate: portfolio risk layer. Used by /trade AND the
+// scheduler executor so no path to the bridge bypasses account guards.
+function riskGate({ symbol, action, lotSize, entry, sl, balance }) {
+  return portfolioRisk.check({ symbol, action, lotSize, entry, sl, balance: balance || 1000 });
+}
 
 // Recurring "everyday analyze XAUUSD" tasks — paper-first by design.
 const tradeScheduler = new TradeTaskScheduler({
   engine: mtfStrategy,
   executor: async ({ symbol, action, lotSize, entry, sl, tp, reason }) => {
+    const gate = riskGate({ symbol, action, lotSize, entry, sl, balance: 1000 });
+    if (!gate.allowed) {
+      console.log(`[TradeTaskScheduler] RISK-BLOCKED ${symbol}: ${gate.reasons.join(" | ")}`);
+      return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
+    }
     const result = await sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason });
     if (result.status !== "failed" && sl && tp) {
       try {
@@ -1596,7 +2139,8 @@ if (process.env.TRADE_TASKS === "true") {
 // run_command / write_file / run_sandbox_code are deliberately NOT advertised:
 // they stay gated behind DEV_TOOLS_ENABLED=false on the client.
 const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data", "get_market_news",
-  "analyze_market", "run_code", "wait_and_verify", "assert_text_visible", "get_frit_manual"
+  "analyze_market", "run_code", "wait_and_verify", "assert_text_visible", "get_frit_manual",
+  "delegate_subtasks", "generate_image", "generate_video", "create_content", "ground_scene"
 ]);
 
 const AGENT_TOOLS = [
@@ -1652,7 +2196,11 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "wait_and_verify", description: "Wait a moment before verifying state (use after actions that take time).", parameters: { type: "object", properties: { delay_ms: { type: "number" } } } } },
   { type: "function", function: { name: "assert_text_visible", description: "Verify that text is visible on the last screen state.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
   { type: "function", function: { name: "get_frit_manual", description: "Get a full reference of every real tool FRIT has, grouped by category, plus how to use the phone's installed-apps list correctly. Call this only if you're unsure what capabilities you have — don't call it for every task.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "delegate_subtasks", description: "Fan OUT independent subtasks to parallel subagent models (different providers, zero extra agent turns). Use for: researching several angles at once, drafting + summarizing while you keep driving the phone, comparing options. Args: subtasks = [{task, kind}] where kind is lookup/extract/draft/summarize/research/analyze/code. Max 4 per call. Results come back merged in one response.", parameters: { type: "object", properties: { subtasks: { type: "array", items: { type: "object", properties: { task: { type: "string" }, kind: { type: "string" } }, required: ["task"] } } }, required: ["subtasks"] } } },
+  { type: "function", function: { name: "delegate_subtasks", description: "Fan OUT independent subtasks to parallel OpenRouter subagents (GLM-5.3-Flash heavy, gpt-oss-20b speed, Qwen draft, zero extra agent turns). Use for: researching several angles at once, drafting + summarizing while you keep driving the phone, comparing options. Args: subtasks = [{task, kind}] where kind is lookup/extract/draft/summarize/research/analyze/code. Max 4 per call. Results come back merged in one response.", parameters: { type: "object", properties: { subtasks: { type: "array", items: { type: "object", properties: { task: { type: "string" }, kind: { type: "string" } }, required: ["task"] } } }, required: ["subtasks"] } } },
+  { type: "function", function: { name: "generate_image", description: "Generate an image via OpenRouter (google/gemini-2.5-flash-image). Use for logos, charts visuals, wallpapers, product shots. Returns image data.", parameters: { type: "object", properties: { prompt: { type: "string" }, aspect_ratio: { type: "string" }, n: { type: "number" } }, required: ["prompt"] } } },
+  { type: "function", function: { name: "generate_video", description: "Generate a short video clip via OpenRouter (veo-3.1-lite 720p 4-8s default). Async: returns job id + polling_url, poll then download. Use for creative content shots.", parameters: { type: "object", properties: { prompt: { type: "string" }, duration: { type: "number" }, aspect_ratio: { type: "string" }, resolution: { type: "string" }, model: { type: "string" } }, required: ["prompt"] } } },
+  { type: "function", function: { name: "create_content", description: "Creative mode: turn a video brief/transcript into script + shot list (image/video prompts) + caption. Then call generate_image/generate_video per shot.", parameters: { type: "object", properties: { brief: { type: "string" }, transcript: { type: "string" } } } } },
+  { type: "function", function: { name: "ground_scene", description: "Before-math: compute real-world sizes, relative scale, camera and depth order for a scene brief. Returns enriched prompt + negative prompt. ALWAYS call this before generate_image/generate_video for realistic scenes.", parameters: { type: "object", properties: { brief: { type: "string" }, prompt: { type: "string" } } } } },
 ];
 
 // Auto-generated from AGENT_TOOLS itself, so this can never drift out of sync
@@ -1689,13 +2237,28 @@ async function runLocalTool(name, args = {}, agentState = null) {
     case "analyze_market": return { ok: true, data: await mtfStrategy.analyze(args.symbol, { interval: args.interval, balance: args.balance, riskPercent: args.risk_percent }) };
     case "run_code": return { ok: true, data: await runSandbox({ language: args.language, code: args.code, stdin: args.stdin || "", timeout_ms: args.timeout_ms || 15000 }) };
     case "get_frit_manual": return { ok: true, data: buildFritManual() };
-    // Fan-out: run independent subtasks in PARALLEL across providers so the
-    // primary brain isn't the bottleneck. Each subtask gets the cheapest
-    // capable model on a DIFFERENT provider (spreads rate-limit + cost load):
-    //   - fast lookup/extract  -> Groq gpt-oss-20b (1000 tok/s, $0.075/M)
-    //   - drafting/summarize   -> Mistral Small (inside your 1M/mo free tier)
-    //   - research/heavy lift  -> Zen Big Pickle (free pool)
-    // Local 1.7B can also take subtasks via execute_local_action when offline.
+    case "generate_image": return { ok: true, data: await generateImage(args.prompt || "", { aspect_ratio: args.aspect_ratio, n: args.n }) };
+    case "generate_video": return { ok: true, data: await submitVideo(args.prompt || "", { duration: args.duration, aspect_ratio: args.aspect_ratio, resolution: args.resolution, model: args.model }) };
+    case "ground_scene": return { ok: true, data: await groundScene(args.brief || args.prompt || "") };
+    case "create_content": {
+      // Creative personality: transcript/notes -> GLM script + shot list -> image + video jobs.
+      // Client sends text + optional frame descriptions (video bytes stay on-device).
+      const brief = String(args.brief || args.transcript || "");
+      const out = await chatWithFallback("conversation", {
+        messages: [
+          { role: "system", content: "You are FRIT Creative. Turn the video brief into: 1) 60-word hook script, 2) 3-5 shot list with per-shot image/video prompts, 3) caption + hashtags. Reply JSON {script, shots:[{kind:'image'|'video', prompt}], caption}." },
+          { role: "user", content: brief.slice(0, 4000) },
+        ],
+        max_tokens: 1500,
+      });
+      return { ok: true, data: out.choices[0].message.content };
+    }
+    // Fan-out: independent subtasks run in PARALLEL on OpenRouter (one gateway,
+    // different cheap models per kind so rate-limit + cost spread):
+    //   - speed lookup/extract -> gpt-oss-20b paid ($0.02/M, fast)
+    //   - draft/summarize      -> qwen 30B-class cheap
+    //   - heavy research/code  -> GLM-5.3-Flash (beats Qwen 235B on benches)
+    // Free :free quota is fallback inside mistralChat chains, not here.
     case "delegate_subtasks": return { ok: true, data: await runSubagents(args.subtasks || []) };
     case "wait_and_verify": {
       const delay = args.delay_ms || 500;
@@ -1716,12 +2279,11 @@ async function runLocalTool(name, args = {}, agentState = null) {
 // ==================== SUBAGENT FAN-OUT ====================
 // Primary delegates independent chunks here; they resolve concurrently and
 // the merged results come back as ONE tool result (one agent turn, not N).
+// GLM-5.3-Flash is heavy (DeepSWE 63.4, Toolathlon 78.4 — beats Qwen 235B).
 const SUBAGENT_POOL = [
-  { slot: "speed", model: "groq:openai/gpt-oss-20b", kinds: ["lookup", "extract", "classify", "quick"] },
-  { slot: "draft", model: "mistral-small-latest", kinds: ["draft", "summarize", "rewrite", "plan"] },
-  // Heavy slot follows the Qwen migration: 3.8-27B leads research/code
-  // (SWE-Pro 61.7, OSWorld-Verified 84.3), DeepSeek direct if keyed.
-    { slot: "heavy", model: (typeof HAS_GROQ !== "undefined" && HAS_GROQ) ? "groq:moonshotai/kimi-k2-instruct-0905" : ((typeof HAS_DEEPSEEK !== "undefined" && HAS_DEEPSEEK) ? `deepseek:${DEEPSEEK_MODEL}` : (typeof MISTRAL_MODEL !== "undefined" && MISTRAL_MODEL ? MISTRAL_MODEL : "groq:openai/gpt-oss-120b")), kinds: ["research", "compare", "analyze", "code"] },
+  { slot: "speed", model: "openrouter:openai/gpt-oss-20b", kinds: ["lookup", "extract", "classify", "quick"] },
+  { slot: "draft", model: "openrouter:qwen/qwen3-30b-a3b-2507", kinds: ["draft", "summarize", "rewrite", "plan"] },
+  { slot: "heavy", model: "openrouter:z-ai/glm-5.3-flash", kinds: ["research", "compare", "analyze", "code"] },
 ];
 function pickSubagentModel(kind = "") {
   const k = String(kind).toLowerCase();
@@ -1759,7 +2321,7 @@ async function runSubagents(subtasks = []) {
       ],
       temperature: 0.3, max_tokens: 900,
     }).then(
-      out => ({ index: i, model, ok: true, result: String(out || "").slice(0, 2500) }),
+      out => ({ index: i, model, ok: true, result: String(out?.choices?.[0]?.message?.content || "").slice(0, 2500) }),
       err => ({ index: i, model, ok: false, result: `FAILED: ${err.message}` }),
     );
     // Per-subtask timeout so one slow provider can't stall the merge.
@@ -1773,9 +2335,32 @@ async function runSubagents(subtasks = []) {
 }
 
 // ==================== AUTOMATION SYSTEM PROMPT ====================
-function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = "", tradeMemory = "", verification = null, lastFailure = "" }) {
+function buildUserProfileBlock(userProfile = null) {
+  if (!userProfile || typeof userProfile !== "object") return "";
+  const pick = (v) => String(v || "").trim();
+  const lines = [];
+  const callAs = pick(userProfile.preferred_name) || pick(userProfile.display_name);
+  if (callAs) lines.push(`Address the user as: ${callAs.slice(0, 40)}`);
+  if (pick(userProfile.display_name) && pick(userProfile.display_name) !== callAs) lines.push(`Full name: ${pick(userProfile.display_name).slice(0, 60)}`);
+  if (pick(userProfile.language)) lines.push(`Language: ${pick(userProfile.language).slice(0, 30)}`);
+  const loc = [pick(userProfile.city), pick(userProfile.country)].filter(Boolean).join(", ");
+  if (loc) lines.push(`Location: ${loc.slice(0, 80)}`);
+  if (pick(userProfile.occupation)) lines.push(`Occupation: ${pick(userProfile.occupation).slice(0, 80)}`);
+  if (pick(userProfile.work_schedule)) lines.push(`Work schedule: ${pick(userProfile.work_schedule).slice(0, 80)}`);
+  if (pick(userProfile.interests)) lines.push(`Interests: ${pick(userProfile.interests).slice(0, 160)}`);
+  if (pick(userProfile.trading_risk)) lines.push(`Trading risk: ${pick(userProfile.trading_risk).slice(0, 20)}`);
+  // Birthday / emergency contact intentionally NOT forwarded verbatim — the
+  // phone resolves them locally; the brain only needs to know they exist.
+  if (pick(userProfile.birthday)) lines.push("Birthday: on file (ask the user before using it anywhere)");
+  if (pick(userProfile.emergency_contact)) lines.push("Emergency contact: on file on the phone (never ask the brain to dial it blindly — confirm first)");
+  if (!lines.length) return "";
+  return `User profile (Settings → Personal Details — baseline only, live chat tone always wins):\n${lines.join("\n")}`;
+}
+
+function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = "", tradeMemory = "", verification = null, lastFailure = "", userProfile = null }) {
   const deviceStateText = buildDeviceStateBlock(deviceState);
   const memoryText = buildMemoryBlock(summarizeMemory(memory, 6, 700));
+  const profileText = buildUserProfileBlock(userProfile || deviceState?.user_profile);
   const ledgerText = Array.isArray(ledger) && ledger.length
     ? `\nTask ledger (tracked server-side — subtasks are marked done/failed automatically):\n${ledger.map(t => `- [${t.status}] ${t.description}${t.note ? ` — ${t.note}` : ""}`).join("\n")}`
     : "";
@@ -1810,7 +2395,7 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- DIVISION OF LABOR: the phone's local engine owns launching apps and system shortcuts (open_app, execute_local_action). You own analysis, decisions, and every tap/type INSIDE an app. Never navigate to an app manually; launch it, then act on the screen text the launch returns.",
     "- If the device state below lists 'Installed apps', ONLY target names from that list with open_app — do not guess an app exists if it isn't listed. If it's not there, tell the user instead of trying anyway.",
     "- UNFAMILIAR APP UI (Opay, Facebook, MT5, any app you haven't driven in THIS session): BEFORE tapping blindly, spend ONE 'search_web' call on the exact flow — e.g. 'Opay Android app how to transfer money steps 2026', 'Facebook Android app create post steps'. Combine that walkthrough with the live screen text and NEVER second-guess: screen text always wins over the article when they disagree. Skip the search only for apps/flows you already completed successfully in this session.",
-    "- PARALLELIZE with 'delegate_subtasks': independent research angles, per-option comparisons, or draft-while-you-drive work goes there (up to 4 at once across Groq/Mistral/Go) instead of burning sequential agent turns.",
+    "- PARALLELIZE with 'delegate_subtasks': independent research angles, per-option comparisons, or draft-while-you-drive work goes there (up to 4 at once across OpenRouter speed/draft/heavy slots) instead of burning sequential agent turns.",
     "- PAST FEEDBACK IS BINDING: user memory may contain 'feedback_negative: task=[...] bad_reply=[...]'. If the current goal matches such a task, you MUST use a different approach than the recorded bad reply — repeating it is a failure. 'feedback_positive' entries mark the approach to reuse.",
     "- You only have the tools explicitly provided to you in this request (open_app, read_screen, tap_button, type_text, run_code, search_web, get_market_data, analyze_market, send_whatsapp, make_call, etc.). Never assume a capability exists beyond that list — e.g. there is no generic 'send_message' or 'call_contact' tool, use the exact tool names you were given.",
     "",
@@ -1825,7 +2410,7 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "- Browse: Use 'search_web' to find information.",
     "- Market/trading news & fundamentals: ALWAYS call 'get_market_news' or 'search_web' to retrieve current live 2025/2026 market news. NEVER cite outdated news from 2024 or earlier memory!",
      "- Market/trading tasks: analysis happens HERE on the server, NOT on the phone. Actually CALL the 'analyze_market' or 'get_market_data' tool (a real function call) and read the returned direction/entry/SL/TP — do not narrate calling it. Only use the phone (open_app MetaTrader5, tap, type) to EXECUTE an order after the analysis is complete.",
-     "- TRADING NUMBERS DISCIPLINE: report the engine's decision/entry_zone/scenario/pullback_health fields VERBATIM. NEVER invent MACD, Bollinger, ADX/DI, or session values the tools did not return — if you want an indicator the engine lacks, compute it with run_code from real candles, never from memory. When decision is WAIT_PULLBACK, present ONLY the pullback-zone entry (limit-style); never substitute a market entry. When a healthy pullback exists, scenario_2 IS the trade — scenario_1 immediates apply only when the engine is aligned.",
+     "- TRADING NUMBERS DISCIPLINE: report the engine's decision/entry_zone/scenario/pullback_health fields VERBATIM. NEVER invent MACD, Bollinger, ADX/DI, or session values the tools did not return — if you want an indicator the engine lacks, compute it with run_code from real candles, never from memory. When decision is WAIT_PULLBACK, present ONLY the pullback-zone entry (limit-style); never substitute a market entry. When a healthy pullback exists, scenario_2 IS the trade — scenario_1 immediates apply only when the engine is aligned. When decision is WAIT_RANGE, present ONLY the range-edge fade (limit at the proven edge toward midline, invalidation on close beyond the edge); never market-enter mid-range, never flip to breakout-chasing. Every setup carries a costs block (net RR after spread/commission/slippage) — if net RR < 1.0 the setup was already suppressed; if costs are WEAK, say so and size down.",
     "",
     "PHONE UI SKILL — field-tested patterns for operating any app accurately (loaded from server/skills/phone-ui.md — edit that file to teach new patterns):",
     PHONE_UI_SKILL,
@@ -1843,6 +2428,15 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     deviceStateText,
     tradeMemory ? `\n${tradeMemory}` : "",
     memoryText ? `\n${memoryText}` : "",
+    profileText ? `\n${profileText}` : "",
+    "",
+    "PERSONALITY — DYNAMIC TONE MIRRORING (not a fixed persona):",
+    "- The user profile above is only the BASELINE default. The live conversation / thread tone ALWAYS wins.",
+    "- Fresh chat with no signal → warm neutral: friendly, plain, no slang, no stiffness.",
+    "- Official signals (email, job/school, bank/opay dispute, complaint, MT5/trading instruction, 'Dear Sir/Ma', formal request) → act OFFICIAL: full sentences, polite structure, no slang, no emojis unless the user used one.",
+    "- Casual signals (slang, pidgin, short chatty lines, jokes, friends/family chat) → mirror casually: short human replies, light warmth, ever so slight playfulness — never corporate.",
+    "- When operating messaging apps on the user's behalf, mirror the THREAD's current tone the same way (neutral default; official only if the thread is formal). Never force the profile tone over what the thread shows.",
+    "- Address the user by their profile name only when it sounds natural (greetings, confirmations) — not every turn.",
   ].filter(Boolean).join("\n");
 }
 
@@ -1861,6 +2455,18 @@ function buildDeviceStateBlock(ds = {}) {
     parts.push(`NOTE: the accessibility layer returned NO readable screen text.${d.has_screen_capture ? " A screen capture IS available — call 'analyze_screenshot' to inspect the UI visually instead of read_screen." : " No screen capture either — open/press_home to an app that exposes text, or tell the user the phone screen has no readable content."}`);
   }
   if (d.screen_note) parts.push(`Screen note: ${truncateText(d.screen_note, 400)}`);
+  if (d.user_profile && typeof d.user_profile === "object") {
+    const up = d.user_profile;
+    const nm = String(up.preferred_name || up.display_name || "").trim();
+    const lg = String(up.language || "").trim();
+    const lc = [String(up.city || "").trim(), String(up.country || "").trim()].filter(Boolean).join(", ");
+    const bits = [];
+    if (nm) bits.push(`user: ${nm.slice(0, 40)}`);
+    if (lg) bits.push(`lang: ${lg.slice(0, 20)}`);
+    if (lc) bits.push(`loc: ${lc.slice(0, 60)}`);
+    if (String(up.occupation || "").trim()) bits.push(`job: ${String(up.occupation).trim().slice(0, 60)}`);
+    if (bits.length) parts.push(`Profile: ${bits.join(" · ")}`);
+  }
   if (Array.isArray(d.installed_apps) && d.installed_apps.length) {
     // Ground open_app in reality: only these names are guaranteed to exist.
     // Capped to keep prompt size sane on large phones (150+ apps is common).
@@ -1893,8 +2499,15 @@ function resolveInstalledApp(requestedName, deviceState) {
 }
 
 // ==================== SCREEN FRAME INGESTION ====================
-const frameBuffer = [];
+// Per-user buffers (10 each) — a global buffer leaked User A's screenshots
+// into User B's vision calls.
+const frameBuffers = new Map();
 const FRAME_BUFFER_SIZE = 10;
+function userFrames(uid) {
+  let b = frameBuffers.get(uid);
+  if (!b) { b = []; frameBuffers.set(uid, b); }
+  return b;
+}
 
 // ==================== ROUTES ====================
 app.get("/", (_req, res) => {
@@ -1906,11 +2519,18 @@ app.get("/", (_req, res) => {
       core: ["/health", "/agent/start", "/agent/resume", "/agent/status"],
       market: ["/market/quote", "/market/batch", "/market/analyze", "/trade"],
       positions: ["/positions", "/positions/status", "/positions/resolve"],
-      strategy: ["/enhanced/analyze", "/market/strategy", "/strategy/status", "/systems/status"],
+      strategy: ["/enhanced/analyze", "/market/strategy", "/strategy/status", "/systems/status", "/strategy/costs", "/strategy/journal/stats", "/strategy/journal/recent", "/strategy/journal/resolve"],
+      risk: ["/risk/status", "/risk/check"],
       memory: ["/memory/trade"],
       screen: ["/screen/frame", "/screen/analyze-frame", "/screen/status"],
       transcribe: ["/transcribe"],
       tools: ["/tools/search"],
+      images: ["/images/generate"],
+      video: ["/videos/submit", "/videos/status/:jobId", "/videos/content/:jobId"],
+      creative: ["/creative/compose", "/creative/revise", "/creative/assemble", "/creative/ground", "/creative/jobs"],
+      billing: ["/billing/tiers", "/billing/pay-info", "/billing/subscribe", "/billing/submit-reference", "/billing/pending", "/billing/approve", "/billing/redeem", "/billing/status"],
+      wallet: ["/wallet/balance", "/wallet/topup", "/wallet/spend"],
+      models: ["/models/free-health"],
     utility: ["/weather"],
     sandbox: ["/sandbox/run"],
   },
@@ -1921,26 +2541,28 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "active",
     models: MODELS,
+    openrouter: { primary: OR_PRIMARY, fast: OR_FAST, draft: OR_DRAFT, image: OR_IMAGE_MODEL, stt: OR_STT_MODEL, free_fast: OR_FREE_FAST },
     twelve_data: !!TWELVE_DATA_KEY,
     mt5_bridge: !!MT5_BRIDGE_URL,
     sandbox_url: SANDBOX_URL,
     sandbox_auth: !!SANDBOX_AUTH,
-    frame_buffer: frameBuffer.length,
+    frame_buffers: frameBuffers.size,
     cache_entries: _cache.size,
     uptime: Math.floor(process.uptime()) + "s",
   });
 });
 
 
-app.post("/screen/frame", requireAuth, (req, res) => {
+app.post("/screen/frame", requireAuth, limitNormal, (req, res) => {
   const { frameData, timestamp, width, height, current_app, screen_text, current_activity } = req.body || {};
   if (!frameData) return res.status(400).json({ error: "frameData required" });
-  frameBuffer.push({ data: frameData, timestamp: timestamp || Date.now(), width, height });
-  if (frameBuffer.length > FRAME_BUFFER_SIZE) frameBuffer.shift();
-  res.json({ status: "received", buffered: frameBuffer.length });
+  const buf = userFrames(boundUser(req));
+  buf.push({ data: frameData, timestamp: timestamp || Date.now(), width, height });
+  if (buf.length > FRAME_BUFFER_SIZE) buf.shift();
+  res.json({ status: "received", buffered: buf.length });
 });
 
-app.post("/screen/analyze-frame", requireAuth, async (req, res) => {
+app.post("/screen/analyze-frame", requireAuth, limitCostly, async (req, res) => {
   const { prompt, frameIndex = -1, frameData } = req.body || {};
   // Inline image support: clients that attach an image (photo picker, camera,
   // arbitrary screenshot) pass frameData directly instead of pre-buffering it.
@@ -1961,8 +2583,9 @@ app.post("/screen/analyze-frame", requireAuth, async (req, res) => {
       return res.status(500).json({ error: "Inline frame analysis failed", details: err.message });
     }
   }
-  if (!frameBuffer.length) return res.status(400).json({ error: "No frames in buffer. Android app must send frames first via /screen/frame." });
-  const frame = frameIndex >= 0 && frameIndex < frameBuffer.length ? frameBuffer[frameIndex] : frameBuffer.at(-1);
+  const buf = userFrames(boundUser(req));
+  if (!buf.length) return res.status(400).json({ error: "No frames in buffer. Android app must send frames first via /screen/frame." });
+  const frame = frameIndex >= 0 && frameIndex < buf.length ? buf[frameIndex] : buf.at(-1);
   try {
     const out = await chatWithFallback("vision", {
       messages: [{
@@ -1977,24 +2600,25 @@ app.post("/screen/analyze-frame", requireAuth, async (req, res) => {
     res.json({
       analysis: out.choices[0].message.content,
       frameTimestamp: frame.timestamp,
-      frameIndex: frameIndex >= 0 ? frameIndex : frameBuffer.length - 1,
+      frameIndex: frameIndex >= 0 ? frameIndex : buf.length - 1,
     });
   } catch (err) {
     res.status(500).json({ error: "Frame analysis failed", details: err.message });
   }
 });
 
-app.get("/screen/status", requireAuth, (_req, res) => {
+app.get("/screen/status", requireAuth, (req, res) => {
+  const buf = userFrames(boundUser(req));
   res.json({
-    buffered_frames: frameBuffer.length,
+    buffered_frames: buf.length,
     max_buffer: FRAME_BUFFER_SIZE,
-    oldest_frame_ts: frameBuffer[0]?.timestamp || null,
-    newest_frame_ts: frameBuffer.at(-1)?.timestamp || null,
+    oldest_frame_ts: buf[0]?.timestamp || null,
+    newest_frame_ts: buf.at(-1)?.timestamp || null,
   });
 });
 
-app.post("/screen/clear", requireAuth, (_req, res) => {
-  frameBuffer.length = 0;
+app.post("/screen/clear", requireAuth, (req, res) => {
+  userFrames(boundUser(req)).length = 0;
   res.json({ status: "cleared" });
 });
 
@@ -2013,7 +2637,8 @@ app.post("/market/batch", async (req, res) => {
   try {
     const { symbols = [] } = req.body || {};
     if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" });
-    res.json(await fetchMarketPrices(symbols.map(s => String(s).toUpperCase())));
+    if (symbols.length > 20) return res.status(400).json({ error: "max 20 symbols per call" });
+    res.json(await fetchMarketPrices(symbols.slice(0, 20).map(s => String(s).toUpperCase().slice(0, 12))));
   } catch (err) {
     res.status(500).json({ error: "Batch fetch failed", details: err.message });
   }
@@ -2075,15 +2700,30 @@ app.all("/market/analyze", requireAuth, async (req, res) => {
 // ==================== TRADE ENDPOINT (engine.js only) ====================
 // MTFStrategyEngine (server/src/strategy/engine.js) is the single trading
 // engine. /trade always runs through it — no legacy/GSRI/ACP branches.
-app.post("/trade", requireAuth, async (req, res) => {
+app.post("/trade", requireAuth, limitNormal, async (req, res) => {
   const { symbol, risk_percent = 1, balance, reason = "", interval = "1h" } = req.body || {};
   if (!symbol) return res.status(400).json({ error: "symbol required" });
+  if (balance != null && (!Number.isFinite(Number(balance)) || Number(balance) > 1_000_000)) {
+    return res.status(400).json({ error: "balance must be ≤ 1,000,000" });
+  }
 
   try {
     const result = await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
 
-    if (["NO_TRADE", "WAIT", "WAIT_PULLBACK", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
+    if (["NO_TRADE", "WAIT", "WAIT_PULLBACK", "WAIT_RANGE", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
       return res.status(200).json({ status: "blocked", ...result });
+    }
+    // Portfolio risk layer: account-level guards BEFORE anything reaches the bridge.
+    const gate = riskGate({
+      symbol: symbol.toUpperCase(),
+      action: result.decision === "BUY" ? "buy" : "sell",
+      lotSize: result.lot_size,
+      entry: result.entry,
+      sl: result.sl,
+      balance: balance || 1000,
+    });
+    if (!gate.allowed) {
+      return res.status(200).json({ status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure, ...result });
     }
     const tradeResult = await sendToMT5Bridge({
       symbol: symbol.toUpperCase(),
@@ -2128,6 +2768,14 @@ app.post("/trade", requireAuth, async (req, res) => {
       structure: result.structure_30m,
       entry_ctx: result.entry_ctx,
       guards: result.guards,
+      costs: result.costs ?? null,
+      costs_usd: (() => {
+        try {
+          const cfg = PIP_CONFIG[symbol.toUpperCase()];
+          return costToUsd({ symbol: symbol.toUpperCase(), lotSize: result.lot_size, pipSize: cfg?.pipSize, pipValue: cfg?.pipValue, refPrice: result.entry });
+        } catch { return null; }
+      })(),
+      risk: { allowed: true, exposure: gate.exposure },
       mt5_result: tradeResult,
       position_id: position?.id ?? null,
     });
@@ -2167,6 +2815,73 @@ app.get("/memory/trade", requireAuth, (req, res) => {
   res.json({ symbol, entries: getTradeMemory(symbol) });
 });
 
+// ==================== PULLBACK JOURNAL (setup recorder + accuracy) ======
+// Every published setup is auto-recorded by the engine; resolve replays 30M
+// candles and scores win/loss/expired. Stats carry the only verdict that
+// matters: expectancy in R over resolved setups (30-trade minimum).
+app.get("/strategy/journal/stats", requireAuth, (req, res) => {
+  try {
+    res.json(pullbackJournal.stats({
+      symbol: req.query.symbol || null,
+      strategy: req.query.strategy || null,
+    }));
+  } catch (err) {
+    res.status(500).json({ error: "Journal stats failed", details: err.message });
+  }
+});
+
+app.get("/strategy/journal/recent", requireAuth, (req, res) => {
+  try {
+    res.json({ setups: pullbackJournal.recent(Number(req.query.limit) || 20) });
+  } catch (err) {
+    res.status(500).json({ error: "Journal recent failed", details: err.message });
+  }
+});
+
+app.post("/strategy/journal/resolve", requireAuth, async (req, res) => {
+  try {
+    res.json(await pullbackJournal.resolvePending({ fetchCandles }));
+  } catch (err) {
+    res.status(500).json({ error: "Journal resolve failed", details: err.message });
+  }
+});
+
+// ==================== COSTS (retail friction lookup) =====================
+app.get("/strategy/costs", requireAuth, (req, res) => {
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  const cfg = PIP_CONFIG[symbol];
+  res.json({
+    symbol,
+    ...getSymbolCost(symbol),
+    per_lot_usd: costToUsd({ symbol, lotSize: 1, pipSize: cfg?.pipSize, pipValue: cfg?.pipValue }),
+  });
+});
+
+// ==================== RISK (portfolio guards) ============================
+app.get("/risk/status", requireAuth, (req, res) => {
+  try {
+    res.json(portfolioRisk.status(Number(req.query.balance) || 1000));
+  } catch (err) {
+    res.status(500).json({ error: "Risk status failed", details: err.message });
+  }
+});
+
+app.post("/risk/check", requireAuth, (req, res) => {
+  const { symbol, action, lotSize, lot_size, entry, sl, balance } = req.body || {};
+  if (!symbol || entry == null || sl == null) {
+    return res.status(400).json({ error: "symbol, entry and sl required" });
+  }
+  try {
+    res.json(riskGate({
+      symbol, action: action || "buy",
+      lotSize: lotSize ?? lot_size ?? 0.01, entry, sl, balance,
+    }));
+  } catch (err) {
+    res.status(500).json({ error: "Risk check failed", details: err.message });
+  }
+});
+
 app.get("/weather", async (req, res) => {
   try {
     const city = String(req.query.city || "Lagos");
@@ -2177,20 +2892,57 @@ app.get("/weather", async (req, res) => {
   }
 });
 
-app.post("/transcribe", requireAuth, async (req, res) => {
+app.post("/transcribe", requireAuth, limitCostly, async (req, res) => {
   try {
     const { audio_base64, mime_type = "audio/webm" } = req.body || {};
     if (!audio_base64) return res.status(400).json({ error: "audio_base64 required" });
+    const uid = boundUser(req);
+    const cap = checkCap(uid, "stt");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
     const text = await mistralTranscribe(audio_base64, mime_type);
     if (!text) return res.status(500).json({ error: "Transcription failed" });
-    res.json({ text, model_used: MODELS.voxtral });
+    db.prepare("UPDATE usage_daily SET stt_mins = stt_mins + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    res.json({ text, model_used: OR_STT_MODEL });
   } catch (err) {
     console.error("[/transcribe]", err.message);
     res.status(500).json({ error: "Transcription failed", details: err.message });
   }
 });
 
-app.post("/sandbox/run", requireAuth, async (req, res) => {
+app.post("/images/generate", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { prompt, aspect_ratio, n } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+    const uid = boundUser(req);
+    const cap = checkCap(uid, "image");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const data = await generateImage(prompt, { aspect_ratio, n });
+    db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    res.json({ ok: true, model: OR_IMAGE_MODEL, ...data });
+  } catch (err) {
+    console.error("[/images/generate]", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Free-tier health: which :free models answer right now? Free pool rotates and
+// 429s often — this tells you in 10s whether free is worth using today.
+app.get("/models/free-health", requireAuth, async (_req, res) => {
+  const candidates = [OR_FREE_FAST, OR_FREE_DRAFT, "openrouter/free"];
+  const results = [];
+  for (const m of candidates) {
+    const t0 = Date.now();
+    try {
+      const out = await mistralChat({ model: `openrouter:${m.replace(/^openrouter:/, "")}`, messages: [{ role: "user", content: "ping" }], max_tokens: 5 });
+      results.push({ model: m, ok: true, ms: Date.now() - t0, sample: String(out?.choices?.[0]?.message?.content || "").slice(0, 50) });
+    } catch (e) {
+      results.push({ model: m, ok: false, ms: Date.now() - t0, error: e.message.slice(0, 120) });
+    }
+  }
+  res.json({ quota_note: "free = 50/day default, 1000/day after $10 credits. 20 RPM. Spare capacity: expect 429s.", results });
+});
+
+app.post("/sandbox/run", requireAuth, limitCostly, async (req, res) => {
   try {
     const result = await runSandbox(req.body);
     res.json(result);
@@ -2200,10 +2952,502 @@ app.post("/sandbox/run", requireAuth, async (req, res) => {
   }
 });
 
+// ==================== VIDEO + CREATIVE ====================
+// Async: submit returns job id immediately (video takes minutes). Client polls
+// /videos/status, then GETs /videos/content for the downloadable MP4.
+// Revise = submit again with edited prompt (same model/endpoint continues).
+app.post("/videos/submit", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { prompt, duration, resolution, aspect_ratio, model } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Video needs Creator or Pro." });
+    const cap = checkCap(uid, "clip");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const job = await submitVideo(prompt, { duration, resolution, aspect_ratio, model });
+    const id = `vid_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video', 'submitted', ?)").run(id, uid, String(prompt).slice(0, 1000));
+    db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    res.json({ ok: true, job_id: id, provider_job: job });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.get("/videos/status/:jobId", requireAuth, limitNormal, async (req, res) => {
+  try {
+    const data = await pollVideo(req.params.jobId);
+    res.json({ ok: true, ...data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.get("/videos/content/:jobId", requireAuth, limitNormal, async (req, res) => {
+  try {
+    const jobId = String(req.params.jobId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+    if (!jobId) return res.status(400).json({ error: "bad job id" });
+    const buf = await downloadVideo(jobId, Number(req.query.index || 0));
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename="${jobId}.mp4"`);
+    res.send(buf);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+// Creative compose: brief/transcript (+ optional frame notes) -> script + shots.
+// Client uploads video bytes; Android extracts audio/frames and sends text here.
+// Final stitching happens in /creative/assemble (sandbox ffmpeg).
+app.post("/creative/compose", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { brief, transcript, frame_notes } = req.body || {};
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Creative mode needs Creator or Pro." });
+    const input = String(transcript || brief || "");
+    if (!input) return res.status(400).json({ error: "transcript or brief required" });
+    const ground = await groundScene(input); // before-math: real sizes + camera first
+    const out = await chatWithFallback("conversation", {
+      messages: [
+        { role: "system", content: "You are FRIT Creative. Given a video transcript/brief AND its physical grounding spec, output JSON {script, shots:[{kind:'image'|'video', prompt, duration}], caption, corrections_invite}. Each shot prompt MUST embed the grounding proportions and negative prompt. Shots max 5." },
+        { role: "user", content: `Brief: ${input.slice(0, 6000)}${frame_notes ? `\nFrames: ${String(frame_notes).slice(0, 2000)}` : ""}\nGrounding: ${JSON.stringify(ground).slice(0, 2000)}` },
+      ],
+      max_tokens: 1800,
+    });
+    const text = out.choices[0].message.content || "";
+    const id = `cc_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'compose', 'done', ?, ?)").run(id, uid, input.slice(0, 1000), text.slice(0, 4000));
+    res.json({ ok: true, job_id: id, draft: text, note: "Reply with corrections to /creative/revise with job_id." });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.post("/creative/revise", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { job_id, corrections } = req.body || {};
+    if (!job_id || !corrections) return res.status(400).json({ error: "job_id and corrections required" });
+    const prev = db.prepare("SELECT * FROM creative_jobs WHERE id = ?").get(job_id);
+    if (!prev) return res.status(404).json({ error: "job not found" });
+    if (req.authUser && prev.user_id && prev.user_id !== req.authUser) {
+      return res.status(403).json({ error: "not your job" });
+    }
+    const out = await chatWithFallback("conversation", {
+      messages: [
+        { role: "system", content: "You are FRIT Creative. Revise the prior draft per user corrections. Output updated JSON {script, shots, caption}." },
+        { role: "user", content: `Prior: ${(prev.result_url || prev.prompt || "").slice(0, 4000)}\nCorrections: ${String(corrections).slice(0, 2000)}` },
+      ],
+      max_tokens: 1800,
+    });
+    const text = out.choices[0].message.content || "";
+    db.prepare("UPDATE creative_jobs SET status = 'revised', result_url = ? WHERE id = ?").run(text.slice(0, 4000), job_id);
+    res.json({ ok: true, job_id, draft: text });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+// Creative assemble: clips (OpenRouter jobIds/urls) and/or images -> one MP4.
+// Proxies to sandbox /media/assemble (the only place ffmpeg runs). Returns MP4 download.
+app.post("/creative/assemble", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { clips = [], images = [], per_image_secs = 2 } = req.body || {};
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Creative mode needs Creator or Pro." });
+    if ((!Array.isArray(clips) || !clips.length) && (!Array.isArray(images) || !images.length)) {
+      return res.status(400).json({ error: "clips[] (jobIds/urls) or images[] (base64) required" });
+    }
+    const files = [];
+    for (const c of (Array.isArray(clips) ? clips : []).slice(0, 4)) {
+      const s = String(c);
+      let buf;
+      if (/^https?:\/\//i.test(s)) {
+        const r = await fetch(s, { signal: AbortSignal.timeout(120_000) });
+        if (!r.ok) throw new Error(`clip fetch HTTP ${r.status}`);
+        buf = Buffer.from(await r.arrayBuffer());
+      } else {
+        buf = await downloadVideo(s, 0); // OpenRouter video jobId
+      }
+      if (buf.length > 8 * 1024 * 1024) throw new Error("clip >8MB, keep 720p 4-8s");
+      files.push({ base64: buf.toString("base64") });
+    }
+    for (const b64 of (Array.isArray(images) ? images : []).slice(0, 6 - files.length)) {
+      if (String(b64 || "").length > 11 * 1024 * 1024) throw new Error("image >8MB");
+      files.push({ base64: String(b64) });
+    }
+    const op = clips.length ? "concat" : "slideshow";
+    const r = await fetch(`${SANDBOX_URL}/media/assemble`, {
+      method: "POST",
+      headers: sandboxAuthHeaders(),
+      body: JSON.stringify({ op, files, per_image_secs }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data?.base64) throw new Error(data?.error || `assemble HTTP ${r.status}`);
+    const id = `asm_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'assemble', 'done', ?)").run(id, uid, `op=${op} files=${files.length}`);
+    res.json({ ok: true, job_id: id, mime: "video/mp4", size: data.size, base64: data.base64 });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ==================== WALLET + SUBSCRIPTIONS ====================
+// Two rails, zero API keys:
+// A) Bank transfer: subscribe -> PENDING order + auto passcode -> user pays with
+//    passcode as narration -> "I've paid" + passcode -> you approve -> tier+expiry.
+// B) Crypto on BNB Smart Chain (your Binance deposits): USDT or BTCB to ONE
+//    BSC_ADDRESS -> user submits txhash -> auto-verified keyless via BSC public
+//    RPC (>=12 confirmations, txhash single-use). Native BTC (bc1…) also works
+//    via mempool.space IF you later add a native BTC_ADDRESS.
+// Upgrade path later: BTCPay Server (self-hosted, no per-tx key) or
+// Paystack/Flutterwave webhooks — same tables.
+app.get("/billing/tiers", requireAuth, async (_req, res) => {
+  const rate = await ngnPerUsd();
+  const tiers = Object.fromEntries(Object.entries(SUB_TIERS).map(([k, t]) => [k, { ...t, price_kobo_live: Math.round(t.usd * rate * 100) }]));
+  res.json({ ok: true, usd_ngn: rate, tiers, overage: OVERAGE });
+});
+app.get("/billing/pay-info", requireAuth, async (_req, res) => {
+  const rate = await ngnPerUsd();
+  res.json({
+    ok: true, usd_ngn: rate,
+    bank: { bank_name: PAY_BANK_NAME || "(set PAY_BANK_NAME)", account_number: PAY_ACCOUNT_NUMBER || "(set PAY_ACCOUNT_NUMBER)", account_name: PAY_ACCOUNT_NAME || "(set PAY_ACCOUNT_NAME)" },
+    crypto: {
+      bsc_address: BSC_ADDRESS || "(set BSC_ADDRESS)",
+      assets: ["USDT (BEP20)", "BTCB = BTC on BNB Smart Chain (BEP20)"],
+      native_btc_address: BTC_ADDRESS || "(optional — set BTC_ADDRESS for native bc1… deposits)",
+      usdt_tron_address: USDT_TRON_ADDRESS || "(manual approve only)",
+      note: "USDT + BTCB auto-verify on txhash submit (12+ confirmations). Send ONLY on BNB Smart Chain — other networks will lose funds.",
+    },
+    tiers: { creator_naira: Math.round(10 * rate), pro_naira: Math.round(26 * rate) },
+    two_pots: {
+      subscription: "Your payment for USING the app. Goes to our account as revenue, unlocks your tier for 30 days. Non-refundable, never spendable.",
+      wallet: "YOUR money, held for the AI to spend FOR you (flights, orders, services). Fund it via /wallet/topup; the agent debits it via /wallet/spend per booking. Unspent balance stays yours.",
+    },
+    note: "Prices track the dollar — the app shows the exact naira amount before you pay, and that quoted amount is locked on your order.",
+  });
+});
+app.post("/billing/subscribe", requireAuth, limitNormal, async (req, res) => {
+  const { tier, method } = req.body || {};
+  const user_id = boundUser(req);
+  if (!SUB_TIERS[tier] || tier === "free" || tier === "owner") return res.status(400).json({ error: "paid tier required" });
+  const rate = await ngnPerUsd();
+  const amount_kobo = tierNaira(tier, rate); // locked at order time — FX moves don't change it after
+  const id = `pay_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+  const passcode = makePasscode(); // auto-generated, user types it in "I've paid"
+  db.prepare("INSERT INTO pending_payments (id, user_id, tier, amount_kobo, reference, purpose) VALUES (?, ?, ?, ?, ?, 'sub')").run(id, user_id, tier, amount_kobo, passcode);
+  const m = String(method || "bank").toLowerCase();
+  const naira = (amount_kobo / 100).toLocaleString();
+  res.json({
+    ok: true, payment_id: id, tier, amount_kobo, usd_ngn: rate, passcode,
+    ...(m === "crypto"
+      ? { pay_to: { bsc_address: BSC_ADDRESS, assets: ["USDT (BEP20)", "BTCB (BEP20)"] }, instruction: `Send USDT or BTCB on BNB Smart Chain equal to ~₦${naira} to ${BSC_ADDRESS}, then submit txhash + this passcode: ${passcode}.` }
+      : { pay_to: { bank_name: PAY_BANK_NAME, account_number: PAY_ACCOUNT_NUMBER, account_name: PAY_ACCOUNT_NAME }, instruction: `Transfer ₦${naira} with narration ${passcode}, then enter passcode ${passcode} in "I've paid".` }),
+  });
+});
+app.post("/billing/submit-reference", requireAuth, limitNormal, async (req, res) => {
+  const { payment_id, passcode, sender_name, txid, network } = req.body || {};
+  const pay = db.prepare("SELECT * FROM pending_payments WHERE id = ?").get(payment_id);
+  if (!pay || (pay.status !== "pending" && pay.status !== "awaiting_review")) return res.status(404).json({ error: "pending payment not found" });
+  // Brute-force guard: 8 passcode tries per hour per order, then re-subscribe.
+  const atk = `pc:${payment_id}`;
+  const now = Date.now();
+  let att = _rl.get(atk);
+  if (!att || now > att.reset) { att = { n: 0, reset: now + 3600e3 }; _rl.set(atk, att); }
+  if (++att.n > 8) return res.status(429).json({ error: "too many wrong passcodes — create a fresh order" });
+  if (String(passcode || "").toUpperCase().replace(/[^A-Z0-9]/gi, "") !== String(pay.reference).replace(/[^A-Z0-9]/gi, "")) {
+    return res.status(400).json({ error: "wrong passcode — check the code from subscribe" });
+  }
+  _rl.delete(atk);
+  // Crypto rail (keyless): network = "usdt" | "btcb" (BSC public RPC, 12+ confs)
+  // or "btc" (native Bitcoin via mempool.space, needs BTC_ADDRESS set).
+  // Each txhash works exactly once (spent_txids).
+  const net = String(network || (txid ? "usdt" : "")).toLowerCase();
+  if (txid && ["usdt", "btcb", "btc"].includes(net)) {
+    try {
+      const cleanTx = String(txid).trim();
+      if (db.prepare("SELECT txid FROM spent_txids WHERE txid = ?").get(cleanTx)) {
+        return res.status(400).json({ error: "txhash already used for another order" });
+      }
+      const rate = await ngnPerUsd();
+      const usd = pay.amount_kobo / 100 / rate; // same live FX as the order quote
+      let v;
+      if (net === "btc") {
+        if (!BTC_ADDRESS) throw new Error("native BTC deposits not configured — pay USDT/BTCB on BSC instead");
+        const price = await btcPriceUSD();
+        v = await verifyBtcTx(cleanTx, Math.round((usd / price) * 1e8));
+        if (!v.confirmed) {
+          db.prepare("UPDATE pending_payments SET status = 'awaiting_review' WHERE id = ?").run(payment_id);
+          return res.json({ ok: false, payment_id, status: "awaiting_review", error: "tx seen but unconfirmed — auto-approves after 1 confirmation, or manual review" });
+        }
+      } else {
+        const token = BSC_TOKENS[net];
+        const unitPrice = net === "usdt" ? 1 : await btcPriceUSD();
+        v = await verifyBscTx(cleanTx, net, (usd / unitPrice) * (10 ** token.decimals));
+        if (!v.confirmed) {
+          db.prepare("UPDATE pending_payments SET status = 'awaiting_review' WHERE id = ?").run(payment_id);
+          return res.json({ ok: false, payment_id, status: "awaiting_review", error: `tx seen (${v.confirmations}/12 confirmations) — auto-approves at 12, or manual review` });
+        }
+      }
+      db.prepare("INSERT INTO spent_txids (txid, payment_id) VALUES (?, ?)").run(cleanTx, payment_id);
+      db.prepare("UPDATE pending_payments SET status = 'approved' WHERE id = ?").run(payment_id);
+      if (pay.purpose === "topup") {
+        const bal = walletCredit(pay.user_id, pay.amount_kobo, `topup ${payment_id} (${net} ${cleanTx.slice(0, 12)}…)`);
+        takeSnapshot("approve-topup-crypto");
+        return res.json({ ok: true, payment_id, status: "approved", verified: v, balance_kobo: bal });
+      }
+      const code = makeActivationCode();
+      const exp = new Date(Date.now() + SUB_TIERS[pay.tier].days * 864e5).toISOString();
+      db.prepare("INSERT INTO activation_codes (code, tier, status, user_id, expires_at) VALUES (?, ?, 'unused', NULL, ?)").run(code, pay.tier, exp);
+      takeSnapshot("approve-sub-crypto");
+      return res.json({ ok: true, payment_id, status: "approved", verified: v, activation_code: code, note: `${net.toUpperCase()} confirmed. Enter activation code in app to unlock ${pay.tier} until ${exp.slice(0, 10)}.` });
+    } catch (e) {
+      db.prepare("UPDATE pending_payments SET status = 'awaiting_review' WHERE id = ?").run(payment_id);
+      return res.json({ ok: false, payment_id, status: "awaiting_review", error: `auto-verify failed (${e.message}) — queued for manual review` });
+    }
+  }
+  db.prepare("UPDATE pending_payments SET status = 'awaiting_review' WHERE id = ?").run(payment_id);
+  res.json({ ok: true, payment_id, status: "awaiting_review", note: `Thanks ${sender_name || "you"} — passcode accepted, confirming shortly.` });
+});
+app.get("/billing/pending", requireAdmin, (_req, res) => {
+  // YOUR admin queue: review sender names / txids vs bank alerts, then approve.
+  res.json({ ok: true, pending: db.prepare("SELECT * FROM pending_payments WHERE status IN ('pending','awaiting_review') ORDER BY created_at DESC LIMIT 100").all() });
+});
+app.post("/billing/approve", requireAdmin, (req, res) => {
+  // YOU call this after confirming the bank alert / txid (same AUTH_TOKEN = admin).
+  // Subs return an ACTIVATION CODE (send it to the user); top-ups credit wallet directly.
+  const { payment_id } = req.body || {};
+  const pay = db.prepare("SELECT * FROM pending_payments WHERE id = ?").get(payment_id);
+  if (!pay || (pay.status !== "pending" && pay.status !== "awaiting_review")) return res.status(404).json({ error: "pending payment not found" });
+  db.prepare("UPDATE pending_payments SET status = 'approved' WHERE id = ?").run(payment_id);
+  if (pay.purpose === "topup") {
+    const bal = walletCredit(pay.user_id, pay.amount_kobo, `topup ${payment_id}`);
+    takeSnapshot("approve-topup");
+    return res.json({ ok: true, purpose: "topup", user_id: pay.user_id, balance_kobo: bal });
+  }
+  const code = makeActivationCode();
+  const exp = new Date(Date.now() + SUB_TIERS[pay.tier].days * 864e5).toISOString();
+  db.prepare("INSERT INTO activation_codes (code, tier, status, user_id, expires_at) VALUES (?, ?, 'unused', NULL, ?)").run(code, pay.tier, exp);
+  takeSnapshot("approve-sub");
+  res.json({ ok: true, purpose: "sub", user_id: pay.user_id, tier: pay.tier, activation_code: code, expires_at: exp });
+});
+app.post("/billing/mint", requireAdmin, (req, res) => {
+  // Admin: mint free-trial passcodes (e.g. 3-day Creator) for testers.
+  // They redeem in-app via /billing/redeem; each code is single-use with expiry.
+  const { tier, days, count } = req.body || {};
+  if (!SUB_TIERS[tier] || tier === "owner") return res.status(400).json({ error: "valid tier required" });
+  const n = Math.min(Math.max(Number(count) || 1, 1), 100);
+  const d = Math.min(Math.max(Number(days) || 3, 1), 30);
+  const codes = [];
+  for (let i = 0; i < n; i++) {
+    const code = makeActivationCode();
+    const exp = new Date(Date.now() + d * 864e5).toISOString();
+    db.prepare("INSERT INTO activation_codes (code, tier, status, user_id, expires_at) VALUES (?, ?, 'unused', NULL, ?)").run(code, `${tier}`, exp);
+    codes.push({ code, tier, expires_at: exp });
+  }
+  res.json({ ok: true, codes });
+});
+app.post("/billing/redeem", requireAuth, limitNormal, (req, res) => {
+  // User enters activation code (or your MASTER_CODE) in-app -> tier unlocks.
+  const { code } = req.body || {};
+  const user_id = boundUser(req);
+  if (!code) return res.status(400).json({ error: "code required" });
+  const c = String(code).trim();
+  if (MASTER_CODE && MASTER_CODE.length >= 8) {    const a = Buffer.from(c), b = Buffer.from(MASTER_CODE);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      db.prepare("INSERT INTO subscriptions (user_id, tier, status, expires_at) VALUES (?, 'owner', 'active', ?) ON CONFLICT(user_id) DO UPDATE SET tier='owner', status='active', expires_at=?, updated_at=CURRENT_TIMESTAMP").run(user_id, "2999-01-01", "2999-01-01");
+      return res.json({ ok: true, tier: "owner", expires_at: "2999-01-01", note: "Owner mode: full potential, never expires." });
+    }
+  }
+  const row = db.prepare("SELECT * FROM activation_codes WHERE code = ?").get(c);
+  if (!row || row.status !== "unused") return res.status(400).json({ error: "invalid or used code" });
+  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
+    db.prepare("UPDATE activation_codes SET status = 'expired' WHERE code = ?").run(c);
+    return res.status(400).json({ error: "code expired — contact support for a fresh one" });
+  }
+  db.prepare("UPDATE activation_codes SET status = 'used', user_id = ? WHERE code = ?").run(user_id, c);
+  db.prepare("INSERT INTO subscriptions (user_id, tier, status, expires_at) VALUES (?, ?, 'active', ?) ON CONFLICT(user_id) DO UPDATE SET tier=?, status='active', expires_at=?, updated_at=CURRENT_TIMESTAMP").run(user_id, row.tier, row.expires_at, row.tier, row.expires_at);
+  res.json({ ok: true, tier: row.tier, expires_at: row.expires_at });
+});
+app.get("/billing/status", requireAuth, limitNormal, (req, res) => {
+  const user_id = boundUser(req);
+  const sub = db.prepare("SELECT tier, expires_at FROM subscriptions WHERE user_id = ?").get(user_id);
+  res.json({ ok: true, user_id, tier: activeTier(user_id), expires_at: sub?.expires_at || null, usage_today: getUsage(user_id), usage_month: monthUsage(user_id) });
+});
+function takeSnapshot(kind) {
+  const payload = JSON.stringify({
+    wallet_total_kobo: db.prepare("SELECT COALESCE(SUM(balance_kobo),0) AS s FROM wallet_accounts").get().s,
+    ledger_rows: db.prepare("SELECT COUNT(*) AS c FROM wallet_txns").get().c,
+    ledger_head: db.prepare("SELECT tx_hash FROM wallet_txns ORDER BY id DESC LIMIT 1").get()?.tx_hash || "GENESIS",
+    subs_active: db.prepare("SELECT COUNT(*) AS c FROM subscriptions WHERE status='active'").get().c,
+    pending: db.prepare("SELECT COUNT(*) AS c FROM pending_payments WHERE status IN ('pending','awaiting_review')").get().c,
+  });
+  const r = db.prepare("INSERT INTO snapshots (kind, payload) VALUES (?, ?)").run(kind, payload);
+  void backupNow(`snapshot-${kind}`); // off-site copy on every money event, fire-and-forget
+  return { id: r.lastInsertRowid, ...JSON.parse(payload) };
+}
+// Push a consistent DB copy to Supabase Storage (frit-latest.db + timestamped).
+// Never throws — backup must not break money flows.
+async function backupNow(reason = "manual") {
+  if (!HAS_REMOTE_BACKUP) return { ok: false, skipped: true };
+  try {
+    await supaBucket();
+    const tmp = `${DB_PATH}.backup-tmp`;
+    await db.backup(tmp);
+    const bytes = _readFileSync(tmp);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    for (const name of [`frit-latest.db`, `frit-${stamp}.db`]) {
+      const up = await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${name}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY,
+          "Content-Type": "application/octet-stream", "x-upsert": "true",
+        },
+        body: bytes,
+        signal: AbortSignal.timeout(120_000),
+      });
+      if (!up.ok) throw new Error(`upload ${name} HTTP ${up.status}`);
+    }
+    // Prune timestamped copies to the newest 7 (frit-latest.db always kept).
+    try {
+      const list = await (await fetch(`${SUPABASE_URL}/storage/v1/object/list/${SUPABASE_BUCKET}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ prefix: "frit-20", limit: 100 }),
+        signal: AbortSignal.timeout(20_000),
+      })).json();
+      const olds = (list || []).map(f => f.name).filter(n => n !== "frit-latest.db").sort().slice(0, -7);
+      for (const n of olds) {
+        await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${n}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY },
+          signal: AbortSignal.timeout(20_000),
+        }).catch(() => {});
+      }
+    } catch {}
+    try { (await import("fs")).unlinkSync(tmp); } catch {}
+    console.log(`[backup] pushed (${bytes.length} bytes, ${reason})`);
+    return { ok: true, bytes: bytes.length };
+  } catch (e) {
+    console.warn("[backup] push failed:", e.message);
+    return { ok: false, error: e.message };
+  }
+}
+setInterval(() => { void backupNow("hourly"); }, 60 * 60 * 1000).unref?.();
+app.post("/admin/snapshot", requireAdmin, (_req, res) => res.json({ ok: true, snapshot: takeSnapshot("manual") }));
+app.get("/admin/snapshots", requireAdmin, (_req, res) => {
+  res.json({ ok: true, snapshots: db.prepare("SELECT * FROM snapshots ORDER BY id DESC LIMIT 100").all() });
+});
+app.get("/admin/ledger/verify", requireAdmin, (_req, res) => {
+  const rows = db.prepare("SELECT id, user_id, amount_kobo, kind, note, created_at, prev_hash, tx_hash FROM wallet_txns ORDER BY id ASC LIMIT 5000").all();
+  let prev = "GENESIS";
+  for (const r of rows) {
+    if (r.prev_hash !== prev) return res.json({ ok: false, break_at: r.id, reason: "prev_hash mismatch — ledger was edited" });
+    const recomputed = crypto.createHash("sha256").update(`${r.prev_hash}|${r.user_id}|${r.amount_kobo}|${r.kind}|${r.note}|${r.created_at}`).digest("hex");
+    if (recomputed !== r.tx_hash) return res.json({ ok: false, break_at: r.id, reason: "tx_hash mismatch — row was edited" });
+    prev = r.tx_hash;
+  }
+  res.json({ ok: true, rows: rows.length, head: prev });
+});
+app.post("/admin/backup", requireAdmin, async (_req, res) => {
+  try {
+    const dir = DB_PATH.startsWith("/data") ? "/data/backups" : join(__dirname, "../backups");
+    _mkdirSync(dir, { recursive: true });
+    const file = join(dir, `frit-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.db`);
+    await db.backup(file);
+    const remote = await backupNow("manual");
+    res.json({ ok: true, file, remote });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+app.post("/admin/keys", requireAdmin, (req, res) => {
+  // Mint a per-user app key: binds ALL quota/wallet/tier actions to user_id.
+  // The app stores this key (not the master token) — spoofing ends here.
+  const { user_id, label } = req.body || {};
+  if (!user_id) return res.status(400).json({ error: "user_id required" });
+  const key = `frit_${crypto.randomBytes(24).toString("hex")}`;
+  db.prepare("INSERT INTO api_keys (key_hash, user_id, label) VALUES (?, ?, ?)").run(hashKey(key), String(user_id), String(label || ""));
+  res.json({ ok: true, user_id, api_key: key, note: "Shown once — store in the app's TokenStore." });
+});
+app.get("/admin/keys", requireAdmin, (_req, res) => {
+  res.json({ ok: true, keys: db.prepare("SELECT user_id, label, created_at FROM api_keys ORDER BY created_at DESC").all() });
+});
+app.get("/wallet/balance", requireAuth, limitNormal, (req, res) => {
+  const user_id = boundUser(req);
+  res.json({ ok: true, user_id, balance_kobo: walletBalance(user_id) });
+});
+app.post("/wallet/topup", requireAuth, limitNormal, async (req, res) => {
+  // Wallet funding uses the SAME rails as subs (bank passcode or crypto txid):
+  // creates a PENDING top-up order — approve credits the wallet, so users can
+  // never credit themselves. Same passcode/"I've paid" screen as subscriptions.
+  const { amount_kobo, method } = req.body || {};
+  const user_id = boundUser(req);
+  if (!Number.isInteger(Number(amount_kobo)) || Number(amount_kobo) < 10000) return res.status(400).json({ error: "integer amount_kobo (min ₦100) required" });
+  const id = `top_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+  const passcode = makePasscode();
+  db.prepare("INSERT INTO pending_payments (id, user_id, tier, amount_kobo, reference, purpose) VALUES (?, ?, 'free', ?, ?, 'topup')").run(id, user_id, Number(amount_kobo), passcode);
+  const m = String(method || "bank").toLowerCase();
+  const naira = (Number(amount_kobo) / 100).toLocaleString();
+  res.json({
+    ok: true, payment_id: id, amount_kobo: Number(amount_kobo), passcode, purpose: "wallet top-up (YOUR spending money — not a subscription)",
+    ...(m === "crypto"
+      ? { pay_to: { btc_address: BTC_ADDRESS, usdt_tron_address: USDT_TRON_ADDRESS }, instruction: `Send crypto equal to ~₦${naira} for YOUR wallet, then submit txid + passcode ${passcode}.` }
+      : { pay_to: { bank_name: PAY_BANK_NAME, account_number: PAY_ACCOUNT_NUMBER, account_name: PAY_ACCOUNT_NAME }, instruction: `Transfer ₦${naira} to YOUR wallet with narration ${passcode}, then enter passcode ${passcode} in "I've paid". Subscription and wallet are separate — this does not buy a tier.` }),
+  });
+});
+app.post("/wallet/spend", requireAuth, limitNormal, (req, res) => {
+  // Agent calls this when booking/paying for a service on user's behalf.
+  try {
+    const { amount_kobo, note } = req.body || {};
+    const user_id = boundUser(req);
+    if (!Number.isInteger(Number(amount_kobo))) return res.status(400).json({ error: "integer amount_kobo required" });
+    res.json({ ok: true, balance_kobo: walletSpend(user_id, Number(amount_kobo), String(note || "agent spend").slice(0, 200)) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+app.get("/creative/jobs", requireAuth, limitNormal, (req, res) => {
+  const user_id = boundUser(req);
+  res.json({ ok: true, jobs: db.prepare("SELECT id, kind, status, prompt, substr(result_url,1,200) AS draft_head, created_at FROM creative_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(user_id) });
+});
+app.post("/creative/ground", requireAuth, limitNormal, async (req, res) => {
+  try {
+    const { brief, prompt } = req.body || {};
+    if (!brief && !prompt) return res.status(400).json({ error: "brief required" });
+    res.json({ ok: true, grounding: await groundScene(brief || prompt) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+// Trial feedback: testers on trial codes tell us what broke (rating 1-5 + text).
+app.post("/feedback", requireAuth, limitNormal, (req, res) => {
+  const { message, rating } = req.body || {};
+  const user_id = boundUser(req);
+  if (!message) return res.status(400).json({ error: "message required" });
+  const tier = activeTier(String(user_id));
+  const r = db.prepare("INSERT INTO feedback (user_id, tier, rating, message) VALUES (?, ?, ?, ?)").run(String(user_id), tier, Number(rating) || null, String(message).slice(0, 2000));
+  res.json({ ok: true, id: r.lastInsertRowid });
+});
+app.get("/feedback", requireAdmin, (_req, res) => {
+  res.json({ ok: true, feedback: db.prepare("SELECT * FROM feedback ORDER BY created_at DESC LIMIT 200").all() });
+});
+const LEGAL_PAGES = { terms: "TERMS.md", privacy: "PRIVACY.md", refunds: "REFUNDS.md" };
+app.get("/legal/:page", (req, res) => {
+  const file = LEGAL_PAGES[String(req.params.page || "").toLowerCase()];
+  if (!file) return res.status(404).send("unknown legal page");
+  try {
+    const md = readFileSync(join(__dirname, "../../docs", file), "utf8");
+    const html = md
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/^### (.*)$/gm, "<h3>$1</h3>").replace(/^## (.*)$/gm, "<h2>$1</h2>").replace(/^# (.*)$/gm, "<h1>$1</h1>")
+      .replace(/^\- (.*)$/gm, "<li>$1</li>").replace(/\n/g, "<br>");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<html><body style="font-family:sans-serif;max-width:720px;margin:2em auto;padding:0 1em">${html}</body></html>`);
+  } catch (e) {
+    res.status(500).send("legal page unavailable");
+  }
+});
+
 // ==================== WEB SEARCH ====================
 // /tools/search — raw web-search endpoint used by the agent brain (search_web tool)
 // and by any client that wants real-time info without going through the LLM.
-app.post("/tools/search", requireAuth, async (req, res) => {
+app.post("/tools/search", requireAuth, limitNormal, async (req, res) => {
   const { query, mode = "text" } = req.body || {};
   if (!query) return res.status(400).json({ error: "query required" });
   try {
@@ -2283,15 +3527,17 @@ app.use((err, _req, res, _next) => {
 // ====== START ======
 app.listen(PORT, () => {
   console.log(`
-FRIT - engine.js Trading Engine & Mistral AI Orchestrator
+FRIT - engine.js Trading Engine & OpenRouter AI Orchestrator
 Port : ${String(PORT).padEnd(5)}
 Single trading engine (server/src/strategy/engine.js):
  - 30M primary + 4H confirmation (EMA 9/21 + RSI + DI, ADX percentile gate)
  - News filter (FF calendar — 30 min advisory)
  - Multi-timeframe confirmation (4H trend regime)
-Single Mistral ecosystem:
- - Mistral Medium — chat + agentic + vision
- - Voxtral Mini — STT
+Single OpenRouter gateway:
+ - GLM-5.3-Flash — chat + agentic + tools + coding (primary)
+ - gpt-oss-20b — fast/verify/router
+ - whisper-large-v3 — STT (accuracy pick)
+ - gemini-2.5-flash-image — image gen
 Infrastructure:
  - Lot size engine (per-pair pip math)
  - MT5 bridge (live) or paper mode
