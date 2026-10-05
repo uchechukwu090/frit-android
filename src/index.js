@@ -132,6 +132,17 @@ db.exec(`
     label TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS withdrawals (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    amount_kobo INTEGER,
+    bank_name TEXT,
+    account_number TEXT,
+    account_name TEXT,
+    status TEXT DEFAULT 'pending',
+    admin_note TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
   CREATE TABLE IF NOT EXISTS pending_payments (
     id TEXT PRIMARY KEY,
     user_id TEXT,
@@ -227,13 +238,25 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const HAS_OR = !!OPENROUTER_API_KEY;
 const OR_PRIMARY = process.env.OR_PRIMARY_MODEL || "z-ai/glm-5.3-flash";
 const OR_FAST = process.env.OR_FAST_MODEL || "openai/gpt-oss-20b";
-const OR_DRAFT = process.env.OR_DRAFT_MODEL || "qwen/qwen3-30b-a3b-2507";
-const OR_IMAGE_MODEL = process.env.OR_IMAGE_MODEL || "google/gemini-2.5-flash-image";
+const OR_DRAFT = process.env.OR_DRAFT_MODEL || "deepseek/deepseek-v4-flash";
+const OR_IMAGE_MODEL = process.env.OR_IMAGE_MODEL || "bytedance-seed/seedream-5-0-flash";
 const OR_STT_MODEL = process.env.OR_STT_MODEL || "openai/whisper-large-v3";
+// Graphic-design specialists (on demand, both currently FREE via NovitaAI):
+// design = text-to-image with legible text (prompt only — NO refs, NO aspect ratio, rejected otherwise);
+// layer = decomposes ONE flat design image into RGBA layers (needs exactly 1 input_reference + layer plan).
+const OR_DESIGN_MODEL = process.env.OR_DESIGN_MODEL || "inclusionai/ming-image-0.1-design";
+const OR_LAYER_MODEL = process.env.OR_LAYER_MODEL || "inclusionai/ming-image-0.1-design-layer";
 const OR_VIDEO_MODEL = process.env.OR_VIDEO_MODEL || "google/veo-3.1-lite"; // cheapest OpenRouter video-gen default (720p 4-8s)
 // Free-tier models (zero token cost, count against 1000/day quota):
 const OR_FREE_FAST = process.env.OR_FREE_FAST || "openai/gpt-oss-20b:free";
 const OR_FREE_DRAFT = process.env.OR_FREE_DRAFT || "qwen/qwen3-30b-a3b-2507:free";
+// Optional provider pinning: OpenRouter prices the SAME model differently per
+// provider (GLM Flash $0.15 default route vs $0.075 DeepInfra 50%-off vs
+// $0.08385 StreamLake 44%-off). Set OR_PROVIDER_ONLY=deepinfra (or comma list)
+// to lock cheap reliable endpoints; empty = auto-route (most reliable).
+// OR_PROVIDER_SORT=throughput|latency optionally reorders within the set.
+const OR_PROVIDER_ONLY = (process.env.OR_PROVIDER_ONLY || "").split(",").map(s => s.trim()).filter(Boolean);
+const OR_PROVIDER_SORT = process.env.OR_PROVIDER_SORT || "";
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ZEN_API_KEY = process.env.OPENCODE_ZEN_API_KEY || "";
@@ -627,6 +650,13 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
     : model;
 
   const body = { model: cleanModel, messages, temperature, max_tokens };
+  if (provider === "openrouter" && (OR_PROVIDER_ONLY.length || OR_PROVIDER_SORT)) {
+    body.provider = {
+      ...(OR_PROVIDER_ONLY.length ? { only: OR_PROVIDER_ONLY } : {}),
+      ...(OR_PROVIDER_SORT ? { sort: OR_PROVIDER_SORT } : {}),
+      allow_fallbacks: true,
+    };
+  }
   if (tools?.length) {
     body.tools = tools.map(t => ({
       type: "function",
@@ -1299,27 +1329,68 @@ async function mistralTranscribe(audio_base64, mime_type = "audio/webm") {
   return "";
 }
 
-// Image generation via OpenRouter Images API.
+// Image generation via OpenRouter Images API (default: Seedream 5.0 Flash).
 async function generateImage(prompt, opts = {}) {
   if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY missing");
-  const res = await fetch("https://openrouter.ai/api/v1/images", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://frit.local",
-      "X-Title": "FRIT",
-    },
-    body: JSON.stringify({
-      model: OR_IMAGE_MODEL, // google/gemini-2.5-flash-image
-      prompt: String(prompt || ""),
-      ...(opts.aspect_ratio ? { aspect_ratio: opts.aspect_ratio } : {}),
-      ...(opts.n ? { n: opts.n } : {}),
-    }),
-  });
+  const model = opts.model || OR_IMAGE_MODEL;
+  const isMing = model.startsWith("inclusionai/ming");
+  // Ming models REJECT sizes/aspect ratios instead of reshaping — never send them.
+  const body = { model, prompt: String(prompt || "") };
+  if (!isMing) {
+    if (opts.aspect_ratio) body.aspect_ratio = opts.aspect_ratio;
+    body.n = opts.n || 1;
+  }
+  if (opts.output_format) body.output_format = opts.output_format;
+  if (opts.input_references?.length) body.input_references = opts.input_references;
+  let res;
+  try {
+    res = await fetch("https://openrouter.ai/api/v1/images", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://frit.local",
+        "X-Title": "FRIT",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch (e) {
+    throw new Error(`Image gen unreachable (${e.message}) — server network or OpenRouter down`);
+  }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error?.message || `Image gen HTTP ${res.status}`);
-  return data;
+  if (!res.ok) {
+    const msg = data?.error?.message || `Image gen HTTP ${res.status}`;
+    const hint = res.status === 402
+      ? " — image models need PAID OpenRouter credits (free 1000/day quota never covers /images). Top up at openrouter.ai/credits."
+      : res.status === 404
+        ? ` — model '${model}' not served on /images right now; check GET /api/v1/images/models.`
+        : "";
+    throw new Error(msg + hint);
+  }
+  // Normalize shapes: {data:[{b64_json|url}]} | {data:{...}} | {images:[...]}
+  const item = data?.data?.[0] || data?.data || data?.images?.[0] || {};
+  const out = {
+    ok: true,
+    model,
+    image_url: item.url || null,
+    image_b64: item.b64_json || item.b64Json || item.base64 || null,
+    media_type: item.media_type || null,
+  };
+  if (!out.image_url && !out.image_b64) {
+    // The API answered but carried no pixels — usually a moderation block or
+    // provider quirk. Never return "success with nothing".
+    throw new Error(`Image API returned no image (model '${model}'): ${JSON.stringify(data).slice(0, 300)}`);
+  }
+  return out;
+}
+// Design-layer decomposition: flat design -> editable RGBA layers (FREE).
+async function decomposeDesign(imageRef, prompt, opts = {}) {
+  return generateImage(prompt, {
+    model: opts.model || OR_LAYER_MODEL,
+    output_format: opts.output_format || "png",
+    input_references: [{ type: "image_url", image_url: { url: imageRef } }],
+  });
 }
 
 // BEFORE-MATH OF PRODUCTION: physical grounding pass for image/video prompts.
@@ -1369,7 +1440,7 @@ async function submitVideo(prompt, opts = {}) {
     signal: AbortSignal.timeout(60_000),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error?.message || `Video submit HTTP ${res.status}`);
+  if (!res.ok) throw new Error((data?.error?.message || `Video submit HTTP ${res.status}`) + (res.status === 402 ? " — video models need PAID OpenRouter credits (free quota never covers /videos). Top up at openrouter.ai/credits." : ""));
   return data; // { id, polling_url, status }
 }
 async function pollVideo(jobId) {
@@ -2140,7 +2211,7 @@ if (process.env.TRADE_TASKS === "true") {
 // they stay gated behind DEV_TOOLS_ENABLED=false on the client.
 const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data", "get_market_news",
   "analyze_market", "run_code", "wait_and_verify", "assert_text_visible", "get_frit_manual",
-  "delegate_subtasks", "generate_image", "generate_video", "create_content", "ground_scene"
+  "delegate_subtasks", "generate_image", "design_image", "decompose_design", "generate_video", "create_content", "ground_scene"
 ]);
 
 const AGENT_TOOLS = [
@@ -2187,6 +2258,7 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "search_web", description: "Deep web research spanning DuckDuckGo, Bing and Brave. Returns a real ranked result list (titles, URLs, snippets), NOT one abstract. Supports search-dorking operators: site:, intitle:, inurl:, filetype:, -keyword, \"exact phrase\". Call multiple times with refined queries for multi-angle research.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "get_weather", description: "Get current weather for a city.", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
   { type: "function", function: { name: "get_market_data", description: "Fetch live spot prices for one or more symbols (e.g. XAUUSD, BTCUSD).", parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
+  { type: "function", function: { name: "analyze_market", description: "Full multi-timeframe engine analysis for a symbol: direction, confidence, entry/SL/TP, regime. ALWAYS call this (not memory) before giving any trade opinion.", parameters: { type: "object", properties: { symbol: { type: "string" }, interval: { type: "string" }, balance: { type: "number" }, risk_percent: { type: "number" } }, required: ["symbol"] } } },
   { type: "function", function: { name: "get_market_news", description: "Fetch real-time financial, fundamental, and macroeconomic news for any trading symbol (XAUUSD, BTCUSD, Forex, Stocks) for the current date/year.", parameters: { type: "object", properties: { symbol: { type: "string" }, query: { type: "string" } } } } },
   { type: "function", function: { name: "place_mt5_trade", description: "Place a real market order on MetaTrader 5 via the phone's MT5 agent. Use this after market analysis confirms a high-confidence entry signal.", parameters: { type: "object", properties: { symbol: { type: "string" }, action: { type: "string", enum: ["BUY", "SELL"] }, volume: { type: "number" }, sl: { type: "number" }, tp: { type: "number" } }, required: ["symbol", "action", "volume"] } } },
   { type: "function", function: { name: "modify_mt5_order", description: "Modify SL/TP of an open MT5 position via guided on-device UI steps (Trade tab -> long-press -> Modify). If unsure about MT5 menu layout, call search_web first (e.g. 'MT5 android modify SL TP steps').", parameters: { type: "object", properties: { symbol: { type: "string" }, sl: { type: "number" }, tp: { type: "number" } }, required: ["symbol"] } } },
@@ -2197,7 +2269,9 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "assert_text_visible", description: "Verify that text is visible on the last screen state.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
   { type: "function", function: { name: "get_frit_manual", description: "Get a full reference of every real tool FRIT has, grouped by category, plus how to use the phone's installed-apps list correctly. Call this only if you're unsure what capabilities you have — don't call it for every task.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "delegate_subtasks", description: "Fan OUT independent subtasks to parallel OpenRouter subagents (GLM-5.3-Flash heavy, gpt-oss-20b speed, Qwen draft, zero extra agent turns). Use for: researching several angles at once, drafting + summarizing while you keep driving the phone, comparing options. Args: subtasks = [{task, kind}] where kind is lookup/extract/draft/summarize/research/analyze/code. Max 4 per call. Results come back merged in one response.", parameters: { type: "object", properties: { subtasks: { type: "array", items: { type: "object", properties: { task: { type: "string" }, kind: { type: "string" } }, required: ["task"] } } }, required: ["subtasks"] } } },
-  { type: "function", function: { name: "generate_image", description: "Generate an image via OpenRouter (google/gemini-2.5-flash-image). Use for logos, charts visuals, wallpapers, product shots. Returns image data.", parameters: { type: "object", properties: { prompt: { type: "string" }, aspect_ratio: { type: "string" }, n: { type: "number" } }, required: ["prompt"] } } },
+  { type: "function", function: { name: "generate_image", description: "Generate an image (default Seedream 5.0 Flash, cheap). ALWAYS ground_scene first for realistic scenes. Needs paid OpenRouter credits.", parameters: { type: "object", properties: { prompt: { type: "string" }, aspect_ratio: { type: "string" }, n: { type: "number" }, model: { type: "string" } }, required: ["prompt"] } } },
+  { type: "function", function: { name: "design_image", description: "Graphic-design generation (posters, UI, infographics, legible text) via Ming Design — FREE. Use when the user asks for design work, NOT photos.", parameters: { type: "object", properties: { prompt: { type: "string" }, output_format: { type: "string" } }, required: ["prompt"] } } },
+  { type: "function", function: { name: "decompose_design", description: "Decompose a FLAT design image into editable RGBA layers (background + foreground) via Ming Layer — FREE. Needs the image (base64 data URL or http URL) + a layer plan.", parameters: { type: "object", properties: { image: { type: "string" }, prompt: { type: "string" }, layer_plan: { type: "string" } }, required: ["image"] } } },
   { type: "function", function: { name: "generate_video", description: "Generate a short video clip via OpenRouter (veo-3.1-lite 720p 4-8s default). Async: returns job id + polling_url, poll then download. Use for creative content shots.", parameters: { type: "object", properties: { prompt: { type: "string" }, duration: { type: "number" }, aspect_ratio: { type: "string" }, resolution: { type: "string" }, model: { type: "string" } }, required: ["prompt"] } } },
   { type: "function", function: { name: "create_content", description: "Creative mode: turn a video brief/transcript into script + shot list (image/video prompts) + caption. Then call generate_image/generate_video per shot.", parameters: { type: "object", properties: { brief: { type: "string" }, transcript: { type: "string" } } } } },
   { type: "function", function: { name: "ground_scene", description: "Before-math: compute real-world sizes, relative scale, camera and depth order for a scene brief. Returns enriched prompt + negative prompt. ALWAYS call this before generate_image/generate_video for realistic scenes.", parameters: { type: "object", properties: { brief: { type: "string" }, prompt: { type: "string" } } } } },
@@ -2237,7 +2311,9 @@ async function runLocalTool(name, args = {}, agentState = null) {
     case "analyze_market": return { ok: true, data: await mtfStrategy.analyze(args.symbol, { interval: args.interval, balance: args.balance, riskPercent: args.risk_percent }) };
     case "run_code": return { ok: true, data: await runSandbox({ language: args.language, code: args.code, stdin: args.stdin || "", timeout_ms: args.timeout_ms || 15000 }) };
     case "get_frit_manual": return { ok: true, data: buildFritManual() };
-    case "generate_image": return { ok: true, data: await generateImage(args.prompt || "", { aspect_ratio: args.aspect_ratio, n: args.n }) };
+    case "generate_image": return { ok: true, data: await generateImage(args.prompt || "", { aspect_ratio: args.aspect_ratio, n: args.n, model: args.model }) };
+    case "design_image": return { ok: true, data: await generateImage(args.prompt || "", { model: OR_DESIGN_MODEL, output_format: args.output_format || "png" }) };
+    case "decompose_design": return { ok: true, data: await decomposeDesign(args.image || "", args.prompt || args.layer_plan || "decompose into background and foreground layers") };
     case "generate_video": return { ok: true, data: await submitVideo(args.prompt || "", { duration: args.duration, aspect_ratio: args.aspect_ratio, resolution: args.resolution, model: args.model }) };
     case "ground_scene": return { ok: true, data: await groundScene(args.brief || args.prompt || "") };
     case "create_content": {
@@ -2282,7 +2358,7 @@ async function runLocalTool(name, args = {}, agentState = null) {
 // GLM-5.3-Flash is heavy (DeepSWE 63.4, Toolathlon 78.4 — beats Qwen 235B).
 const SUBAGENT_POOL = [
   { slot: "speed", model: "openrouter:openai/gpt-oss-20b", kinds: ["lookup", "extract", "classify", "quick"] },
-  { slot: "draft", model: "openrouter:qwen/qwen3-30b-a3b-2507", kinds: ["draft", "summarize", "rewrite", "plan"] },
+  { slot: "draft", model: "openrouter:deepseek/deepseek-v4-flash", kinds: ["draft", "summarize", "rewrite", "plan"] },
   { slot: "heavy", model: "openrouter:z-ai/glm-5.3-flash", kinds: ["research", "compare", "analyze", "code"] },
 ];
 function pickSubagentModel(kind = "") {
@@ -2371,46 +2447,28 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     ? `\nNOTE — a previous attempt failed: ${lastFailure}. If you are retrying, use a DIFFERENT approach.`
     : "";
   return [
-    "You are FRIT, an autonomous Android AI Agent. You operate the phone exactly like a human: observing the screen, planning, acting, and verifying.",
-    "CRITICAL RULE: YOU MUST BE AGENTIC AND PERSISTENT.",
-    "",
-    "# FRIT Mobile Agent Execution Mindset:",
-    "- UI Asynchrony: Android UIs do not refresh instantly. After executing a structural tap or typing text, always assume an animation or network lag of 300-800ms.",
-    "- Flaky Element Matching: Resource IDs change between app updates, and text labels may contain leading/trailing whitespaces. Always use fuzzy substring matching if an exact match fails.",
-    "- Coordination Safety: Never issue raw coordinates (tap_coordinates) unless element-based text anchors (tap_button) are entirely absent from the structured screen dump. Bounding boxes shift based on device display scaling and DPI variations.",
-    "- Recovery: If an execution path blocks or fields are missing, do not hallucinate success. Tap go_back, re-examine the screen text structure, or call take_screenshot to confirm the visual layer.",
-    "",
-    "1. OBSERVE: Use 'read_screen' or 'read_screen_structured' to see what's on screen.",
-    "2. ANALYZE: If you don't see what you need, ANALYZE why. Maybe the app isn't open? Maybe you need to scroll?",
-    "3. ACT: Decide on ONE next step (tap, type, scroll, go_back, press_home).",
-    "4. VERIFY: Immediately call 'read_screen' again to see the result of your action. Did it work? If not, self-correct.",
+    "You are FRIT, an autonomous Android AI agent: observe the screen, plan, act, verify. Be agentic and persistent — finish the task completely, however many steps it takes.",
+    "UI rules: screens lag 300-800ms after taps; fuzzy-match labels (whitespace/renames); prefer tap_button over tap_coordinates; on blockage go_back, re-read, or screenshot — never hallucinate success.",
+    "Loop: OBSERVE (read_screen) → ANALYZE → ACT (one step) → VERIFY (read_screen again, self-correct).",
     "",
     "HARD RULES — VIOLATING THESE IS A FAILURE:",
-    "- NEVER write a fake action as plain text or a markdown code block (e.g. 'Action: ```python get_market_data(...)```'). That is not a real tool call and does NOTHING. If you need a tool, you MUST use the actual function-calling mechanism provided to you — never describe, narrate, or pretend to call a tool in prose.",
-    "- If you genuinely cannot call a tool (none fits), say so directly in one sentence. Do not paste code for the user to run manually as a substitute for calling 'run_code' yourself — you have 'run_code', use it.",
-    "- Only call DEVICE-CONTROL tools (open_app, tap, type, scroll, go_back, press_home) when the user's message clearly asks for a phone action. For greetings or small talk with no request in them, reply in plain conversational text with ZERO tool calls — do not invent a phone task out of a greeting like 'hi'.",
-    "- This restriction does NOT apply to server-side analysis/data tools (analyze_market, get_market_data, search_web, run_code, get_weather). If the user asks a question those tools can answer — e.g. 'what's your analysis on XAUUSD', 'search X', 'what's the weather' — CALL the relevant tool immediately. A question is still a request; don't treat 'they didn't say an imperative command' as a reason to skip the tool and answer from memory instead.",
-    "- For 'open_app': the 'app_name' argument must be ONLY the literal app name (e.g. 'WhatsApp', 'Messenger') — never a sentence, instruction, or task description. Open the app first, THEN use separate tool calls (read_screen, tap, type) to carry out the actual task once it's open.",
-    "- SETTINGS TOGGLES (bluetooth/wifi/data/airplane/location/battery): step 1 call 'execute_local_action' (e.g. 'open bluetooth') — it lands directly on the right page. Step 2 'read_screen', then 'tap_button' the toggle. Step 3 'read_screen' to confirm it flipped. Step 4 call 'return_to_frit'. Never navigate Settings menus manually.",
-    "- DIVISION OF LABOR: the phone's local engine owns launching apps and system shortcuts (open_app, execute_local_action). You own analysis, decisions, and every tap/type INSIDE an app. Never navigate to an app manually; launch it, then act on the screen text the launch returns.",
-    "- If the device state below lists 'Installed apps', ONLY target names from that list with open_app — do not guess an app exists if it isn't listed. If it's not there, tell the user instead of trying anyway.",
-    "- UNFAMILIAR APP UI (Opay, Facebook, MT5, any app you haven't driven in THIS session): BEFORE tapping blindly, spend ONE 'search_web' call on the exact flow — e.g. 'Opay Android app how to transfer money steps 2026', 'Facebook Android app create post steps'. Combine that walkthrough with the live screen text and NEVER second-guess: screen text always wins over the article when they disagree. Skip the search only for apps/flows you already completed successfully in this session.",
-    "- PARALLELIZE with 'delegate_subtasks': independent research angles, per-option comparisons, or draft-while-you-drive work goes there (up to 4 at once across OpenRouter speed/draft/heavy slots) instead of burning sequential agent turns.",
-    "- PAST FEEDBACK IS BINDING: user memory may contain 'feedback_negative: task=[...] bad_reply=[...]'. If the current goal matches such a task, you MUST use a different approach than the recorded bad reply — repeating it is a failure. 'feedback_positive' entries mark the approach to reuse.",
-    "- You only have the tools explicitly provided to you in this request (open_app, read_screen, tap_button, type_text, run_code, search_web, get_market_data, analyze_market, send_whatsapp, make_call, etc.). Never assume a capability exists beyond that list — e.g. there is no generic 'send_message' or 'call_contact' tool, use the exact tool names you were given.",
+    "- Real function calls only — never narrate, describe, or paste fake tool calls/code blocks. If no tool fits, say so in one sentence.",
+    "- Greetings/small talk: plain text, ZERO tool calls. But questions answerable by server tools (analysis, search, weather, prices) MUST call the tool immediately — never answer from memory.",
+    "- open_app app_name = literal app name only ('WhatsApp'), then separate read/tap/type calls once open.",
+    "- Settings toggles: execute_local_action first, then read_screen → tap → verify → return_to_frit. Never hand-navigate Settings menus.",
+    "- Division of labor: the phone launches apps; you decide and tap/type inside them.",
+    "- open_app targets must come from the Installed apps list — never guess.",
+    "- Unfamiliar app UI: spend ONE search_web on the exact flow first (screen text wins on conflict); skip only for flows done this session.",
+    "- Parallelize independent research via delegate_subtasks (max 4) instead of sequential turns.",
+    "- Past feedback entries are binding: never repeat a recorded bad reply; reuse recorded good approaches.",
+    "- Only listed tools exist — use exact tool names, never invented ones.",
     "",
-    "TIPS FOR FULL AUTONOMY:",
-    "- CHOOSE THE RIGHT TOOL: match the problem to the cheapest correct tool. Code/webpages/files/charts/math/backtesting → 'run_code' (server-side sandbox). Facts/news/research → 'search_web'. Weather → 'get_weather'. Market prices/analysis → 'get_market_data'/'analyze_market'. Phone app control → device tools (open_app, tap, type).",
-    "- NEVER write or run code on the phone. Do not open IDE apps (PyCharm, etc.) on the device to build code — the phone is only for UI actions on OTHER apps. Code always goes through 'run_code' on the server, and any file it produces is returned to the user automatically.",
-    "- If the user asks for something that can be DONE server-side (a webpage, a chart, a report, a calculation, a search), do it with the server-side tool — never invent a phone workflow for it.",
-    "- To open any app: If not visible, press_home -> click search bar or use 'open_app'.",
-    "- To find a specific button: Use 'read_screen_structured' to get exact coordinates if text-matching fails.",
-    "- If a tool fails: Don't give up. Try a different approach (e.g., tap_coordinates instead of tap_button).",
-    "- Run Code: Use 'run_code' for complex logic, math, or data processing. Don't guess calculations.",
-    "- Browse: Use 'search_web' to find information.",
-    "- Market/trading news & fundamentals: ALWAYS call 'get_market_news' or 'search_web' to retrieve current live 2025/2026 market news. NEVER cite outdated news from 2024 or earlier memory!",
-     "- Market/trading tasks: analysis happens HERE on the server, NOT on the phone. Actually CALL the 'analyze_market' or 'get_market_data' tool (a real function call) and read the returned direction/entry/SL/TP — do not narrate calling it. Only use the phone (open_app MetaTrader5, tap, type) to EXECUTE an order after the analysis is complete.",
-     "- TRADING NUMBERS DISCIPLINE: report the engine's decision/entry_zone/scenario/pullback_health fields VERBATIM. NEVER invent MACD, Bollinger, ADX/DI, or session values the tools did not return — if you want an indicator the engine lacks, compute it with run_code from real candles, never from memory. When decision is WAIT_PULLBACK, present ONLY the pullback-zone entry (limit-style); never substitute a market entry. When a healthy pullback exists, scenario_2 IS the trade — scenario_1 immediates apply only when the engine is aligned. When decision is WAIT_RANGE, present ONLY the range-edge fade (limit at the proven edge toward midline, invalidation on close beyond the edge); never market-enter mid-range, never flip to breakout-chasing. Every setup carries a costs block (net RR after spread/commission/slippage) — if net RR < 1.0 the setup was already suppressed; if costs are WEAK, say so and size down.",
+    "TOOL CHOICE (cheapest correct tool wins):",
+    "- Code/files/charts/math → run_code (server sandbox — never on the phone, never paste code for the user). Facts/news → search_web. Weather → get_weather. Markets → get_market_data/analyze_market. Phone UI → device tools.",
+    "- Tool failed? Retry differently (tap_coordinates for tap_button, scroll then retry).",
+    "- Market news: live get_market_news/search_web only — never memory, never old years.",
+    "- Trading analysis happens HERE via a real analyze_market call — read direction/entry/SL/TP from its reply; the phone only EXECUTES orders after analysis.",
+    "- TRADING NUMBERS DISCIPLINE: report the engine's decision/entry_zone/scenario/pullback_health fields VERBATIM. NEVER invent MACD, Bollinger, ADX/DI, or session values the tools did not return — if you want an indicator the engine lacks, compute it with run_code from real candles, never from memory. When decision is WAIT_PULLBACK, present ONLY the pullback-zone entry (limit-style); never substitute a market entry. When a healthy pullback exists, scenario_2 IS the trade — scenario_1 immediates apply only when the engine is aligned. When decision is WAIT_RANGE, present ONLY the range-edge fade (limit at the proven edge toward midline, invalidation on close beyond); never market-enter mid-range. Every setup carries a costs block (net RR after spread/commission/slippage) — if costs are WEAK, say so and size down.",
     "",
     "PHONE UI SKILL — field-tested patterns for operating any app accurately (loaded from server/skills/phone-ui.md — edit that file to teach new patterns):",
     PHONE_UI_SKILL,
@@ -2525,11 +2583,12 @@ app.get("/", (_req, res) => {
       screen: ["/screen/frame", "/screen/analyze-frame", "/screen/status"],
       transcribe: ["/transcribe"],
       tools: ["/tools/search"],
-      images: ["/images/generate"],
+      images: ["/images/generate", "/images/decompose"],
       video: ["/videos/submit", "/videos/status/:jobId", "/videos/content/:jobId"],
       creative: ["/creative/compose", "/creative/revise", "/creative/assemble", "/creative/ground", "/creative/jobs"],
-      billing: ["/billing/tiers", "/billing/pay-info", "/billing/subscribe", "/billing/submit-reference", "/billing/pending", "/billing/approve", "/billing/redeem", "/billing/status"],
-      wallet: ["/wallet/balance", "/wallet/topup", "/wallet/spend"],
+      billing: ["/billing/tiers", "/billing/pay-info", "/billing/subscribe", "/billing/submit-reference", "/billing/pending", "/billing/approve", "/billing/mint", "/billing/redeem", "/billing/status"],
+      wallet: ["/wallet/balance", "/wallet/topup", "/wallet/spend", "/wallet/withdraw", "/wallet/withdrawals"],
+      admin: ["/admin/inbox", "/admin/keys", "/admin/snapshot", "/admin/ledger/verify", "/admin/backup", "/admin/withdrawals/approve"],
       models: ["/models/free-health"],
     utility: ["/weather"],
     sandbox: ["/sandbox/run"],
@@ -2911,16 +2970,27 @@ app.post("/transcribe", requireAuth, limitCostly, async (req, res) => {
 
 app.post("/images/generate", requireAuth, limitCostly, async (req, res) => {
   try {
-    const { prompt, aspect_ratio, n } = req.body || {};
+    const { prompt, aspect_ratio, n, model } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt required" });
     const uid = boundUser(req);
     const cap = checkCap(uid, "image");
     if (!cap.ok) return res.status(402).json({ error: cap.message });
-    const data = await generateImage(prompt, { aspect_ratio, n });
+    const data = await generateImage(prompt, { aspect_ratio, n, model });
     db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
-    res.json({ ok: true, model: OR_IMAGE_MODEL, ...data });
+    res.json({ ok: true, model: model || OR_IMAGE_MODEL, ...data });
   } catch (err) {
     console.error("[/images/generate]", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.post("/images/decompose", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { image, prompt, layer_plan } = req.body || {};
+    if (!image) return res.status(400).json({ error: "image (base64 data URL or http URL) required" });
+    const data = await decomposeDesign(image, prompt || layer_plan || "decompose into background and foreground layers");
+    res.json({ ok: true, model: OR_LAYER_MODEL, ...data });
+  } catch (err) {
+    console.error("[/images/decompose]", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -2976,6 +3046,10 @@ app.post("/videos/submit", requireAuth, limitCostly, async (req, res) => {
 app.get("/videos/status/:jobId", requireAuth, limitNormal, async (req, res) => {
   try {
     const data = await pollVideo(req.params.jobId);
+    const st = data?.data?.status || data?.status;
+    if (st === "failed" || st === "cancelled" || st === "expired") {
+      return res.status(500).json({ ok: false, status: st, error: data?.data?.error || data?.error || `video job ${st} — resubmit (failed generations are not billed)` });
+    }
     res.json({ ok: true, ...data });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -2985,7 +3059,14 @@ app.get("/videos/content/:jobId", requireAuth, limitNormal, async (req, res) => 
   try {
     const jobId = String(req.params.jobId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
     if (!jobId) return res.status(400).json({ error: "bad job id" });
+    // Never hand back an empty/partial file: confirm completion first.
+    const poll = await pollVideo(jobId).catch(() => null);
+    const st = poll?.data?.status || poll?.status;
+    if (poll && st && st !== "completed") {
+      return res.status(409).json({ ok: false, status: st, error: `video not ready (status: ${st}) — poll /videos/status until completed` });
+    }
     const buf = await downloadVideo(jobId, Number(req.query.index || 0));
+    if (!buf?.length) return res.status(500).json({ ok: false, error: "video download came back empty — retry shortly" });
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${jobId}.mp4"`);
     res.send(buf);
@@ -3091,10 +3172,12 @@ app.post("/creative/assemble", requireAuth, limitCostly, async (req, res) => {
 // Two rails, zero API keys:
 // A) Bank transfer: subscribe -> PENDING order + auto passcode -> user pays with
 //    passcode as narration -> "I've paid" + passcode -> you approve -> tier+expiry.
-// B) Crypto on BNB Smart Chain (your Binance deposits): USDT or BTCB to ONE
+// B) Crypto on BNB Smart Chain (your Binance deposits): USDT or BTC to ONE
 //    BSC_ADDRESS -> user submits txhash -> auto-verified keyless via BSC public
-//    RPC (>=12 confirmations, txhash single-use). Native BTC (bc1…) also works
-//    via mempool.space IF you later add a native BTC_ADDRESS.
+//    RPC (>=12 confirmations, txhash single-use). User-facing name is always
+//    "BTC" (their Binance shows BTC); internally it's the BTCB contract.
+//    Native BTC (bc1…) also works via mempool.space IF you later add a native
+//    BTC_ADDRESS (network "btc-native").
 // Upgrade path later: BTCPay Server (self-hosted, no per-tx key) or
 // Paystack/Flutterwave webhooks — same tables.
 app.get("/billing/tiers", requireAuth, async (_req, res) => {
@@ -3109,10 +3192,8 @@ app.get("/billing/pay-info", requireAuth, async (_req, res) => {
     bank: { bank_name: PAY_BANK_NAME || "(set PAY_BANK_NAME)", account_number: PAY_ACCOUNT_NUMBER || "(set PAY_ACCOUNT_NUMBER)", account_name: PAY_ACCOUNT_NAME || "(set PAY_ACCOUNT_NAME)" },
     crypto: {
       bsc_address: BSC_ADDRESS || "(set BSC_ADDRESS)",
-      assets: ["USDT (BEP20)", "BTCB = BTC on BNB Smart Chain (BEP20)"],
-      native_btc_address: BTC_ADDRESS || "(optional — set BTC_ADDRESS for native bc1… deposits)",
-      usdt_tron_address: USDT_TRON_ADDRESS || "(manual approve only)",
-      note: "USDT + BTCB auto-verify on txhash submit (12+ confirmations). Send ONLY on BNB Smart Chain — other networks will lose funds.",
+      assets: ["USDT (BNB Smart Chain)", "BTC (BNB Smart Chain)"],
+      note: "USDT + BTC auto-verify on txhash submit (12+ confirmations). Send ONLY on BNB Smart Chain — other networks will lose funds.",
     },
     tiers: { creator_naira: Math.round(10 * rate), pro_naira: Math.round(26 * rate) },
     two_pots: {
@@ -3136,7 +3217,7 @@ app.post("/billing/subscribe", requireAuth, limitNormal, async (req, res) => {
   res.json({
     ok: true, payment_id: id, tier, amount_kobo, usd_ngn: rate, passcode,
     ...(m === "crypto"
-      ? { pay_to: { bsc_address: BSC_ADDRESS, assets: ["USDT (BEP20)", "BTCB (BEP20)"] }, instruction: `Send USDT or BTCB on BNB Smart Chain equal to ~₦${naira} to ${BSC_ADDRESS}, then submit txhash + this passcode: ${passcode}.` }
+      ? { pay_to: { bsc_address: BSC_ADDRESS, assets: ["USDT (BNB Smart Chain)", "BTC (BNB Smart Chain)"] }, instruction: `Send USDT or BTC on BNB Smart Chain equal to ~₦${naira} to ${BSC_ADDRESS}, then submit txhash + this passcode: ${passcode}.` }
       : { pay_to: { bank_name: PAY_BANK_NAME, account_number: PAY_ACCOUNT_NUMBER, account_name: PAY_ACCOUNT_NAME }, instruction: `Transfer ₦${naira} with narration ${passcode}, then enter passcode ${passcode} in "I've paid".` }),
   });
 });
@@ -3154,11 +3235,11 @@ app.post("/billing/submit-reference", requireAuth, limitNormal, async (req, res)
     return res.status(400).json({ error: "wrong passcode — check the code from subscribe" });
   }
   _rl.delete(atk);
-  // Crypto rail (keyless): network = "usdt" | "btcb" (BSC public RPC, 12+ confs)
-  // or "btc" (native Bitcoin via mempool.space, needs BTC_ADDRESS set).
+  // Crypto rail (keyless): network = "usdt" | "btc" (both on BSC, 12+ confs)
+  // or "btc-native" (native Bitcoin via mempool.space, needs BTC_ADDRESS set).
   // Each txhash works exactly once (spent_txids).
   const net = String(network || (txid ? "usdt" : "")).toLowerCase();
-  if (txid && ["usdt", "btcb", "btc"].includes(net)) {
+  if (txid && ["usdt", "btc", "btc-native"].includes(net)) {
     try {
       const cleanTx = String(txid).trim();
       if (db.prepare("SELECT txid FROM spent_txids WHERE txid = ?").get(cleanTx)) {
@@ -3167,8 +3248,8 @@ app.post("/billing/submit-reference", requireAuth, limitNormal, async (req, res)
       const rate = await ngnPerUsd();
       const usd = pay.amount_kobo / 100 / rate; // same live FX as the order quote
       let v;
-      if (net === "btc") {
-        if (!BTC_ADDRESS) throw new Error("native BTC deposits not configured — pay USDT/BTCB on BSC instead");
+      if (net === "btc-native") {
+        if (!BTC_ADDRESS) throw new Error("native BTC deposits not configured — pay USDT/BTC on BNB Smart Chain instead");
         const price = await btcPriceUSD();
         v = await verifyBtcTx(cleanTx, Math.round((usd / price) * 1e8));
         if (!v.confirmed) {
@@ -3176,9 +3257,11 @@ app.post("/billing/submit-reference", requireAuth, limitNormal, async (req, res)
           return res.json({ ok: false, payment_id, status: "awaiting_review", error: "tx seen but unconfirmed — auto-approves after 1 confirmation, or manual review" });
         }
       } else {
-        const token = BSC_TOKENS[net];
-        const unitPrice = net === "usdt" ? 1 : await btcPriceUSD();
-        v = await verifyBscTx(cleanTx, net, (usd / unitPrice) * (10 ** token.decimals));
+        // "btc" = your Binance BTC-on-BSC (BTCB contract under the hood).
+        const asset = net === "btc" ? "btcb" : "usdt";
+        const token = BSC_TOKENS[asset];
+        const unitPrice = asset === "usdt" ? 1 : await btcPriceUSD();
+        v = await verifyBscTx(cleanTx, asset, (usd / unitPrice) * (10 ** token.decimals));
         if (!v.confirmed) {
           db.prepare("UPDATE pending_payments SET status = 'awaiting_review' WHERE id = ?").run(payment_id);
           return res.json({ ok: false, payment_id, status: "awaiting_review", error: `tx seen (${v.confirmations}/12 confirmations) — auto-approves at 12, or manual review` });
@@ -3401,6 +3484,57 @@ app.post("/wallet/spend", requireAuth, limitNormal, (req, res) => {
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
+});
+// Withdrawal: user sends THEIR bank details, creator pays manually from the
+// receiving account and marks paid. No auto-send exists (manual transfer).
+app.post("/wallet/withdraw", requireAuth, limitNormal, (req, res) => {
+  const { bank_name, account_number, account_name, amount_kobo } = req.body || {};
+  const user_id = boundUser(req);
+  const amt = Number(amount_kobo);
+  if (!bank_name || !account_number || !account_name) return res.status(400).json({ error: "bank_name, account_number and account_name required" });
+  if (!Number.isInteger(amt) || amt < 50000) return res.status(400).json({ error: "minimum withdrawal is ₦500" });
+  if (walletBalance(user_id) < amt) return res.status(400).json({ error: "insufficient wallet balance" });
+  const id = `wd_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+  db.prepare("INSERT INTO withdrawals (id, user_id, amount_kobo, bank_name, account_number, account_name) VALUES (?, ?, ?, ?, ?, ?)").run(
+    id, user_id, amt, String(bank_name).slice(0, 60), String(account_number).slice(0, 20), String(account_name).slice(0, 80));
+  res.json({ ok: true, withdrawal_id: id, status: "pending", note: "Request sent. The creator pays manually and marks it paid — usually within 24h." });
+});
+app.get("/wallet/withdrawals", requireAuth, limitNormal, (req, res) => {
+  const user_id = boundUser(req);
+  res.json({ ok: true, withdrawals: db.prepare("SELECT id, amount_kobo, bank_name, account_number, account_name, status, admin_note, created_at FROM withdrawals WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(user_id) });
+});
+// Creator inbox: ONE poll for everything needing your eyes — payments,
+// withdrawals, trial feedback. The creator app polls this and notifies.
+app.get("/admin/inbox", requireAdmin, (_req, res) => {
+  res.json({
+    ok: true,
+    payments: db.prepare("SELECT id, user_id, tier, amount_kobo, reference, purpose, status, created_at FROM pending_payments WHERE status IN ('pending','awaiting_review') ORDER BY created_at DESC LIMIT 100").all(),
+    withdrawals: db.prepare("SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY created_at DESC LIMIT 100").all(),
+    feedback_unread: db.prepare("SELECT COUNT(*) AS c FROM feedback").get().c,
+    latest_feedback: db.prepare("SELECT * FROM feedback ORDER BY id DESC LIMIT 5").all(),
+  });
+});
+app.post("/admin/withdrawals/approve", requireAdmin, (req, res) => {
+  // Call AFTER you send the money from your bank app. Debits the wallet now
+  // (not at request time) so failed/duplicate approvals can't double-spend.
+  const { id, admin_note } = req.body || {};
+  const w = db.prepare("SELECT * FROM withdrawals WHERE id = ?").get(id);
+  if (!w || w.status !== "pending") return res.status(404).json({ error: "pending withdrawal not found" });
+  try {
+    walletSpend(w.user_id, w.amount_kobo, `withdrawal ${id} paid to ${w.bank_name} ${w.account_number}`);
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: `cannot debit: ${e.message}` });
+  }
+  db.prepare("UPDATE withdrawals SET status = 'paid', admin_note = ? WHERE id = ?").run(String(admin_note || "").slice(0, 200), id);
+  takeSnapshot("withdrawal-paid");
+  res.json({ ok: true, id, status: "paid" });
+});
+app.post("/admin/withdrawals/decline", requireAdmin, (req, res) => {
+  const { id, admin_note } = req.body || {};
+  const w = db.prepare("SELECT * FROM withdrawals WHERE id = ?").get(id);
+  if (!w || w.status !== "pending") return res.status(404).json({ error: "pending withdrawal not found" });
+  db.prepare("UPDATE withdrawals SET status = 'declined', admin_note = ? WHERE id = ?").run(String(admin_note || "").slice(0, 200), id);
+  res.json({ ok: true, id, status: "declined" });
 });
 app.get("/creative/jobs", requireAuth, limitNormal, (req, res) => {
   const user_id = boundUser(req);
