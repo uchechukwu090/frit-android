@@ -1,0 +1,5 @@
+[skills] phone-ui.md not loaded: ENOENT: no such file or directory, open 'C:\Users\User\Documents\codes and apps\FRIT_All_In_One_Integrated_Build\server\src\skills\phone-ui.md'
+[backup] push failed: request to https://chaquyxfmhobzvtwemhn.supabase.co/storage/v1/object/frit-backups/frit-latest.db failed, reason: getaddrinfo ENOTFOUND chaquyxfmhobzvtwemhn.supabase.co
+[free] refresh failed, keeping defaults: request to https://openrouter.ai/api/v1/models failed, reason: getaddrinfo ENOTFOUND openrouter.ai
+[backup] push failed: request to https://chaquyxfmhobzvtwemhn.supabase.co/storage/v1/object/frit-backups/frit-latest.db failed, reason: getaddrinfo ENOTFOUND chaquyxfmhobzvtwemhn.supabase.co
+[backup] push failed: request to https://chaquyxfmhobzvtwemhn.supabase.co/storage/v1/object/frit-backups/frit-latest.db failed, reason: getaddrinfo ENOTFOUND chaquyxfmhobzvtwemhn.supabase.co

@@ -11,12 +11,18 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { MTFStrategyEngine } from "./strategy/engine.js";
+import { LiveFeed } from "./strategy/feed/live_feed.js";
 import { TradeTaskScheduler } from "./strategy/scheduler.js";
 import { PositionMonitor } from "./strategy/position_monitor.js";
 import { PullbackJournal } from "./strategy/journal.js";
 import { PortfolioRisk } from "./strategy/risk.js";
 import { getSymbolCost, costToUsd } from "./strategy/costs.js";
 import { deepSearch } from "./deep_search.js";
+import * as imageProcessor from "./creative/imageProcessor.js";
+import * as aiFeatures from "./creative/aiFeatures.js";
+import * as promptEngine from "./creative/promptEngine.js";
+import * as videoProcessor from "./creative/videoProcessor.js";
+import * as templateLibrary from "./creative/templateLibrary.js";
 
 dotenv.config();
 
@@ -192,6 +198,150 @@ db.exec(`
     message TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS creative_projects (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    name TEXT,
+    type TEXT DEFAULT 'image',
+    status TEXT DEFAULT 'draft',
+    thumbnail_url TEXT,
+    metadata TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS creative_assets (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    user_id TEXT,
+    kind TEXT,
+    source TEXT,
+    original_url TEXT,
+    current_url TEXT,
+    thumbnail_url TEXT,
+    metadata TEXT,
+    version INTEGER DEFAULT 1,
+    parent_asset_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES creative_projects(id)
+  );
+  CREATE TABLE IF NOT EXISTS creative_edits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT,
+    user_id TEXT,
+    operation TEXT,
+    params TEXT,
+    result_url TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(asset_id) REFERENCES creative_assets(id)
+  );
+  CREATE TABLE IF NOT EXISTS creative_styles (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    name TEXT,
+    category TEXT,
+    parameters TEXT,
+    is_default BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS creative_templates (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    category TEXT,
+    platform TEXT,
+    aspect_ratio TEXT,
+    layout_data TEXT,
+    thumbnail_url TEXT,
+    is_system BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS creative_batch_jobs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    operation TEXT,
+    asset_ids TEXT,
+    params TEXT,
+    status TEXT DEFAULT 'pending',
+    completed_count INTEGER DEFAULT 0,
+    total_count INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS creative_collaborators (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT,
+    owner_user_id TEXT,
+    collaborator_user_id TEXT,
+    role TEXT DEFAULT 'editor',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES creative_projects(id)
+  );
+  CREATE TABLE IF NOT EXISTS creative_sync_state (
+    project_id TEXT PRIMARY KEY,
+    user_id TEXT,
+    device_id TEXT,
+    last_sync_at DATETIME,
+    sync_data TEXT,
+    FOREIGN KEY(project_id) REFERENCES creative_projects(id)
+  );
+
+  -- Trading Suite Tables
+  CREATE TABLE IF NOT EXISTS trading_watchlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    asset_class TEXT DEFAULT 'FOREX',
+    is_enabled INTEGER DEFAULT 1,
+    sort_order INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, symbol)
+  );
+  CREATE INDEX IF NOT EXISTS idx_watchlist_user ON trading_watchlist(user_id);
+
+  CREATE TABLE IF NOT EXISTS trading_signals (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    confidence INTEGER,
+    entry REAL,
+    sl REAL,
+    tp1 REAL,
+    tp2 REAL,
+    rr REAL,
+    scenario TEXT,
+    reasoning TEXT,
+    pullback_health TEXT,
+    range_info TEXT,
+    costs TEXT,
+    timestamp INTEGER NOT NULL,
+    is_favorite INTEGER DEFAULT 0,
+    is_read INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_signals_user_time ON trading_signals(user_id, timestamp DESC);
+  CREATE INDEX IF NOT EXISTS idx_signals_symbol ON trading_signals(symbol);
+
+  CREATE TABLE IF NOT EXISTS push_tokens (
+    user_id TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    platform TEXT DEFAULT 'android',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS notification_prefs (
+    user_id TEXT PRIMARY KEY,
+    signal_alerts INTEGER DEFAULT 1,
+    tp_sl_alerts INTEGER DEFAULT 1,
+    news_alerts INTEGER DEFAULT 1,
+    daily_summary INTEGER DEFAULT 1
+  );
+
+  CREATE TABLE IF NOT EXISTS sentiment_cache (
+    symbol TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    cached_at INTEGER NOT NULL
+  );
 `);
 
 // Migrations — older frit.db files predate these columns and CREATE TABLE IF
@@ -247,9 +397,49 @@ const OR_STT_MODEL = process.env.OR_STT_MODEL || "openai/whisper-large-v3";
 const OR_DESIGN_MODEL = process.env.OR_DESIGN_MODEL || "inclusionai/ming-image-0.1-design";
 const OR_LAYER_MODEL = process.env.OR_LAYER_MODEL || "inclusionai/ming-image-0.1-design-layer";
 const OR_VIDEO_MODEL = process.env.OR_VIDEO_MODEL || "google/veo-3.1-lite"; // cheapest OpenRouter video-gen default (720p 4-8s)
-// Free-tier models (zero token cost, count against 1000/day quota):
-const OR_FREE_FAST = process.env.OR_FREE_FAST || "openai/gpt-oss-20b:free";
-const OR_FREE_DRAFT = process.env.OR_FREE_DRAFT || "qwen/qwen3-30b-a3b-2507:free";
+// Free-tier models (zero token cost, count against 1000/day quota).
+// Verified Oct 2026: qwen3.8-27b (best free all-rounder, tools+vision),
+// nemotron-3-super (NVIDIA-backed, sticky). gpt-oss-20b:free 429s constantly
+// and qwen3-30b-a3b-2507:free isn't a valid slug — both replaced.
+let OR_FREE_FAST = process.env.OR_FREE_FAST || "qwen/qwen3.8-27b:free";
+let OR_FREE_DRAFT = process.env.OR_FREE_DRAFT || "nvidia/nemotron-3-super-120b-a12b:free";
+// The free roster rotates, so the server re-checks OpenRouter's public model
+// list at boot + every 6h and picks the top-rated live :free text models.
+const PREFERRED_FREE = [
+  "qwen/qwen3.8-27b:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "google/gemma-4-26b-a4b-it:free",
+  "thinkingmachines/inkling-small:free",
+  "poolside/laguna-s-2.1:free",
+  "cohere/north-mini-code:free",
+  "openrouter/free",
+];
+function pickFreeModels(all) {
+  const ids = new Set((Array.isArray(all) ? all : []).map(m => m.id).filter(id =>
+    typeof id === "string" && id.endsWith(":free") &&
+    !/embed|whisper|tts|moderation|safety|guard/i.test(id)));
+  const ranked = PREFERRED_FREE.filter(id => ids.has(id));
+  for (const id of ids) if (!ranked.includes(id)) ranked.push(id); // any other live free model
+  return ranked;
+}
+async function refreshFreeModels() {
+  try {
+    const r = await fetch("https://openrouter.ai/api/v1/models", { signal: AbortSignal.timeout(20_000) });
+    const d = await r.json();
+    const ranked = pickFreeModels(d?.data);
+    if (!ranked.length) return false;
+    if (!process.env.OR_FREE_FAST) OR_FREE_FAST = ranked[0];
+    if (!process.env.OR_FREE_DRAFT) OR_FREE_DRAFT = ranked[1] || ranked[0];
+    for (const role of ["agent", "tools", "conversation", "fast"]) {
+      FALLBACK_CHAINS[role] = buildFallbackChain(MODELS[role]);
+    }
+    console.log(`[free] live free models: ${OR_FREE_FAST} / ${OR_FREE_DRAFT} (${ranked.length} listed)`);
+    return true;
+  } catch (e) {
+    console.warn("[free] refresh failed, keeping defaults:", e.message);
+    return false;
+  }
+}
 // Optional provider pinning: OpenRouter prices the SAME model differently per
 // provider (GLM Flash $0.15 default route vs $0.075 DeepInfra 50%-off vs
 // $0.08385 StreamLake 44%-off). Set OR_PROVIDER_ONLY=deepinfra (or comma list)
@@ -258,13 +448,18 @@ const OR_FREE_DRAFT = process.env.OR_FREE_DRAFT || "qwen/qwen3-30b-a3b-2507:free
 const OR_PROVIDER_ONLY = (process.env.OR_PROVIDER_ONLY || "").split(",").map(s => s.trim()).filter(Boolean);
 const OR_PROVIDER_SORT = process.env.OR_PROVIDER_SORT || "";
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ZEN_API_KEY = process.env.OPENCODE_ZEN_API_KEY || "";
 const HAS_ZEN = !!ZEN_API_KEY;
 const ZEN_MODEL = process.env.OPENCODE_ZEN_MODEL || "glm-5.3-flash";
 const MISTRAL_MODEL = process.env.MISTRAL_MODEL || "mistral-large-latest";
 const MISTRAL_FAST_MODEL = process.env.MISTRAL_FAST_MODEL || "mistral-small-latest";
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
+// Live-feed (24/7 WS scanning): Finnhub key covers forex/metals/stocks streaming
+// (OANDA:XAU_USD etc.). Crypto needs no key (Binance public WS); forex/metals
+// fall back to keyless Dukascopy polling when FINNHUB_KEY is unset.
+const FINNHUB_KEY = process.env.FINNHUB_KEY || "";
+const FEED_ENABLED = process.env.FEED_ENABLED !== "0";
+const FEED_BACKFILL_BUDGET = Number(process.env.FEED_BACKFILL_BUDGET || 200);
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
 // The sandbox service requires its own auth token. The AI never sees this —
 // the server attaches it when forwarding run_code calls.
@@ -286,7 +481,7 @@ if (!AUTH_TOKEN) {
   console.error("[FATAL] AUTH_TOKEN missing — mandatory for agentic security!");
   process.exit(1);
 }
-if (!HAS_OR && !GEMINI_API_KEY && !MISTRAL_API_KEY) {
+if (!HAS_OR && !MISTRAL_API_KEY) {
   console.error("[FATAL] All provider keys missing — set OPENROUTER_API_KEY in .env");
   process.exit(1);
 }
@@ -367,14 +562,14 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // fast = openai/gpt-oss-20b ($0.02/$0.10) — the gpt-oss-20b-class slot.
 // draft = qwen 30B-class cheap. Free :free models sit AFTER paid in chains.
 const GO_MODEL = process.env.OPENCODE_GO_MODEL || "glm-5.3-flash";
-const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL)));
+const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL));
 const MODELS = {
-  vision: process.env.VISION_MODEL || (GEMINI_API_KEY ? "gemini-3.6-flash" : (HAS_OR ? `openrouter:${OR_PRIMARY}` : "mistral-large-latest")),
+  vision: process.env.VISION_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "mistral-large-latest"),
   agent: AGENT_PRIMARY,
-  conversation: process.env.CONVERSATION_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL))),
-  tools: process.env.TOOLS_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : HAS_ZEN ? `go:${GO_MODEL}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_MODEL)),
+  conversation: process.env.CONVERSATION_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL)),
+  tools: process.env.TOOLS_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL),
   coding: process.env.CODING_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "codestral-latest"),
-  fast: process.env.FAST_MODEL || (HAS_OR ? `openrouter:${OR_FAST}` : (GEMINI_API_KEY ? "gemini-3.6-flash" : MISTRAL_FAST_MODEL)),
+  fast: process.env.FAST_MODEL || (HAS_OR ? `openrouter:${OR_FAST}` : MISTRAL_FAST_MODEL),
   voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || "voxtral-mini-transcribe-realtime",
   local: process.env.LOCAL_MODEL || "gemma-3n-e2b", // on-device offline fallback (Android), not called here
 };
@@ -404,15 +599,13 @@ function buildFallbackChain(primary) {
     chain.push(`openrouter:${OR_FREE_DRAFT}`);
   }
   if (HAS_ZEN) chain.push(`go:${GO_MODEL}`);
-  if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
   if (MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
   return [...new Set(chain)];
 }
 
 function buildVisionFallbackChain(primary) {
   const chain = [primary];
-  if (GEMINI_API_KEY) chain.push("gemini-3.6-flash");
-  if (HAS_OR) chain.push(`openrouter:${OR_PRIMARY}`); // GLM-5.3-Flash is natively multimodal
+  if (HAS_OR && primary !== `openrouter:${OR_PRIMARY}`) chain.push(`openrouter:${OR_PRIMARY}`); // native multimodal (z-ai/glm-5.3-flash)
   if (MISTRAL_API_KEY) chain.push("mistral-large-latest");
   return [...new Set(chain)];
 }
@@ -424,6 +617,9 @@ const FALLBACK_CHAINS = {
   conversation: buildFallbackChain(MODELS.conversation),
   fast: buildFallbackChain(MODELS.fast),
 };
+// The :free roster rotates — resolve the live list at boot, re-check every 6h.
+await refreshFreeModels();
+setInterval(() => { void refreshFreeModels(); }, 6 * 3600e3).unref?.();
 
 let PHONE_UI_SKILL = "";
 try {
@@ -534,109 +730,19 @@ function buildMemoryBlock(memory = []) {
 // ========================= PROVIDER ADAPTERS ===========================
 const MISTRAL_BASE = "https://api.mistral.ai/v1";
 
-async function geminiChat({ model, messages, tools = null, temperature = 0.7, max_tokens = 2048 }) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-
-  const contents = messages.map(m => {
-    let parts = [];
-    if (typeof m.content === "string") {
-      parts = [{ text: m.content }];
-    } else if (Array.isArray(m.content)) {
-      parts = m.content.map(p => {
-        if (p.type === "text") return { text: p.text };
-        if (p.type === "image_url") {
-          const b64 = p.image_url.url.split(",")[1] || p.image_url.url;
-          return { inline_data: { mime_type: "image/jpeg", data: b64 } };
-        }
-        return null;
-      }).filter(Boolean);
-    }
-
-    if (m.tool_calls) {
-      m.tool_calls.forEach(tc => {
-        parts.push({
-          functionCall: {
-            name: tc.function.name,
-            args: typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments
-          }
-        });
-      });
-    }
-
-    if (m.role === "tool") {
-      return {
-        role: "function",
-        parts: [{
-          functionResponse: {
-            name: m.name || m.tool_call_id, // Gemini expects the function name here often
-            response: { content: m.content }
-          }
-        }]
-      };
-    }
-
-    return { role: m.role === "assistant" ? "model" : "user", parts };
-  });
-
-  const body = {
-    contents,
-    generationConfig: { maxOutputTokens: max_tokens, temperature }
-  };
-
-  if (tools?.length) {
-    body.tools = [{
-      function_declarations: tools.map(t => ({
-        name: t.function.name,
-        description: t.function.description,
-        parameters: t.function.parameters
-      }))
-    }];
-  }
-
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(90_000) });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || JSON.stringify(data));
-
-  const candidate = data.candidates?.[0];
-  const msgContent = candidate?.content;
-  const parts = msgContent?.parts || [];
-
-  let text = "";
-  const tool_calls = [];
-
-  parts.forEach(p => {
-    if (p.text) text += p.text;
-    if (p.functionCall) {
-      tool_calls.push({
-        id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-        type: "function",
-        function: {
-          name: p.functionCall.name,
-          arguments: JSON.stringify(p.functionCall.args)
-        }
-      });
-    }
-  });
-
-  return { choices: [{ message: { content: text, tool_calls: tool_calls.length ? tool_calls : undefined } }] };
-}
-
 // Resolve which provider a model string belongs to.
-// "openrouter:..." -> OpenRouter (single gateway for LLM/STT/image)
+// "openrouter:..." -> OpenRouter (single gateway for LLM/STT/image/vision)
 // "zen:..."/"go:..." -> OpenCode Zen/Go (legacy opt fallback)
-// "gemini-*"  -> Gemini native generateContent (vision; tools unsupported here)
 // otherwise    -> Mistral (OpenAI-compatible chat completions, supports tool calls)
 function resolveProvider(model) {
   if (typeof model === "string" && model.startsWith("openrouter:")) return "openrouter";
   if (typeof model === "string" && model.startsWith("go:")) return "go";
   if (typeof model === "string" && model.startsWith("zen:")) return "zen";
-  if (typeof model === "string" && model.startsWith("gemini")) return "gemini";
   return "mistral";
 }
 
 async function mistralChat({ model, messages, tools = null, temperature = 0.3, max_tokens = 1600, tool_choice = "auto", retries = 3 }) {
   const provider = resolveProvider(model);
-  if (provider === "gemini") return geminiChat({ model, messages, tools, temperature, max_tokens });
 
   const base = provider === "openrouter" ? "https://openrouter.ai/api/v1/chat/completions"
     : provider === "go" ? "https://opencode.ai/zen/go/v1/chat/completions"
@@ -1103,13 +1209,15 @@ async function enhanceGoalForAgent(rawGoal, history = []) {
   return rawGoal;
 }
 
-// ==================== DETERMINISTIC MARKET PRE-ROUTE ====================
-// Pure quote/analysis goals are answered straight from the trading engine
-// (Twelve Data spot + MTF strategy) instead of entering the LLM loop, where
-// the brain sometimes narrates analysis from memory instead of calling
-// analyze_market/get_market_data. Trade EXECUTION ("buy X 0.01") is NOT
-// short-circuited — orders stay inside the agent loop with its verification
-// and confirmation discipline.
+// ==================== MARKET DATA ====================
+// There is NO keyword shortcut into the trading engine. A chat message that
+// merely mentions a symbol, "mt5", "buy" or "trade" must never reach
+// mtfStrategy directly — every market answer goes through the agent loop and
+// its analyze_market / get_market_data tools, so the brain decides whether a
+// tool is actually needed and the user sees a normal AI reply instead of a
+// raw engine dump. Trading facts (price/structure/decision) stay available
+// inside those tools; the SensitiveGate + confirmation discipline still apply
+// to anything that spends money.
 const MARKET_SYMBOL_MAP = {
   bitcoin: "BTCUSD", btcusd: "BTCUSD", btc: "BTCUSD",
   ethereum: "ETHUSD", ethusd: "ETHUSD", eth: "ETHUSD",
@@ -1133,43 +1241,7 @@ function extractMarketSymbol(text) {
     const w = m[0].toUpperCase();
     if (/USD$|JPY$|CHF$|CAD$/.test(w)) return w;
   }
-  return "BTCUSD";
-}
-function hasMarketContext(t) {
-  if (/\bmt5\b|forex|crypto|\bmarket\b|\blot\b|\btrade\b|\btrading\b/.test(t)) return true;
-  return Object.keys(MARKET_SYMBOL_MAP).some(k => marketKeyHit(t, k));
-}
-// Returns { kind: "quote"|"analysis", symbol } or null. Trade orders return
-// null on purpose so they stay in the agent loop (confirmation discipline).
-function detectMarketGoal(rawGoal) {
-  const t = String(rawGoal || "").toLowerCase();
-  if (!hasMarketContext(t)) return null;
-  const side = /\bbuy\b|\bsell\b|\blong\b|\bshort\b/.test(t);
-  const num = /\d+(\.\d+)?/.test(t);
-  if (side && num) return null; // real order -> agent loop
-  if (/price|quote|\brate\b|how much|cost of/.test(t)) return { kind: "quote", symbol: extractMarketSymbol(t) };
-  if (/analy|signal|forecast|predict|chart|outlook|\btrade\b|\btrading\b|\bmt5\b|\bbuy\b|\bsell\b|\blong\b|\bshort\b/.test(t)) {
-    return { kind: "analysis", symbol: extractMarketSymbol(t) };
-  }
-  return null;
-}
-function formatQuote(symbol, prices) {
-  const q = prices && prices[symbol];
-  if (!q || q.error || !q.price) return `${symbol}: live price unavailable right now.`;
-  const ch = Number(q.change24h || 0);
-  return `${symbol}: ${q.price} ${q.currency || "USD"} (24h ${ch >= 0 ? "+" : ""}${ch.toFixed(2)}%) — live engine quote.`;
-}
-function formatEngineAnalysis(symbol, a) {
-  if (!a || typeof a !== "object") return `${symbol}: engine returned no data.`;
-  if (a.decision === "DATA_UNAVAILABLE") return `${symbol}: live data unavailable (${a.reason || "no candles"}).`;
-  const L = [`${a.symbol || symbol} live engine: ${a.decision}${a.direction ? ` (${a.direction})` : ""}${a.confidence != null ? ` — confidence ${a.confidence}%` : ""}`];
-  if (a.price != null) L.push(`Price: ${a.price}`);
-  if (a.entry != null) L.push(`Entry: ${a.entry}`);
-  if (a.sl != null) L.push(`SL: ${a.sl}`);
-  if (a.tp != null) L.push(`TP: ${a.tp}`);
-  if (Array.isArray(a.reasons) && a.reasons.length) L.push(`Reasons: ${a.reasons.slice(0, 4).join("; ")}`);
-  if (a.entry_ctx && a.entry_ctx.zone != null) L.push(`Entry zone (${a.entry_ctx.type || "limit"}): ${a.entry_ctx.zone}`);
-  return L.join("\n");
+  return null; // no symbol named -> caller decides; never guess BTCUSD
 }
 
 app.post("/agent/start", requireAuth, limitNormal, async (req, res) => {
@@ -1189,21 +1261,8 @@ app.post("/agent/start", requireAuth, limitNormal, async (req, res) => {
     // Router failed — fall through to the agent loop rather than erroring out.
   }
 
-  // Deterministic market pre-route: engine data first, LLM never invents prices.
-  try {
-    const mg = detectMarketGoal(goal);
-    if (mg) {
-      if (mg.kind === "quote") {
-        const prices = await fetchMarketPrices([mg.symbol]);
-        return res.json({ done: true, assistant_text: formatQuote(mg.symbol, prices) });
-      }
-      const analysis = await mtfStrategy.analyze(mg.symbol, {});
-      return res.json({ done: true, assistant_text: formatEngineAnalysis(mg.symbol, analysis) });
-    }
-  } catch (e) {
-    console.warn("[agent/start] market pre-route failed, using agent loop:", e.message);
-  }
-
+  // Market questions go to the agent loop like everything else. The brain
+  // calls analyze_market / get_market_data when it actually needs the data.
   if (!SANDBOX_URL.includes("127.0.0.1")) fetch(`${SANDBOX_URL}/health`).catch(() => {}); // wake sandbox while LLM plans
 
   const sessionId = `sess_${Date.now()}`;
@@ -1709,6 +1768,7 @@ async function runSandbox(args = {}) {
 // ========================= MARKET DATA ============================
 function normalizeInterval(v) {
   const iv = String(v || "1h").toLowerCase().trim();
+  if (iv === "30m") return "30min"; // engine shorthand -> Twelve Data interval
   const allowed = ["1min", "5min", "15min", "30min", "1h", "4h", "1day", "1week"];
   return allowed.includes(iv) ? iv : "1h";
 }
@@ -1722,7 +1782,7 @@ function resolveOutputSize(interval) {
 
 function toBinanceInterval(interval) {
   return ({
-    "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+    "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m", "30m": "30m",
     "1h": "1h", "4h": "4h", "1day": "1d", "1week": "1w"
   })[interval] || "1h";
 }
@@ -1838,6 +1898,14 @@ async function fetchSpotPrice(symbol) {
   const ck = `spot:${sym}`;
   const cached = cacheGet(ck);
   if (cached) return cached;
+  // Live-feed first: streaming ticks are fresher than any REST poll and cost
+  // zero credits. (liveFeed is assigned at boot; null until then.)
+  try {
+    const live = globalThis.__liveFeed?.lastPrice(sym);
+    if (live && Number.isFinite(live.price) && Date.now() - live.ts < 5 * 60 * 1000) {
+      return { price: live.price, source: live.source || "live-feed" };
+    }
+  } catch { /* fall through to REST */ }
   let result = null;
 
   // Crypto: CoinGecko first (free, no key) so crypto spot checks never touch
@@ -2126,6 +2194,279 @@ function formatTradeMemoryForPrompt(symbol) {
   return `\nPast trade memory for ${symbol}:\n${lines.join("\n")}`;
 }
 
+// ==================== TRADING SUITE HELPERS ====================
+
+function formatTradingSignal(symbol, result) {
+  const decision = result.decision || "WAIT";
+  const sc = result.scenarios || {};
+  const s1 = sc.scenario_1_immediate || null;
+  const s2 = sc.scenario_2_pullback_crossover || null;
+  const sR = sc.scenario_range_fade || null;
+  const isActionable = ["BUY", "SELL"].includes(decision);
+  // WAIT_PULLBACK -> PULLBACK zone, WAIT_RANGE -> RANGE fade, else IMMEDIATE/WAIT/REVERSAL
+  let scenario = "WAIT";
+  if (isActionable) {
+    scenario = (result.entry_ctx?.type === "pullback_limit") ? "PULLBACK"
+      : (result.entry_ctx?.type === "range_limit") ? "RANGE" : "IMMEDIATE";
+    // Reversal single-scenario entries carry "Reversal" in the name
+    if (/reversal/i.test(s1?.name || "")) scenario = "REVERSAL";
+  } else if (decision === "WAIT_PULLBACK") scenario = "PULLBACK";
+  else if (decision === "WAIT_RANGE") scenario = "RANGE";
+
+  const primary = s1 || s2 || sR;
+  const entry = Number(result.entry ?? primary?.entry ?? s2?.entry ?? sR?.entry ?? NaN);
+  const sl = Number(result.sl ?? primary?.sl ?? s2?.estimated_sl ?? sR?.estimated_sl ?? sR?.sl ?? NaN);
+  const tp1 = Number(result.tp ?? primary?.tp1 ?? s2?.estimated_tp1 ?? sR?.estimated_tp1 ?? NaN);
+  const tp2 = Number(result.tp2 ?? primary?.tp2 ?? s2?.estimated_tp2 ?? sR?.estimated_tp2 ?? NaN);
+
+  return {
+    id: `sig_${symbol}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    symbol,
+    decision,
+    confidence: result.confidence || 0,
+    entry: Number.isFinite(entry) ? entry : null,
+    sl: Number.isFinite(sl) ? sl : null,
+    tp1: Number.isFinite(tp1) ? tp1 : null,
+    tp2: Number.isFinite(tp2) ? tp2 : null,
+    rr: result.rr ?? primary?.rr ?? null,
+    scenario,
+    reasoning: result.reason || result.reasons?.join(" | ") || "Engine analysis",
+    pullbackHealth: s2?.pullback_health || result.structure_30m ? {
+      status: result.structure_30m?.pullback_status || null,
+      is_healthy: result.structure_30m?.pullback_healthy ?? null,
+      pullback_probability: result.structure_30m?.pullback_probability ?? null,
+      reversal_probability: result.structure_30m?.reversal_probability ?? null,
+      ...(s2?.pullback_health || {}),
+    } : (s2?.pullback_health || null),
+    rangeInfo: result.structure_30m?.range_30m || sR ? {
+      upper: result.structure_30m?.range_30m?.upper ?? sR?.watch_zone ?? null,
+      lower: result.structure_30m?.range_30m?.lower ?? null,
+      tradable: result.structure_30m?.range_30m?.tradable ?? !!sR,
+      ...(sR || {}),
+    } : null,
+    costs: result.costs || primary?.costs || null,
+    tpBasis: result.tp_basis || primary?.tp_basis || null,
+    regime: result.regime?.macro_trend || result.direction || null,
+    entryCtx: result.entry_ctx || null,
+    timestamp: Date.now(),
+    isFavorite: false,
+    isRead: false
+  };
+}
+
+function ensureSignalColumns() {
+  try {
+    const cols = db.prepare("PRAGMA table_info(trading_signals)").all().map(c => c.name);
+    if (!cols.includes("tp_basis")) db.exec("ALTER TABLE trading_signals ADD COLUMN tp_basis TEXT");
+    if (!cols.includes("regime")) db.exec("ALTER TABLE trading_signals ADD COLUMN regime TEXT");
+    if (!cols.includes("entry_ctx")) db.exec("ALTER TABLE trading_signals ADD COLUMN entry_ctx TEXT");
+  } catch (e) { console.warn("[signals] migration failed:", e.message); }
+}
+ensureSignalColumns();
+
+function storeSignalHistory(user_id, signal) {
+  try {
+    ensureSignalColumns();
+    db.prepare(`
+      INSERT INTO trading_signals
+      (id, user_id, symbol, decision, confidence, entry, sl, tp1, tp2, rr, scenario, reasoning, pullback_health, range_info, costs, tp_basis, regime, entry_ctx, timestamp, is_favorite, is_read)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      signal.id, user_id, signal.symbol, signal.decision, signal.confidence,
+      signal.entry, signal.sl, signal.tp1, signal.tp2, signal.rr,
+      signal.scenario, signal.reasoning,
+      signal.pullbackHealth ? JSON.stringify(signal.pullbackHealth) : null,
+      signal.rangeInfo ? JSON.stringify(signal.rangeInfo) : null,
+      signal.costs ? JSON.stringify(signal.costs) : null,
+      signal.tpBasis || null, signal.regime || null,
+      signal.entryCtx ? JSON.stringify(signal.entryCtx) : null,
+      signal.timestamp, 0, 0
+    );
+  } catch (e) {
+    console.warn("[storeSignalHistory] failed:", e.message);
+  }
+}
+
+function hydrateSignal(row) {
+  if (!row) return row;
+  const j = (v) => { try { return typeof v === "string" ? JSON.parse(v) : v; } catch { return v; } };
+  return {
+    ...row,
+    pullbackHealth: row.pullback_health ? j(row.pullback_health) : null,
+    rangeInfo: row.range_info ? j(row.range_info) : null,
+    costs: row.costs ? j(row.costs) : null,
+    entryCtx: row.entry_ctx ? j(row.entry_ctx) : null,
+    tpBasis: row.tp_basis || null,
+    isFavorite: row.is_favorite === 1,
+    isRead: row.is_read === 1,
+  };
+}
+
+async function fetchSentiment(symbol) {
+  const sym = String(symbol).toUpperCase();
+  const cacheKey = `sentiment:${sym}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  try {
+    // Use web search for news sentiment
+    const queries = [
+      `${sym} market news ${new Date().getFullYear()} sentiment`,
+      `${sym} technical analysis forecast`,
+      `${sym} fundamental outlook`
+    ];
+    
+    const results = await Promise.all(queries.map(q => webSearch(q)));
+    
+    // Simple sentiment scoring based on keywords
+    const text = results.join(" ").toLowerCase();
+    const bullishWords = ["bullish", "buy", "long", "support", "breakout", "rally", "surge", "gain", "positive", "optimistic", "upside"];
+    const bearishWords = ["bearish", "sell", "short", "resistance", "breakdown", "crash", "drop", "loss", "negative", "pessimistic", "downside"];
+    
+    let bullScore = 0, bearScore = 0;
+    for (const w of bullishWords) bullScore += (text.match(new RegExp(w, "g")) || []).length;
+    for (const w of bearishWords) bearScore += (text.match(new RegExp(w, "g")) || []).length;
+    
+    const total = bullScore + bearScore;
+    let sentiment = "NEUTRAL";
+    let score = 50;
+    if (total > 0) {
+      score = Math.round((bullScore / total) * 100);
+      if (score > 60) sentiment = "BULLISH";
+      else if (score < 40) sentiment = "BEARISH";
+    }
+    
+    const data = {
+      symbol: sym,
+      sentiment,
+      score,
+      bullishSignals: bullScore,
+      bearishSignals: bearScore,
+      summary: results.slice(0, 2).join(" | ").slice(0, 500),
+      sources: queries.length,
+      cachedAt: Date.now()
+    };
+    cacheSet(cacheKey, data, 12 * 60 * 60 * 1000);
+    return data;
+  } catch (e) {
+    console.warn("[fetchSentiment] failed:", e.message);
+    return { symbol: sym, sentiment: "NEUTRAL", score: 50, summary: "Sentiment unavailable", cachedAt: Date.now() };
+  }
+}
+
+async function generateSignalExplanation(signal, detailLevel = "full") {
+  const sym = signal.symbol;
+  const isBuy = signal.decision === "BUY";
+  
+  // Get fresh analysis for context
+  const fresh = await mtfStrategy.analyze(sym, { interval: "1h" });
+  
+  const factors = [];
+  
+  // Macro trend factor
+  if (fresh.regime?.macro_trend) {
+    factors.push({
+      name: "4H Macro Trend",
+      value: fresh.regime.macro_trend,
+      impact: fresh.regime.macro_trend !== "NEUTRAL" ? "HIGH" : "LOW",
+      description: `The 4-hour timeframe shows a ${fresh.regime.macro_trend.toLowerCase()} trend (EMA 9/21 alignment + RSI + DI confirmation).`
+    });
+  }
+  
+  // 30M alignment
+  if (fresh.regime?.primary_trend) {
+    factors.push({
+      name: "30M Primary Trend",
+      value: fresh.regime.primary_trend,
+      impact: "HIGH",
+      description: `The 30-minute timeframe is ${fresh.regime.primary_trend === "BULLISH" ? "bullish" : "bearish"} (EMA 9 ${fresh.regime.primary_trend === "BULLISH" ? "above" : "below"} EMA 21).`
+    });
+  }
+  
+  // Pullback health
+  if (signal.pullbackHealth) {
+    factors.push({
+      name: "Pullback Health",
+      value: signal.pullbackHealth.is_healthy ? "HEALTHY" : "WEAK",
+      impact: "MEDIUM",
+      description: `Pullback probability: ${signal.pullbackHealth.pullback_probability}% vs reversal: ${signal.pullbackHealth.reversal_probability}%. ${signal.pullbackHealth.note || ""}`
+    });
+  }
+  
+  // Confluence
+  if (signal.rangeInfo?.fib_confluence) {
+    factors.push({
+      name: "Fib + EMA Confluence",
+      value: "YES",
+      impact: "HIGH",
+      description: "The pullback zone (50-61.8% Fib) aligns with 30M EMA 21, increasing entry quality."
+    });
+  }
+  
+  // Costs
+  if (signal.costs) {
+    factors.push({
+      name: "Transaction Costs",
+      value: `netRR ${signal.costs.netRR}`,
+      impact: signal.costs.blocked ? "CRITICAL" : signal.costs.weak ? "MEDIUM" : "LOW",
+      description: `After spread/commission/slippage: net RR = ${signal.costs.netRR} (${signal.costs.costPctOfRisk}% of risk). ${signal.costs.blocked ? "BLOCKED - negative expectancy" : signal.costs.weak ? "WEAK - needs confluence" : "ACCEPTABLE"}`
+    });
+  }
+  
+  // News
+  if (fresh.news_filter?.has_news) {
+    factors.push({
+      name: "News Risk",
+      value: "ACTIVE",
+      impact: "HIGH",
+      description: fresh.news_filter.recommendation || fresh.news_filter.reason
+    });
+  }
+  
+  const explanation = {
+    signalId: signal.id,
+    symbol: sym,
+    decision: signal.decision,
+    confidence: signal.confidence,
+    plainEnglish: `${isBuy ? "Buy" : "Sell"} ${sym} at ${signal.entry} with SL ${signal.sl}, TP1 ${signal.tp1}, TP2 ${signal.tp2} (R:R ${signal.rr}). ${fresh.regime?.macro_trend || "Neutral"} macro trend, ${signal.scenario === "PULLBACK" ? "waiting for pullback entry" : "immediate entry"}.`,
+    factors,
+    riskWarning: signal.costs?.weak ? "Costs consume significant portion of risk - consider smaller size or wait for better confluence." : "Standard risk parameters apply.",
+    detailLevel,
+    generatedAt: Date.now()
+  };
+  
+  return explanation;
+}
+
+function getLearningContent(category = null) {
+  const content = {
+    basics: [
+      { id: "b1", title: "Understanding Forex Pairs", category: "basics", readTime: 5, content: "Forex pairs quote one currency against another..." },
+      { id: "b2", title: "What is a Pip?", category: "basics", readTime: 3, content: "A pip is the smallest price move..." },
+      { id: "b3", title: "Leverage and Margin", category: "basics", readTime: 7, content: "Leverage allows controlling larger positions..." },
+    ],
+    strategy: [
+      { id: "s1", title: "Trend Following with EMA", category: "strategy", readTime: 10, content: "Our engine uses 30M EMA 9/21 aligned with 4H trend..." },
+      { id: "s2", title: "Fibonacci Pullback Entries", category: "strategy", readTime: 8, content: "Structure-anchored entries at 50-61.8% retracement..." },
+      { id: "s3", title: "Range Fading Strategy", category: "strategy", readTime: 8, content: "When 4H is neutral, fade proven range edges..." },
+    ],
+    risk: [
+      { id: "r1", title: "Position Sizing Rules", category: "risk", readTime: 6, content: "Never risk more than 1-2% per trade..." },
+      { id: "r2", title: "Correlation Management", category: "risk", readTime: 5, content: "EURUSD and GBPUSD move together - don't double risk..." },
+      { id: "r3", title: "Daily Loss Limit", category: "risk", readTime: 4, content: "Stop trading if down 4% in a day - no revenge trading..." },
+    ],
+    psychology: [
+      { id: "p1", title: "Discipline Over Prediction", category: "psychology", readTime: 5, content: "The market doesn't care about your opinion..." },
+      { id: "p2", title: "Handling Drawdowns", category: "psychology", readTime: 6, content: "Every system has losing streaks - size for survival..." },
+    ]
+  };
+  
+  if (category && content[category]) {
+    return { category, items: content[category] };
+  }
+  return { categories: Object.keys(content), all: content };
+}
+
 // ==================== POSITION MONITOR ====================
 // Additive paper-position state machine. Watches positions registered by the
 // daily trade scheduler and /trade; auto-resolves TP/SL via spot polling; logs
@@ -2161,6 +2502,34 @@ const mtfStrategy = new MTFStrategyEngine({
   addTradeMemory,
   recordSetup: (setup) => pullbackJournal.record(setup),
 });
+
+// ==================== LIVE FEED (24/7 WS scanning) ====================
+// Free-tier survival design: ticks stream over Binance/Finnhub/Dukascopy,
+// CandleStore builds 30M/4H locally, engine scans on candle close at 0
+// Twelve Data credits. Backfill uses Finnhub REST first, then budgeted TD.
+const liveFeed = new LiveFeed({
+  db,
+  engine: mtfStrategy,
+  fetchImpl: fetch,
+  fetchCandles,
+  formatSignal: formatTradingSignal,
+  storeSignal: (userId, signal) => storeSignalHistory(userId, signal),
+  getWatchlist: () => {
+    try {
+      return db.prepare("SELECT user_id, symbol FROM trading_watchlist WHERE is_enabled = 1").all();
+    } catch { return []; }
+  },
+  isCrypto: (sym) => CRYPTO_SET.has(String(sym).toUpperCase()),
+  finnhubKey: FINNHUB_KEY,
+  enabled: FEED_ENABLED,
+  backfillBudget: FEED_BACKFILL_BUDGET,
+  log: (...a) => console.log(...a),
+});
+globalThis.__liveFeed = liveFeed;
+if (!FINNHUB_KEY) {
+  console.log("[livefeed] FINNHUB_KEY unset — forex/metals run on Dukascopy poll backup; add key for WS streaming");
+}
+liveFeed.start().catch(e => console.warn("[livefeed] start failed:", e.message));
 
 // Every 30 min, replay 30M candles and resolve journaled setups (win/loss/
 // expired). Only symbols with pending rows cost API calls; engine + fetch
@@ -2302,13 +2671,21 @@ async function runLocalTool(name, args = {}, agentState = null) {
   switch (name) {
     case "search_web": return { ok: true, data: await webSearch(args.query || "") };
     case "get_weather": return { ok: true, data: await getWeather(args.city || "Lagos") };
-    case "get_market_data": return { ok: true, data: await fetchMarketPrices([args.symbol || "BTCUSD"]) };
+    case "get_market_data": {
+      const sym = extractMarketSymbol(args.symbol);
+      if (!sym) return { ok: false, error: "No symbol given. Ask which market (e.g. XAUUSD, EURUSD, BTCUSD) instead of guessing one." };
+      return { ok: true, data: await fetchMarketPrices([sym]) };
+    }
     case "get_market_news": {
       const sym = args.symbol || "market";
       const q = args.query || `${sym} market fundamental news ${new Date().getFullYear()}`;
       return { ok: true, data: await webSearch(q) };
     }
-    case "analyze_market": return { ok: true, data: await mtfStrategy.analyze(args.symbol, { interval: args.interval, balance: args.balance, riskPercent: args.risk_percent }) };
+    case "analyze_market": {
+      const sym = extractMarketSymbol(args.symbol);
+      if (!sym) return { ok: false, error: "No symbol given. Ask which market to analyse instead of guessing one." };
+      return { ok: true, data: await mtfStrategy.analyze(sym, { interval: args.interval, balance: args.balance, riskPercent: args.risk_percent }) };
+    }
     case "run_code": return { ok: true, data: await runSandbox({ language: args.language, code: args.code, stdin: args.stdin || "", timeout_ms: args.timeout_ms || 15000 }) };
     case "get_frit_manual": return { ok: true, data: buildFritManual() };
     case "generate_image": return { ok: true, data: await generateImage(args.prompt || "", { aspect_ratio: args.aspect_ratio, n: args.n, model: args.model }) };
@@ -2465,10 +2842,13 @@ function buildAutomationSystemPrompt({ deviceState, memory, ledger = [], goal = 
     "",
     "TOOL CHOICE (cheapest correct tool wins):",
     "- Code/files/charts/math → run_code (server sandbox — never on the phone, never paste code for the user). Facts/news → search_web. Weather → get_weather. Markets → get_market_data/analyze_market. Phone UI → device tools.",
+    "- MEDIA ROUTING (no exceptions): user asks for a picture/photo/logo/poster/flyer/design → generate_image (Seedream default) or design_image for graphic-design/text-heavy work — NEVER answer with a text description of pixels. User asks for video/clip/animation → generate_video. User shows a flat design to split → decompose_design. ALWAYS ground_scene first for realistic scenes.",
     "- Tool failed? Retry differently (tap_coordinates for tap_button, scroll then retry).",
     "- Market news: live get_market_news/search_web only — never memory, never old years.",
     "- Trading analysis happens HERE via a real analyze_market call — read direction/entry/SL/TP from its reply; the phone only EXECUTES orders after analysis.",
-    "- TRADING NUMBERS DISCIPLINE: report the engine's decision/entry_zone/scenario/pullback_health fields VERBATIM. NEVER invent MACD, Bollinger, ADX/DI, or session values the tools did not return — if you want an indicator the engine lacks, compute it with run_code from real candles, never from memory. When decision is WAIT_PULLBACK, present ONLY the pullback-zone entry (limit-style); never substitute a market entry. When a healthy pullback exists, scenario_2 IS the trade — scenario_1 immediates apply only when the engine is aligned. When decision is WAIT_RANGE, present ONLY the range-edge fade (limit at the proven edge toward midline, invalidation on close beyond); never market-enter mid-range. Every setup carries a costs block (net RR after spread/commission/slippage) — if costs are WEAK, say so and size down.",
+    "- NO ENGINE INTERNALS IN USER-FACING TEXT: the tool's `reasons`, `guards`, `antiX`, `structure_30m` and other diagnostic fields are for YOUR reasoning only. Never quote, list, summarise or leak them to the user, and never present a raw JSON/tool dump. Give the user the decision, the levels, the reasoning in plain language, and the risks that matter to them.",
+    "- NO RAW ENGINE OUTPUT: even when the user asks about a market, answer as FRIT in normal prose (or a clean chat summary). The user should never see the engine speak for itself, its internal reason strings, indicator dumps, or a pasted tool payload.",
+    "- TRADING NUMBERS DISCIPLINE: report the engine's decision/entry_zone/scenario/pullback_health fields VERBATIM. NEVER invent MACD, Bollinger, ADX/DI, or session values the tools did not return — if you want an indicator the engine lacks, compute it with run_code from real candles, never from memory. When decision is WAIT_PULLBACK, present ONLY the pullback-zone entry (limit-style); never substitute a market entry. When a healthy pullback exists, scenario_2 IS the trade — scenario_1 immediates apply only when the engine is aligned. When decision is WAIT_RANGE, present ONLY the range-edge fade (limit at the proven edge toward midline, invalidation on close beyond); never market-enter mid-range. Take-profit levels are structure-anchored and adapt to the current move (targets sit at real swing levels and scale with ATR) — always state the target's basis, and never repeat a stale target the engine has since moved. Every setup carries a costs block (net RR after spread/commission/slippage) — if costs are WEAK, say so and size down.",
     "",
     "PHONE UI SKILL — field-tested patterns for operating any app accurately (loaded from server/skills/phone-ui.md — edit that file to teach new patterns):",
     PHONE_UI_SKILL,
@@ -2586,6 +2966,7 @@ app.get("/", (_req, res) => {
       images: ["/images/generate", "/images/decompose"],
       video: ["/videos/submit", "/videos/status/:jobId", "/videos/content/:jobId"],
       creative: ["/creative/compose", "/creative/revise", "/creative/assemble", "/creative/ground", "/creative/jobs"],
+      creativeSuite: ["/creative-suite/images/generate", "/creative-suite/images/edit", "/creative-suite/images/remove-background", "/creative-suite/images/retouch", "/creative-suite/images/style-transfer", "/creative-suite/images/upscale", "/creative-suite/images/generative-fill", "/creative-suite/images/batch", "/creative-suite/videos/generate", "/creative-suite/videos/edit", "/creative-suite/videos/subtitles", "/creative-suite/videos/translate-subtitles", "/creative-suite/storyboard", "/creative-suite/templates", "/creative-suite/style-presets", "/creative-suite/prompt-suggest", "/creative-suite/prompt-enhance", "/creative-suite/recommend", "/creative-suite/projects", "/creative-suite/export"],
       billing: ["/billing/tiers", "/billing/pay-info", "/billing/subscribe", "/billing/submit-reference", "/billing/pending", "/billing/approve", "/billing/mint", "/billing/redeem", "/billing/status"],
       wallet: ["/wallet/balance", "/wallet/topup", "/wallet/spend", "/wallet/withdraw", "/wallet/withdrawals"],
       admin: ["/admin/inbox", "/admin/keys", "/admin/snapshot", "/admin/ledger/verify", "/admin/backup", "/admin/withdrawals/approve"],
@@ -2759,6 +3140,18 @@ app.all("/market/analyze", requireAuth, async (req, res) => {
 // ==================== TRADE ENDPOINT (engine.js only) ====================
 // MTFStrategyEngine (server/src/strategy/engine.js) is the single trading
 // engine. /trade always runs through it — no legacy/GSRI/ACP branches.
+//
+// The engine's internal `reasons` (its own reasoning strings) are NOT part of
+// the user payload: they read as the engine talking over the user's head.
+// They stay in server logs and are available to the creator console through
+// /admin/strategy/diagnostics. Risk-layer refusals use `risk_reasons` — those
+// describe the user's own account and ARE shown.
+function withoutEngineReasons(result) {
+  if (!result || typeof result !== "object") return result;
+  const { reasons, ...rest } = result;
+  return rest;
+}
+
 app.post("/trade", requireAuth, limitNormal, async (req, res) => {
   const { symbol, risk_percent = 1, balance, reason = "", interval = "1h" } = req.body || {};
   if (!symbol) return res.status(400).json({ error: "symbol required" });
@@ -2768,9 +3161,10 @@ app.post("/trade", requireAuth, limitNormal, async (req, res) => {
 
   try {
     const result = await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
+    console.log(`[/trade] ${symbol} ${result.decision} — reasons: ${JSON.stringify(result.reasons || [])}`);
 
     if (["NO_TRADE", "WAIT", "WAIT_PULLBACK", "WAIT_RANGE", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
-      return res.status(200).json({ status: "blocked", ...result });
+      return res.status(200).json({ status: "blocked", ...withoutEngineReasons(result) });
     }
     // Portfolio risk layer: account-level guards BEFORE anything reaches the bridge.
     const gate = riskGate({
@@ -2782,7 +3176,10 @@ app.post("/trade", requireAuth, limitNormal, async (req, res) => {
       balance: balance || 1000,
     });
     if (!gate.allowed) {
-      return res.status(200).json({ status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure, ...result });
+      return res.status(200).json({
+        status: "blocked", blocked_by: "risk", risk_reasons: gate.reasons,
+        exposure: gate.exposure, ...withoutEngineReasons(result),
+      });
     }
     const tradeResult = await sendToMT5Bridge({
       symbol: symbol.toUpperCase(),
@@ -2821,6 +3218,7 @@ app.post("/trade", requireAuth, limitNormal, async (req, res) => {
       sl: result.sl,
       tp: result.tp,
       tp2: result.tp2,
+      tp_basis: result.tp_basis ?? null,
       rr: result.rr,
       confidence: result.confidence,
       regime: result.regime,
@@ -3503,6 +3901,30 @@ app.get("/wallet/withdrawals", requireAuth, limitNormal, (req, res) => {
   const user_id = boundUser(req);
   res.json({ ok: true, withdrawals: db.prepare("SELECT id, amount_kobo, bank_name, account_number, account_name, status, admin_note, created_at FROM withdrawals WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(user_id) });
 });
+// Creator-only view of the engine's FULL diagnostic output, including the
+// internal `reasons` strings that are stripped from every user-facing
+// payload. Admin token only — this is how you inspect why the engine decided
+// what it decided without the user ever seeing it.
+app.get("/admin/strategy/diagnostics", requireAdmin, async (req, res) => {
+  const symbol = String(req.query.symbol || "XAUUSD").toUpperCase();
+  try {
+    const full = await mtfStrategy.analyze(symbol, {
+      interval: req.query.interval,
+      balance: req.query.balance != null ? Number(req.query.balance) : undefined,
+    });
+    res.json({
+      ok: true,
+      symbol,
+      note: "Creator diagnostics — includes engine-internal reasons. Never expose to users.",
+      reasons: full?.reasons ?? [],
+      guards: full?.guards ?? {},
+      full,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Diagnostics failed", details: err.message });
+  }
+});
+
 // Creator inbox: ONE poll for everything needing your eyes — payments,
 // withdrawals, trial feedback. The creator app polls this and notifies.
 app.get("/admin/inbox", requireAdmin, (_req, res) => {
@@ -3549,6 +3971,371 @@ app.post("/creative/ground", requireAuth, limitNormal, async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+// ==================== CREATIVE SUITE ====================
+app.post("/creative-suite/images/generate", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { prompt, style_preset, aspect_ratio, n, model } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+    const uid = boundUser(req);
+    const cap = checkCap(uid, "image");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const preset = promptEngine.STYLE_PRESETS.find(p => p.id === style_preset);
+    const enhancedPrompt = preset ? `${prompt}, ${preset.description}` : prompt;
+    const data = await generateImage(enhancedPrompt, { aspect_ratio, n, model });
+    db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    const assetId = `img_${Date.now()}`;
+    db.prepare("INSERT INTO creative_assets (id, user_id, kind, source, current_url, metadata) VALUES (?, ?, 'image', 'generated', ?, ?)")
+      .run(assetId, uid, data.image_url || "", JSON.stringify({ prompt, style_preset, model: data.model }));
+    res.json({ ok: true, asset_id: assetId, ...data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/images/edit", requireAuth, limitNormal, async (req, res) => {
+  try {
+    const { image, operations } = req.body || {};
+    if (!image || !Array.isArray(operations)) return res.status(400).json({ error: "image and operations required" });
+    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const resultBuffer = await imageProcessor.applyOperations(imageBuffer, operations);
+    const resultBase64 = resultBuffer.toString("base64");
+    const meta = await imageProcessor.getImageMetadata(resultBuffer);
+    res.json({ ok: true, result: `data:image/png;base64,${resultBase64}`, ...meta });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/images/remove-background", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { image } = req.body || {};
+    if (!image) return res.status(400).json({ error: "image required" });
+    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const result = await aiFeatures.removeBackground(imageBuffer);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/images/retouch", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { image, options } = req.body || {};
+    if (!image) return res.status(400).json({ error: "image required" });
+    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const result = await aiFeatures.retouch(imageBuffer, options || {});
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/images/style-transfer", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { image, style } = req.body || {};
+    if (!image || !style) return res.status(400).json({ error: "image and style required" });
+    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const result = await aiFeatures.styleTransfer(imageBuffer, style);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/images/upscale", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { image, scale } = req.body || {};
+    if (!image) return res.status(400).json({ error: "image required" });
+    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const result = await aiFeatures.upscaleImage(imageBuffer, scale || 2);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/images/generative-fill", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { image, mask, prompt } = req.body || {};
+    if (!image || !mask) return res.status(400).json({ error: "image and mask required" });
+    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const maskBuffer = Buffer.from(mask.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const result = await aiFeatures.generativeFill(imageBuffer, maskBuffer, prompt);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/images/batch", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { images, operation, params } = req.body || {};
+    if (!Array.isArray(images) || !images.length) return res.status(400).json({ error: "images array required" });
+    const uid = boundUser(req);
+    const jobId = `batch_${Date.now()}`;
+    db.prepare("INSERT INTO creative_batch_jobs (id, user_id, operation, asset_ids, params, status, total_count) VALUES (?, ?, ?, ?, ?, 'processing', ?)")
+      .run(jobId, uid, operation, JSON.stringify(images), JSON.stringify(params || {}), images.length);
+    const results = [];
+    for (let i = 0; i < images.length; i++) {
+      try {
+        const imgBuffer = Buffer.from(images[i].replace(/^data:image\/\w+;base64,/, ""), "base64");
+        let resultBuffer;
+        if (operation === "remove_bg") resultBuffer = await aiFeatures.removeBackground(imgBuffer);
+        else if (operation === "upscale") resultBuffer = await aiFeatures.upscaleImage(imgBuffer, params?.scale || 2);
+        else if (operation === "style_transfer") resultBuffer = await aiFeatures.styleTransfer(imgBuffer, params?.style || "realistic");
+        else resultBuffer = await imageProcessor.applyOperations(imgBuffer, [{ type: operation, params: params || {} }]);
+        results.push({ index: i, ok: true, result: resultBuffer.image_url || resultBuffer.result || `data:image/png;base64,${resultBuffer.toString("base64")}` });
+      } catch (e) {
+        results.push({ index: i, ok: false, error: e.message });
+      }
+      db.prepare("UPDATE creative_batch_jobs SET completed_count = ? WHERE id = ?").run(i + 1, jobId);
+    }
+    db.prepare("UPDATE creative_batch_jobs SET status = 'completed' WHERE id = ?").run(jobId);
+    res.json({ ok: true, job_id: jobId, status: "completed", results });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/videos/generate", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { prompt, duration, resolution, aspect_ratio, model } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Video needs Creator or Pro." });
+    const cap = checkCap(uid, "clip");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const job = await submitVideo(prompt, { duration, resolution, aspect_ratio, model });
+    const id = `vid_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video', 'submitted', ?)").run(id, uid, String(prompt).slice(0, 1000));
+    db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    res.json({ ok: true, job_id: id, provider_job: job });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/videos/edit", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { video, operations } = req.body || {};
+    if (!video) return res.status(400).json({ error: "video required" });
+    const results = await videoProcessor.processVideo(Buffer.from(video, "base64"), operations || []);
+    res.json({ ok: true, results });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/videos/subtitles", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { audio, language } = req.body || {};
+    if (!audio) return res.status(400).json({ error: "audio required" });
+    const audioBuffer = Buffer.from(audio.replace(/^data:audio\/\w+;base64,/, ""), "base64");
+    const result = await aiFeatures.generateSubtitles(audioBuffer, language || "auto");
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/videos/translate-subtitles", requireAuth, limitNormal, async (req, res) => {
+  try {
+    const { subtitles, target_language } = req.body || {};
+    if (!subtitles || !target_language) return res.status(400).json({ error: "subtitles and target_language required" });
+    const result = await aiFeatures.translateSubtitles(subtitles, target_language);
+    res.json({ ok: true, subtitles: result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/storyboard", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { script, style, num_frames } = req.body || {};
+    if (!script) return res.status(400).json({ error: "script required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Storyboard needs Creator or Pro." });
+    const frames = await aiFeatures.storyboard(script, style, num_frames || 6);
+    const generatedFrames = [];
+    for (const frame of frames.slice(0, 8)) {
+      try {
+        const img = await generateImage(frame.prompt, { model: OR_IMAGE_MODEL });
+        generatedFrames.push({ ...frame, image_url: img.image_url });
+      } catch (e) {
+        generatedFrames.push({ ...frame, image_url: null, error: e.message });
+      }
+    }
+    res.json({ ok: true, frames: generatedFrames });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/creative-suite/templates", requireAuth, limitNormal, (req, res) => {
+  const { category, platform } = req.query;
+  const templates = templateLibrary.getTemplates(category, platform);
+  res.json({ ok: true, templates });
+});
+
+app.post("/creative-suite/templates/:id/apply", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { assets } = req.body || {};
+    const result = templateLibrary.applyTemplate(req.params.id, assets || []);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/creative-suite/style-presets", requireAuth, limitNormal, (_req, res) => {
+  res.json({ ok: true, presets: promptEngine.STYLE_PRESETS });
+});
+
+app.post("/creative-suite/prompt-suggest", requireAuth, limitNormal, async (req, res) => {
+  try {
+    const { idea, context } = req.body || {};
+    if (!idea) return res.status(400).json({ error: "idea required" });
+    const suggestions = await promptEngine.suggestPrompts(idea, context);
+    res.json({ ok: true, suggestions });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/prompt-enhance", requireAuth, limitNormal, async (req, res) => {
+  try {
+    const { prompt, context } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+    const result = await promptEngine.enhancePrompt(prompt, context);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/recommend", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { image, type } = req.body || {};
+    if (!image) return res.status(400).json({ error: "image required" });
+    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    const analysis = await aiFeatures.analyzeImage(imageBuffer);
+    const recommendations = await promptEngine.recommendStyles(analysis);
+    res.json({ ok: true, recommendations });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/projects", requireAuth, limitNormal, (req, res) => {
+  try {
+    const { name, type, metadata } = req.body || {};
+    if (!name) return res.status(400).json({ error: "name required" });
+    const uid = boundUser(req);
+    const id = `proj_${Date.now()}`;
+    db.prepare("INSERT INTO creative_projects (id, user_id, name, type, metadata) VALUES (?, ?, ?, ?, ?)")
+      .run(id, uid, name, type || "image", JSON.stringify(metadata || {}));
+    res.json({ ok: true, project_id: id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/creative-suite/projects", requireAuth, limitNormal, (req, res) => {
+  const uid = boundUser(req);
+  const projects = db.prepare("SELECT id, name, type, status, thumbnail_url, metadata, updated_at FROM creative_projects WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100").all(uid);
+  res.json({ ok: true, projects });
+});
+
+app.get("/creative-suite/projects/:id", requireAuth, limitNormal, (req, res) => {
+  const uid = boundUser(req);
+  const project = db.prepare("SELECT * FROM creative_projects WHERE id = ?").get(req.params.id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  if (req.authUser && project.user_id && project.user_id !== req.authUser) return res.status(403).json({ error: "not your project" });
+  const assets = db.prepare("SELECT * FROM creative_assets WHERE project_id = ? ORDER BY created_at DESC").all(req.params.id);
+  res.json({ ok: true, project: { ...project, assets } });
+});
+
+app.put("/creative-suite/projects/:id", requireAuth, limitNormal, (req, res) => {
+  try {
+    const { name, metadata, status } = req.body || {};
+    const existing = db.prepare("SELECT * FROM creative_projects WHERE id = ?").get(req.params.id);
+    if (!existing) return res.status(404).json({ error: "project not found" });
+    if (name) db.prepare("UPDATE creative_projects SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(name, req.params.id);
+    if (metadata) db.prepare("UPDATE creative_projects SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(JSON.stringify(metadata), req.params.id);
+    if (status) db.prepare("UPDATE creative_projects SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(status, req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete("/creative-suite/projects/:id", requireAuth, limitNormal, (req, res) => {
+  const existing = db.prepare("SELECT * FROM creative_projects WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "project not found" });
+  db.prepare("DELETE FROM creative_assets WHERE project_id = ?").run(req.params.id);
+  db.prepare("DELETE FROM creative_projects WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post("/creative-suite/projects/:id/assets", requireAuth, limitNormal, (req, res) => {
+  try {
+    const { kind, source, url, metadata } = req.body || {};
+    if (!kind || !url) return res.status(400).json({ error: "kind and url required" });
+    const uid = boundUser(req);
+    const id = `asset_${Date.now()}`;
+    db.prepare("INSERT INTO creative_assets (id, project_id, user_id, kind, source, current_url, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(id, req.params.id, uid, kind, source || "uploaded", url, JSON.stringify(metadata || {}));
+    res.json({ ok: true, asset_id: id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/creative-suite/projects/:id/sync", requireAuth, limitNormal, (req, res) => {
+  try {
+    const { device_id, sync_data } = req.body || {};
+    db.prepare("INSERT INTO creative_sync_state (project_id, user_id, device_id, last_sync_at, sync_data) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?) ON CONFLICT(project_id) DO UPDATE SET device_id = ?, last_sync_at = CURRENT_TIMESTAMP, sync_data = ?")
+      .run(req.params.id, boundUser(req), device_id, JSON.stringify(sync_data || {}), device_id, JSON.stringify(sync_data || {}));
+    res.json({ ok: true, last_sync_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/creative-suite/projects/:id/sync", requireAuth, limitNormal, (req, res) => {
+  const row = db.prepare("SELECT * FROM creative_sync_state WHERE project_id = ?").get(req.params.id);
+  res.json({ ok: true, sync_data: row ? JSON.parse(row.sync_data || "{}") : null, last_sync_at: row?.last_sync_at || null });
+});
+
+app.post("/creative-suite/projects/:id/collaborators", requireAuth, limitNormal, (req, res) => {
+  try {
+    const { user_id, role } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "user_id required" });
+    db.prepare("INSERT INTO creative_collaborators (project_id, owner_user_id, collaborator_user_id, role) VALUES (?, ?, ?, ?)")
+      .run(req.params.id, boundUser(req), user_id, role || "editor");
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/creative-suite/projects/:id/collaborators", requireAuth, limitNormal, (req, res) => {
+  const collabs = db.prepare("SELECT * FROM creative_collaborators WHERE project_id = ?").all(req.params.id);
+  res.json({ ok: true, collaborators: collabs });
+});
+
+app.post("/creative-suite/export", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { asset_url, platform, options } = req.body || {};
+    if (!asset_url || !platform) return res.status(400).json({ error: "asset_url and platform required" });
+    const preset = templateLibrary.EXPORT_PRESETS[platform];
+    if (!preset) return res.status(400).json({ error: "unsupported platform" });
+    res.json({ ok: true, platform, preset, asset_url, note: "Export processing delegated to client-side rendering with platform preset" });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Trial feedback: testers on trial codes tell us what broke (rating 1-5 + text).
 app.post("/feedback", requireAuth, limitNormal, (req, res) => {
   const { message, rating } = req.body || {};
@@ -3652,6 +4439,434 @@ app.get("/systems/status", requireAuth, (_req, res) => {
   });
 });
 
+// ==================== TRADING SUITE API ====================
+// Comprehensive AI-powered trading endpoints for mobile app
+
+// --- Watchlist Management ---
+app.get("/api/trading/watchlist", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const watchlist = db.prepare("SELECT * FROM trading_watchlist WHERE user_id = ? ORDER BY sort_order ASC").all(user_id);
+    res.json({ items: watchlist });
+  } catch (err) {
+    res.status(500).json({ error: "Watchlist fetch failed", details: err.message });
+  }
+});
+
+app.post("/api/trading/watchlist", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbol, name, assetClass } = req.body || {};
+    if (!symbol) return res.status(400).json({ error: "symbol required" });
+    const sym = String(symbol).toUpperCase();
+    const existing = db.prepare("SELECT * FROM trading_watchlist WHERE user_id = ? AND symbol = ?").get(user_id, sym);
+    if (existing) {
+      return res.status(409).json({ error: "Already in watchlist" });
+    }
+    const maxOrder = db.prepare("SELECT COALESCE(MAX(sort_order), 0) as max FROM trading_watchlist WHERE user_id = ?").get(user_id)?.max || 0;
+    db.prepare("INSERT INTO trading_watchlist (user_id, symbol, name, asset_class, sort_order) VALUES (?, ?, ?, ?, ?)")
+      .run(user_id, sym, name || sym, assetClass || "FOREX", maxOrder + 1);
+    const item = db.prepare("SELECT * FROM trading_watchlist WHERE user_id = ? AND symbol = ?").get(user_id, sym);
+    res.json({ ok: true, item });
+  } catch (err) {
+    res.status(500).json({ error: "Watchlist add failed", details: err.message });
+  }
+});
+
+app.delete("/api/trading/watchlist/:symbol", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const sym = String(req.params.symbol).toUpperCase();
+    const result = db.prepare("DELETE FROM trading_watchlist WHERE user_id = ? AND symbol = ?").run(user_id, sym);
+    if (result.changes === 0) return res.status(404).json({ error: "Not in watchlist" });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Watchlist remove failed", details: err.message });
+  }
+});
+
+app.patch("/api/trading/watchlist/:symbol", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const sym = String(req.params.symbol).toUpperCase();
+    const { isEnabled, sortOrder } = req.body || {};
+    const updates = [];
+    const values = [];
+    if (typeof isEnabled === "boolean") { updates.push("is_enabled = ?"); values.push(isEnabled ? 1 : 0); }
+    if (typeof sortOrder === "number") { updates.push("sort_order = ?"); values.push(sortOrder); }
+    if (updates.length === 0) return res.status(400).json({ error: "No updates provided" });
+    db.prepare(`UPDATE trading_watchlist SET ${updates.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND symbol = ?`).run(...values, user_id, sym);
+    const item = db.prepare("SELECT * FROM trading_watchlist WHERE user_id = ? AND symbol = ?").get(user_id, sym);
+    res.json({ ok: true, item });
+  } catch (err) {
+    res.status(500).json({ error: "Watchlist update failed", details: err.message });
+  }
+});
+
+// --- Signal Scanning (batch analyze watchlist) ---
+app.post("/api/trading/scan", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbols, forceRefresh } = req.body || {};
+    let scanSymbols = symbols;
+    if (!scanSymbols || !scanSymbols.length) {
+      const watchlist = db.prepare("SELECT symbol FROM trading_watchlist WHERE user_id = ? AND is_enabled = 1 ORDER BY sort_order ASC").all(user_id);
+      scanSymbols = watchlist.map(w => w.symbol);
+    }
+    if (!scanSymbols.length) return res.json({ signals: [], scannedAt: Date.now() });
+
+    const results = [];
+    for (const sym of scanSymbols.slice(0, 20)) {
+      try {
+        const result = await mtfStrategy.analyze(sym, {});
+        const signal = formatTradingSignal(sym, result);
+        // Only persist meaningful signals — plain WAIT/DATA noise would flood
+        // history. WAIT_PULLBACK / WAIT_RANGE carry actionable zones.
+        const keep = ["BUY", "SELL", "WAIT_PULLBACK", "WAIT_RANGE"].includes(signal.decision);
+        if (keep) storeSignalHistory(user_id, signal);
+        results.push(signal);
+      } catch (e) {
+        console.warn(`[scan] ${sym} failed:`, e.message);
+      }
+    }
+    const alerts = results.filter(s => ["BUY", "SELL"].includes(s.decision));
+    res.json({ signals: results, alerts, scannedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Scan failed", details: err.message });
+  }
+});
+
+// --- Signal History ---
+app.get("/api/trading/signals/history", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbol, limit = 50, favoritesOnly, unreadOnly } = req.query;
+    let query = "SELECT * FROM trading_signals WHERE user_id = ?";
+    const params = [user_id];
+    if (symbol) { query += " AND symbol = ?"; params.push(String(symbol).toUpperCase()); }
+    if (favoritesOnly === "true") { query += " AND is_favorite = 1"; }
+    if (unreadOnly === "true") { query += " AND is_read = 0"; }
+    query += " ORDER BY timestamp DESC LIMIT ?";
+    params.push(Number(limit));
+    const signals = db.prepare(query).all(...params).map(hydrateSignal);
+    const total = db.prepare(`SELECT COUNT(*) as c FROM trading_signals WHERE user_id = ?${symbol ? " AND symbol = ?" : ""}${favoritesOnly === "true" ? " AND is_favorite = 1" : ""}${unreadOnly === "true" ? " AND is_read = 0" : ""}`).get(...params.slice(0, -1))?.c || 0;
+    res.json({ signals, total });
+  } catch (err) {
+    res.status(500).json({ error: "Signal history failed", details: err.message });
+  }
+});
+
+app.post("/api/trading/signals/:id/favorite", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const id = req.params.id;
+    const { favorite } = req.body;
+    db.prepare("UPDATE trading_signals SET is_favorite = ? WHERE id = ? AND user_id = ?").run(favorite ? 1 : 0, id, user_id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Favorite toggle failed", details: err.message });
+  }
+});
+
+app.post("/api/trading/signals/:id/read", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const id = req.params.id;
+    db.prepare("UPDATE trading_signals SET is_read = 1 WHERE id = ? AND user_id = ?").run(id, user_id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Mark read failed", details: err.message });
+  }
+});
+
+app.delete("/api/trading/signals/:id", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const id = req.params.id;
+    db.prepare("DELETE FROM trading_signals WHERE id = ? AND user_id = ?").run(id, user_id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Delete signal failed", details: err.message });
+  }
+});
+
+// --- Portfolio ---
+app.get("/api/trading/portfolio", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const balance = Number(req.query.balance) || 1000;
+    
+    // Get open positions from PositionMonitor
+    const openPositions = positionMonitor.list(100).filter(p => p.status === "MONITORING");
+    
+    // Get resolved positions for P&L
+    const resolvedPositions = positionMonitor.list(500).filter(p => p.status === "RESOLVED");
+    
+    // Calculate metrics
+    let unrealizedPnl = 0, realizedPnl = 0;
+    const positions = [];
+    
+    for (const pos of openPositions) {
+      const spot = await fetchSpotPrice(pos.symbol);
+      if (spot) {
+        const isLong = pos.action === "buy";
+        const pnl = isLong 
+          ? (spot.price - pos.entry) * pos.lot_size * (PIP_CONFIG[pos.symbol]?.pipValue || 10)
+          : (pos.entry - spot.price) * pos.lot_size * (PIP_CONFIG[pos.symbol]?.pipValue || 10);
+        unrealizedPnl += pnl;
+        positions.push({
+          id: pos.id, symbol: pos.symbol, side: pos.action.toUpperCase(),
+          entryPrice: pos.entry, currentPrice: spot.price, lotSize: pos.lot_size,
+          sl: pos.sl, tp: pos.tp, unrealizedPnl: pnl, realizedPnl: 0,
+          status: "OPEN", openedAt: new Date(pos.placed_at).getTime(), closedAt: null
+        });
+      }
+    }
+    
+    for (const pos of resolvedPositions.slice(0, 50)) {
+      const cfg = PIP_CONFIG[pos.symbol];
+      const isLong = pos.action === "buy";
+      const pnl = cfg ? (isLong 
+        ? ((pos.close_price - pos.entry) / cfg.pipSize) * cfg.pipValue * pos.lot_size
+        : ((pos.entry - pos.close_price) / cfg.pipSize) * cfg.pipValue * pos.lot_size
+      ) : 0;
+      realizedPnl += pnl;
+      positions.push({
+        id: pos.id, symbol: pos.symbol, side: pos.action.toUpperCase(),
+        entryPrice: pos.entry, currentPrice: pos.close_price, lotSize: pos.lot_size,
+        sl: pos.sl, tp: pos.tp, unrealizedPnl: 0, realizedPnl: pnl,
+        status: pos.outcome === "win" ? "CLOSED_WIN" : "CLOSED_LOSS",
+        openedAt: new Date(pos.placed_at).getTime(), closedAt: new Date(pos.resolved_at).getTime()
+      });
+    }
+    
+    // Risk metrics from PortfolioRisk
+    const riskStatus = portfolioRisk.status(balance);
+    
+    res.json({
+      positions,
+      summary: {
+        totalPositions: openPositions.length,
+        unrealizedPnl: Number(unrealizedPnl.toFixed(2)),
+        realizedPnl: Number(realizedPnl.toFixed(2)),
+        totalPnl: Number((unrealizedPnl + realizedPnl).toFixed(2)),
+        balance,
+        equity: balance + unrealizedPnl + realizedPnl
+      },
+      risk: riskStatus
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Portfolio fetch failed", details: err.message });
+  }
+});
+
+// --- Risk Management ---
+app.get("/api/trading/risk", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const balance = Number(req.query.balance) || 1000;
+    const riskStatus = portfolioRisk.status(balance);
+    res.json(riskStatus);
+  } catch (err) {
+    res.status(500).json({ error: "Risk status failed", details: err.message });
+  }
+});
+
+// --- Sentiment Analysis (cached daily) ---
+app.get("/api/trading/sentiment", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbols } = req.query;
+    let symList = symbols ? String(symbols).split(",").map(s => s.trim().toUpperCase()) : [];
+    
+    if (!symList.length) {
+      const watchlist = db.prepare("SELECT symbol FROM trading_watchlist WHERE user_id = ? AND is_enabled = 1").all(user_id);
+      symList = watchlist.map(w => w.symbol);
+    }
+    
+    const sentiment = {};
+    const today = new Date().toISOString().slice(0, 10);
+    for (const sym of symList.slice(0, 10)) {
+      const cacheKey = `sentiment:${sym}:${today}`;
+      let data = cacheGet(cacheKey);
+      if (!data) {
+        // SQLite daily cache survives restarts (memory cache does not)
+        try {
+          const row = db.prepare("SELECT data, cached_at FROM sentiment_cache WHERE symbol = ?").get(`${sym}:${today}`);
+          if (row) { data = JSON.parse(row.data); cacheSet(cacheKey, data, 24 * 60 * 60 * 1000); }
+        } catch { /* cache miss */ }
+      }
+      if (!data) {
+        data = await fetchSentiment(sym);
+        cacheSet(cacheKey, data, 24 * 60 * 60 * 1000);
+        try {
+          db.prepare("INSERT OR REPLACE INTO sentiment_cache (symbol, data, cached_at) VALUES (?, ?, ?)").run(`${sym}:${today}`, JSON.stringify(data), Date.now());
+          // Prune caches older than 7 days
+          db.prepare("DELETE FROM sentiment_cache WHERE cached_at < ?").run(Date.now() - 7 * 24 * 3600 * 1000);
+        } catch { /* best-effort */ }
+      }
+      sentiment[sym] = data;
+    }
+    res.json({ sentiment, cachedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Sentiment fetch failed", details: err.message });
+  }
+});
+
+// --- Explainable AI ---
+app.post("/api/trading/ai/explain", requireAuth, async (req, res) => {
+  try {
+    const { signalId, detailLevel = "full" } = req.body || {};
+    if (!signalId) return res.status(400).json({ error: "signalId required" });
+    
+    const signal = db.prepare("SELECT * FROM trading_signals WHERE id = ?").get(signalId);
+    if (!signal) return res.status(404).json({ error: "Signal not found" });
+    
+    const explanation = await generateSignalExplanation(signal, detailLevel);
+    res.json(explanation);
+  } catch (err) {
+    res.status(500).json({ error: "Explanation failed", details: err.message });
+  }
+});
+
+// --- AI Recommendations ---
+app.post("/api/trading/ai/recommendations", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { riskProfile = "MODERATE", capital = 10000 } = req.body || {};
+    
+    const watchlist = db.prepare("SELECT symbol FROM trading_watchlist WHERE user_id = ? AND is_enabled = 1").all(user_id);
+    const symbols = watchlist.map(w => w.symbol);
+    
+    const recommendations = [];
+    for (const sym of symbols.slice(0, 5)) {
+      const result = await mtfStrategy.analyze(sym, { balance: capital, riskPercent: riskProfile === "CONSERVATIVE" ? 0.5 : riskProfile === "AGGRESSIVE" ? 2 : 1 });
+      if (result.decision === "BUY" || result.decision === "SELL") {
+        recommendations.push({
+          symbol: sym,
+          action: result.decision,
+          confidence: result.confidence,
+          entry: result.entry,
+          sl: result.sl,
+          tp1: result.tp,
+          tp2: result.tp2,
+          rr: result.rr,
+          reasoning: result.reason,
+          regime: result.regime?.macro_trend,
+          positionSize: calculateLotSize({ symbol: sym, balance: capital, riskPercent: 1, entry: result.entry, stopLoss: result.sl })
+        });
+      }
+    }
+    
+    res.json({ recommendations, generatedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Recommendations failed", details: err.message });
+  }
+});
+
+// --- Learning Hub ---
+app.get("/api/trading/learning", requireAuth, async (req, res) => {
+  try {
+    const { category } = req.query;
+    const content = getLearningContent(category);
+    res.json({ content });
+  } catch (err) {
+    res.status(500).json({ error: "Learning content failed", details: err.message });
+  }
+});
+
+// --- Push Notification Registration ---
+app.post("/api/trading/notifications/register", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { token, platform } = req.body || {};
+    if (!token) return res.status(400).json({ error: "token required" });
+    db.prepare("INSERT OR REPLACE INTO push_tokens (user_id, token, platform, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)").run(user_id, token, platform || "android");
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Token registration failed", details: err.message });
+  }
+});
+
+app.post("/api/trading/notifications/preferences", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { signalAlerts, tpSlAlerts, newsAlerts, dailySummary } = req.body || {};
+    db.prepare("INSERT OR REPLACE INTO notification_prefs (user_id, signal_alerts, tp_sl_alerts, news_alerts, daily_summary) VALUES (?, ?, ?, ?, ?)")
+      .run(user_id, signalAlerts ? 1 : 0, tpSlAlerts ? 1 : 0, newsAlerts ? 1 : 0, dailySummary ? 1 : 0);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Preferences update failed", details: err.message });
+  }
+});
+
+// --- Price-threshold / TP-SL proximity alerts ---
+// Client polls this with its open signals; server compares live spot vs
+// entry/SL/TP1/TP2 and reports touches so the app can fire notifications.
+app.post("/api/trading/alerts/check", requireAuth, async (req, res) => {
+  try {
+    const { signals } = req.body || {};
+    if (!Array.isArray(signals) || !signals.length) return res.json({ alerts: [] });
+    const alerts = [];
+    for (const s of signals.slice(0, 20)) {
+      try {
+        const sym = String(s.symbol || "").toUpperCase();
+        const spot = await fetchSpotPrice(sym);
+        if (!spot) continue;
+        const px = spot.price;
+        const near = (level) => {
+          if (level == null || !Number.isFinite(Number(level))) return false;
+          const lv = Number(level);
+          const tol = Math.max(Math.abs(px) * 0.0005, 1e-9); // 0.05% touch band
+          return Math.abs(px - lv) <= tol;
+        };
+        if (near(s.tp1)) alerts.push({ symbol: sym, kind: "TP1_HIT", price: px, signalId: s.id || null });
+        else if (near(s.tp2)) alerts.push({ symbol: sym, kind: "TP2_HIT", price: px, signalId: s.id || null });
+        else if (near(s.sl)) alerts.push({ symbol: sym, kind: "SL_HIT", price: px, signalId: s.id || null });
+        else if (near(s.entry)) alerts.push({ symbol: sym, kind: "ENTRY_TOUCH", price: px, signalId: s.id || null });
+      } catch { /* per-symbol best effort */ }
+    }
+    res.json({ alerts, checkedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Alert check failed", details: err.message });
+  }
+});
+
+// --- Live feed status + manual resync ---
+app.get("/api/trading/feed/status", requireAuth, async (_req, res) => {
+  try {
+    res.json({ ...liveFeed.status(), serverTime: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Feed status failed", details: err.message });
+  }
+});
+
+app.post("/api/trading/feed/resync", requireAuth, async (_req, res) => {
+  try {
+    await liveFeed.resync();
+    res.json({ ok: true, ...liveFeed.status() });
+  } catch (err) {
+    res.status(500).json({ error: "Feed resync failed", details: err.message });
+  }
+});
+
+// --- Offline Sync ---
+app.get("/api/trading/sync", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { since } = req.query;
+    const sinceTs = since ? Number(since) : 0;
+    
+    const watchlist = db.prepare("SELECT * FROM trading_watchlist WHERE user_id = ? AND updated_at > ?").all(user_id, sinceTs);
+    const signals = db.prepare("SELECT * FROM trading_signals WHERE user_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 100").all(user_id, sinceTs);
+    const prefs = db.prepare("SELECT * FROM notification_prefs WHERE user_id = ?").get(user_id);
+    
+    res.json({ watchlist, signals, prefs, serverTime: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Sync failed", details: err.message });
+  }
+});
+
 // ====== ERROR HANDLER ======
 app.use((err, _req, res, _next) => {
   console.error("Unhandled Error!", err);
@@ -3671,7 +4886,7 @@ Single OpenRouter gateway:
  - GLM-5.3-Flash — chat + agentic + tools + coding (primary)
  - gpt-oss-20b — fast/verify/router
  - whisper-large-v3 — STT (accuracy pick)
- - gemini-2.5-flash-image — image gen
+ - bytedance-seed/seedream-5-0-flash — image gen
 Infrastructure:
  - Lot size engine (per-pair pip math)
  - MT5 bridge (live) or paper mode

@@ -48,6 +48,113 @@ const ATR_SL_MULT = 1.5;
 const MAX_SL_ATR_MULT = 2.5;
 const MIN_RR = 1.5;
 
+// ---------------------------------------------------------------------------
+// ADAPTIVE TARGETS — targets that follow the market, not a fixed R ladder.
+//
+// A static 1.5R/2.5R ladder is arbitrary: it ignores where the market's real
+// structure is, so it routinely parks a target 0.3 ATR beyond a level price
+// has already rejected three times, or aims at a "2.5R" that sits inside a
+// consolidation. Instead:
+//
+//  1. STRUCTURE FIRST. Every real level ahead of entry is collected — the
+//     impulse extreme being pulled back into, the prior swing high/low, the
+//     opposite range edge, and measured-move projections of the current leg
+//     (1.0x and 1.618x leg range). The NEAREST one that still clears the
+//     minimum distance becomes TP1.
+//  2. ATR-ADAPTIVE MULTIPLIERS as the yardstick. The minimum distance is
+//     atrMult x slDist, where atrMult rises with a strong, trending tape
+//     (ADX percentile) and falls when the tape is weak, so targets stretch in
+//     a real move and come in when the market is going nowhere. Hard caps
+//     stop a target drifting out of the leg.
+//  3. TP2 = the next level beyond TP1, or a further ATR projection when the
+//     structure runs out — so the runner follows the move too.
+//
+// Every returned target carries `basis`, the reason it sits where it does.
+// That is what the user is told instead of a bare number.
+// ---------------------------------------------------------------------------
+function adaptiveTargets({
+  side, entry, slDist, atr, swings = null, rangeInfo = null,
+  legStart = null, legEnd = null, adxPercentile = null,
+  minMult = null, maxMult = 3.0, runnerMult = 2.5,
+}) {
+  const isLong = side === "BUY";
+  const dir = isLong ? 1 : -1;
+  if (!(slDist > 0) || !(atr > 0)) {
+    const tp1 = entry + dir * (slDist || atr || 0) * (minMult || MIN_RR);
+    return {
+      tp1, tp2: entry + dir * (slDist || atr || 0) * runnerMult,
+      rr: slDist > 0 ? Math.abs(tp1 - entry) / slDist : 0,
+      basis: "flat projection (no ATR)", tp1Basis: "flat projection", tp2Basis: "flat projection",
+    };
+  }
+
+  // ATR-adaptive multiplier: strong relative trend earns a further target,
+  // a weak tape brings it in to something the market can actually reach.
+  const strong = typeof adxPercentile === "number" && adxPercentile >= 70;
+  const weakTape = typeof adxPercentile === "number" && adxPercentile < 40;
+  const atrMult = minMult != null ? minMult : (strong ? 2.0 : weakTape ? 1.25 : MIN_RR);
+  const minDist = atrMult * slDist;
+  const maxDist = maxMult * slDist;
+
+  // ---- Collect real levels ahead of entry, nearest first ----
+  const levels = [];
+  const push = (price, label) => {
+    if (price == null || !Number.isFinite(price)) return;
+    const dist = dir * (price - entry);
+    if (dist <= 0) return;             // behind entry — not a target
+    levels.push({ price, label, dist });
+  };
+  push(legEnd, "impulse extreme");                    // leg we are retracing
+  if (isLong) push(swings?.lastHigh, "prior swing high");
+  else push(swings?.lastLow, "prior swing low");
+  if (rangeInfo && rangeInfo.tradable) {
+    push(rangeInfo.mid, "range midline");               // where a fade aims first
+    push(isLong ? rangeInfo.upper : rangeInfo.lower, "opposite range edge");
+  }
+  const legRange = (legStart != null && legEnd != null) ? Math.abs(legEnd - legStart) : 0;
+  if (legRange > 0) {
+    push(entry + dir * legRange, "1.0x leg projection");
+    push(entry + dir * legRange * 1.618, "1.618x leg projection");
+  }
+  levels.sort((a, b) => a.dist - b.dist);
+
+  // ---- TP1: nearest structure that clears the ATR yardstick, else projection ----
+  let tp1 = null, tp1Basis = "";
+  for (const lv of levels) {
+    if (lv.dist < minDist) continue;   // too close to be worth the risk
+    if (lv.dist > maxDist) break;      // out of reach this leg
+    tp1 = lv.price; tp1Basis = lv.label; break;
+  }
+  if (tp1 == null) {
+    const proj = entry + dir * minDist;
+    tp1Basis = levels.length ? `${atrMult}R ATR projection (nearest structure too close or too far)` : `${atrMult}R ATR projection (no structure ahead)`;
+    tp1 = proj;
+  }
+
+  // ---- TP2: next level beyond TP1, else a further ATR projection ----
+  const tp1Dist = Math.abs(tp1 - entry);
+  let tp2 = null, tp2Basis = "";
+  for (const lv of levels) {
+    if (lv.dist <= tp1Dist + 1e-12) continue;
+    tp2 = lv.price; tp2Basis = lv.label; break;
+  }
+  if (tp2 == null) {
+    // The runner must sit meaningfully BEYOND TP1, otherwise "scale out here,
+    // leave a runner there" is the same price twice. Proportional spacing
+    // scales with how far TP1 already reached; runnerMult is the floor.
+    tp2 = entry + dir * Math.max(tp1Dist * 1.5, runnerMult * slDist);
+    tp2Basis = `${runnerMult}R ATR extension`;
+  }
+
+  return {
+    tp1, tp2,
+    rr: Math.abs(tp1 - entry) / slDist,
+    atrMult,
+    basis: `${tp1Basis} (ATR-adaptive ${atrMult}R floor)`,
+    tp1Basis, tp2Basis,
+  };
+}
+
 // 4H trend is only trusted when ADX is strong RELATIVE TO THAT SYMBOL'S OWN
 // history (percentile rank), not a fixed absolute number — a fixed cutoff
 // (e.g. ADX >= 25) means very different things on XAUUSD vs a quiet FX pair.
@@ -278,7 +385,7 @@ function calculateAnticipatedCrossoverPrice(ema9, ema21) {
 // "publish NO pullback level this run" — strictly better than a fake level.
 // All distances are ATR-relative, so this holds across XAUUSD, FX and crypto.
 // ---------------------------------------------------------------------------
-function fibPullbackZone({ swings, macroSide, emaSlow, atr, price }) {
+function fibPullbackZone({ swings, macroSide, emaSlow, atr, price, adxPercentile = null }) {
   const isLong = macroSide === "BUY";
   const legStart = isLong ? swings.prevLow : swings.prevHigh;
   const legEnd = isLong ? swings.lastHigh : swings.lastLow;
@@ -306,14 +413,17 @@ function fibPullbackZone({ swings, macroSide, emaSlow, atr, price }) {
     slDist = Math.max(slDist, 0.75 * atr);             // floor (survive noise)
     const sl = isLong ? entry - slDist : entry + slDist;
 
-    // TP1 pays at the impulse extreme; if the extreme is too close to pay
-    // MIN_RR, there is no business case — fall back to a 1.5R projection so
-    // reported RR never advertises a sub-standard trade.
-    const extremePays = Math.abs(legEnd - entry) >= MIN_RR * slDist;
-    const tp1 = extremePays
-      ? legEnd
-      : (isLong ? entry + 1.5 * slDist : entry - 1.5 * slDist);
-    const tp2 = isLong ? entry + 2.5 * slDist : entry - 2.5 * slDist;
+    // Targets follow the market: the impulse extreme is the first real level
+    // ahead of the entry, but it only becomes TP1 if it still clears the
+    // ATR-adaptive floor — otherwise the adaptive ladder takes over.
+    const t = adaptiveTargets({
+      side: isLong ? "BUY" : "SELL",
+      entry, slDist, atr, swings,
+      legStart, legEnd, adxPercentile,
+      minMult: MIN_RR, maxMult: 3.0, runnerMult: 2.5,
+    });
+    const tp1 = t.tp1;
+    const tp2 = t.tp2;
     const rr = slDist > 0 ? Math.abs(tp1 - entry) / slDist : 0;
 
     if (Math.abs(entry - price) > 2 * atr) return null; // too far — chasing, not a setup
@@ -324,6 +434,8 @@ function fibPullbackZone({ swings, macroSide, emaSlow, atr, price }) {
     return {
       entry, zoneLow: lo, zoneHigh: hi, fib50, fib618, fib786, invalidation,
       sl, tp1, tp2, rr, confluence, weak: false, legStart, legEnd,
+      tp_basis: t.basis, tp1_basis: t.tp1Basis, tp2_basis: t.tp2Basis,
+      tp_atr_mult: t.atrMult ?? null,
     };
   }
 
@@ -335,14 +447,22 @@ function fibPullbackZone({ swings, macroSide, emaSlow, atr, price }) {
   const entry = emaSlow;
   if (Math.abs(entry - price) > 2 * atr) return null;
   const sl = isLong ? entry - slDist : entry + slDist;
+  const wt = adaptiveTargets({
+    side: isLong ? "BUY" : "SELL",
+    entry, slDist, atr, swings,
+    legStart: null, legEnd: null, adxPercentile,
+    minMult: MIN_RR, maxMult: 3.0, runnerMult: 2.5,
+  });
   return {
     entry,
     zoneLow: entry - 0.25 * atr, zoneHigh: entry + 0.25 * atr,
     fib50: null, fib618: null, fib786: null, invalidation: sl,
     sl,
-    tp1: isLong ? entry + 1.5 * slDist : entry - 1.5 * slDist,
-    tp2: isLong ? entry + 2.5 * slDist : entry - 2.5 * slDist,
-    rr: 1.5, confluence: false, weak: true, legStart: null, legEnd: null,
+    tp1: wt.tp1,
+    tp2: wt.tp2,
+    rr: wt.rr, confluence: false, weak: true, legStart: null, legEnd: null,
+    tp_basis: wt.basis, tp1_basis: wt.tp1Basis, tp2_basis: wt.tp2Basis,
+    tp_atr_mult: wt.atrMult ?? null,
   };
 }
 
@@ -413,14 +533,31 @@ function detectRange({ swings, atr, emaFast, emaSlow, rsiNow, price }) {
   const sl = side === "BUY" ? edge - 0.35 * atr : edge + 0.35 * atr;
   const slDist = Math.abs(edge - sl); // = 0.35 ATR by construction
   const mid = (upper + lower) / 2;
-  const opposite = side === "BUY" ? upper : lower;
-  const tp1 = mid;
-  const tp2 = opposite;
+  // Range targets are structure by nature (midline, then the opposite edge),
+  // so they route through the same adaptive helper: the midline is only taken
+  // when it clears the ATR floor, otherwise the scaled projection stands in.
+  // A range that is too tight to reach its own midline after costs is a no-trade.
+  const rt = adaptiveTargets({
+    side, entry: edge, slDist, atr,
+    swings: null,
+    rangeInfo: { tradable: true, upper, lower, mid },
+    legStart: null, legEnd: null,
+    adxPercentile: null,
+    minMult: 1.2,
+    // A fade's first real objective is the midline, so the reach ceiling has
+    // to admit it. A range too tight to pay MIN_RR after the ATR floor still
+    // fails the gate below — that stays a no-trade, as before.
+    maxMult: Math.max(8.0, Math.abs(mid - edge) / slDist),
+    runnerMult: 3.0,
+  });
+  const tp1 = rt.tp1;
+  const tp2 = rt.tp2;
   const rr = slDist > 0 ? Math.abs(tp1 - edge) / slDist : 0;
   if (rr < MIN_RR - 1e-9) return { ...base, tradable: false, touchesUp, touchesLo, why: "geometry pays below minimum RR" };
   return {
     ...base, tradable: true, side, touchesUp, touchesLo,
     edge, entry: edge, sl, tp1, tp2, rr, mid,
+    tp_basis: rt.basis, tp1_basis: rt.tp1Basis, tp2_basis: rt.tp2Basis,
     invalidation: sl, // 30M close beyond edge+buffer = range broken
   };
 }
@@ -487,10 +624,16 @@ export class MTFStrategyEngine {
     const t0 = Date.now();
 
     // Primary: 30m (120 candles = 60 hours) | Confirmation: 4h (80 candles = ~13 days)
-    const [candles30M, candles4H] = await Promise.all([
-      this._candles(sym, "30m", 120),
-      this._candles(sym, "4h", 80),
-    ]);
+    // LIVE-FEED SEAM: callers with locally-built candles (WebSocket/poll ticks
+    // aggregated by CandleStore) pass them in and skip Twelve Data entirely —
+    // steady-state scanning then costs 0 API credits. REST remains the
+    // backfill path when no injected candles are supplied.
+    const [candles30M, candles4H] = (options.candles30M && options.candles4H)
+      ? [options.candles30M, options.candles4H]
+      : await Promise.all([
+        this._candles(sym, "30m", 120),
+        this._candles(sym, "4h", 80),
+      ]);
 
     const need30M = SLOW_PERIOD + RSI_PERIOD + VOL_SMA_PERIOD + 10;
     const need4H = Math.max(SLOW_PERIOD + 5, ADX_PERIOD * 2 + 5); // ADX needs 2x period to warm up
@@ -654,9 +797,15 @@ export class MTFStrategyEngine {
       const isLong = reversalSide === "BUY";
       const slDist = Math.min(MAX_SL_ATR_MULT * atr30M, Math.max(ATR_SL_MULT * atr30M, isLong ? (swings.lastLow ? price - swings.lastLow + 0.1 * atr30M : ATR_SL_MULT * atr30M) : (swings.lastHigh ? swings.lastHigh - price + 0.1 * atr30M : ATR_SL_MULT * atr30M)));
       const sl = isLong ? price - slDist : price + slDist;
-      const tp1 = isLong ? price + 1.8 * slDist : price - 1.8 * slDist;
-      const tp2 = isLong ? price + 2.5 * slDist : price - 2.5 * slDist;
-      const rr = slDist > 0 ? Math.abs(tp1 - price) / slDist : 1.8;
+      const revT = adaptiveTargets({
+        side: reversalSide, entry: price, slDist, atr: atr30M, swings,
+        legStart: isLong ? swings.lastLow : swings.lastHigh,
+        legEnd: isLong ? swings.lastHigh : swings.lastLow,
+        adxPercentile: adxPercentile4h, minMult: 1.5, maxMult: 3.0, runnerMult: 2.5,
+      });
+      const tp1 = revT.tp1;
+      const tp2 = revT.tp2;
+      const rr = slDist > 0 ? Math.abs(tp1 - price) / slDist : revT.rr;
 
       scenario1 = {
         name: `Immediate ${reversalSide} Real Reversal Entry (Single Scenario)`,
@@ -666,6 +815,7 @@ export class MTFStrategyEngine {
         tp1: fmt(tp1),
         tp2: fmt(tp2),
         rr: Number(rr.toFixed(2)),
+        tp_basis: revT.basis,
         condition: "Pullback invalidated: aggressive volume & structure break confirm real reversal. Dual scenarios canceled.",
       };
       scenario2 = null; // No second scenario: old trend is broken!
@@ -677,10 +827,15 @@ export class MTFStrategyEngine {
         const slDist = Math.min(MAX_SL_ATR_MULT * atr30M, Math.max(ATR_SL_MULT * atr30M, isLong ? (swings.lastLow ? price - swings.lastLow + 0.1 * atr30M : ATR_SL_MULT * atr30M) : (swings.lastHigh ? swings.lastHigh - price + 0.1 * atr30M : ATR_SL_MULT * atr30M)));
         const sl = isLong ? price - slDist : price + slDist;
 
-        const tp1Structural = isLong ? (swings.lastHigh && swings.lastHigh > price ? swings.lastHigh : price + 1.5 * slDist) : (swings.lastLow && swings.lastLow < price ? swings.lastLow : price - 1.5 * slDist);
-        const tp1 = isLong ? Math.min(tp1Structural, price + 1.8 * slDist) : Math.max(tp1Structural, price - 1.8 * slDist);
-        const tp2 = isLong ? price + 2.5 * slDist : price - 2.5 * slDist;
-        const rr = slDist > 0 ? Math.abs(tp1 - price) / slDist : 1.5;
+        const tpAligned = adaptiveTargets({
+          side: activeSide, entry: price, slDist, atr: atr30M, swings,
+          legStart: isLong ? swings.lastLow : swings.lastHigh,
+          legEnd: isLong ? swings.lastHigh : swings.lastLow,
+          adxPercentile: adxPercentile4h, minMult: 1.5, maxMult: 3.0, runnerMult: 2.5,
+        });
+        const tp1 = tpAligned.tp1;
+        const tp2 = tpAligned.tp2;
+        const rr = slDist > 0 ? Math.abs(tp1 - price) / slDist : tpAligned.rr;
 
         scenario1 = {
           name: "Immediate Momentum Entry",
@@ -690,6 +845,7 @@ export class MTFStrategyEngine {
           tp1: fmt(tp1),
           tp2: fmt(tp2),
           rr: Number(rr.toFixed(2)),
+          tp_basis: tpAligned.basis,
           condition: freshCrossUp || freshCrossDown ? "Fresh 30M EMA cross confirmed" : "30M EMA persistent alignment with 4H trend",
         };
       }
@@ -701,6 +857,7 @@ export class MTFStrategyEngine {
         const isLong = activeSide === "BUY";
         const zone = fibPullbackZone({
           swings, macroSide: activeSide, emaSlow: ema30mSlow, atr: atr30M, price,
+          adxPercentile: adxPercentile4h,
         });
         // One-step crossover math kept as a diagnostic only — never an entry.
         const estCross = anticipatedCrossoverPrice ? fmt(anticipatedCrossoverPrice) : null;
@@ -726,6 +883,9 @@ export class MTFStrategyEngine {
             estimated_sl: fmt(zone.sl),
             estimated_tp1: fmt(zone.tp1),
             estimated_tp2: fmt(zone.tp2),
+            tp_basis: zone.tp_basis,
+            tp1_basis: zone.tp1_basis,
+            tp2_basis: zone.tp2_basis,
             rr: Number(zone.rr.toFixed(2)),
             fib_confluence: zone.confluence,
             zone_weak: zone.weak,
@@ -773,6 +933,9 @@ export class MTFStrategyEngine {
             estimated_sl: fmt(rangeInfo.sl),
             estimated_tp1: fmt(rangeInfo.tp1),
             estimated_tp2: fmt(rangeInfo.tp2),
+            tp_basis: rangeInfo.tp_basis,
+            tp1_basis: rangeInfo.tp1_basis,
+            tp2_basis: rangeInfo.tp2_basis,
             rr: Number(rangeInfo.rr.toFixed(2)),
             costs: rc,
             range_touches: `${rangeInfo.touchesLo}L/${rangeInfo.touchesUp}U`,
@@ -912,7 +1075,13 @@ export class MTFStrategyEngine {
       entry: primaryScenario?.entry ?? (scenario2 ? fmt(price) : null),
       sl: primaryScenario?.sl ?? scenario2?.estimated_sl ?? scenarioRange?.estimated_sl ?? null,
       tp: primaryScenario?.tp1 ?? scenario2?.estimated_tp1 ?? scenarioRange?.estimated_tp1 ?? null,
-      tp2: primaryScenario?.tp2 ?? scenarioRange?.estimated_tp2 ?? null,
+      tp2: primaryScenario?.tp2 ?? scenario2?.estimated_tp2 ?? scenarioRange?.estimated_tp2 ?? null,
+      // WHY each target sits where it does (structure level vs ATR projection).
+      // Levels are recomputed on every run from live swings/ATR, so a target
+      // that the market has since invalidated moves instead of going stale.
+      tp_basis: primaryScenario?.tp_basis ?? scenario2?.tp_basis ?? scenarioRange?.tp_basis ?? null,
+      tp1_basis: primaryScenario?.tp1_basis ?? scenario2?.tp1_basis ?? scenarioRange?.tp1_basis ?? null,
+      tp2_basis: primaryScenario?.tp2_basis ?? scenario2?.tp2_basis ?? scenarioRange?.tp2_basis ?? null,
       rr: primaryScenario?.rr ?? 1.8,
       costs: primaryScenario?.costs ?? null, // net-RR after spread/commission/slippage (costs.js)
       // Explicit entry context for downstream consumers (/trade reason line,
