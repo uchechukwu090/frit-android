@@ -2,9 +2,10 @@
 // BinanceFeed — free keyless crypto klines over public WebSocket.
 //
 // Endpoint: wss://data-stream.binance.vision (market-data only host).
-// Streams: <sym>@kline_30m + <sym>@kline_4h — pre-built candles pushed every
-// 2s, mapping 1:1 onto the engine's two timeframes. Up to 1024 streams per
-// connection; we use one connection for the whole crypto watchlist.
+// Streams: <sym>@kline_1m + <sym>@kline_30m + <sym>@kline_4h — pre-built
+// candles pushed every 2s. 1m feeds scalping freshness; 30m/4h map 1:1 onto
+// the engine's two timeframes. Up to 1024 streams per connection; we use one
+// connection for the whole crypto watchlist.
 // NOTE: Nigeria/region reachability varies — LiveFeed treats this as tier-1
 // for crypto and falls back to Finnhub crypto (BINANCE:BTCUSDT…) if the
 // socket never goes live.
@@ -41,7 +42,9 @@ export class BinanceFeed extends WsBase {
     const out = [];
     for (const s of this.symbols) {
       const b = BINANCE_WS_MAP[s].toLowerCase();
-      out.push(`${b}@kline_30m`, `${b}@kline_4h`);
+      // 1m feeds scalping freshness; 30m/4h feed the engine. Still far under
+      // the 1024-stream cap for any sane watchlist.
+      out.push(`${b}@kline_1m`, `${b}@kline_30m`, `${b}@kline_4h`);
     }
     return out.slice(0, 1000);
   }
@@ -64,7 +67,7 @@ export class BinanceFeed extends WsBase {
     const bsym = String(d.s || "").toUpperCase();
     const frit = Object.keys(BINANCE_WS_MAP).find(f => BINANCE_WS_MAP[f] === bsym);
     if (!frit) return;
-    const interval = k.i === "4h" ? "4h" : "30m";
+    const interval = ["1m", "30m", "4h"].includes(k.i) ? k.i : "30m";
     try {
       this.onKline(frit, interval, {
         openTime: Number(k.t),

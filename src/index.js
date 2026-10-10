@@ -17,12 +17,22 @@ import { PositionMonitor } from "./strategy/position_monitor.js";
 import { PullbackJournal } from "./strategy/journal.js";
 import { PortfolioRisk } from "./strategy/risk.js";
 import { getSymbolCost, costToUsd } from "./strategy/costs.js";
+import { getChain, fetchDailyCloses } from "./strategy/options/chains.js";
+import { scanSymbol, ensureOptionsTables } from "./strategy/options/scanner.js";
+import { analyzeLongterm } from "./strategy/longterm.js";
+import { getBots, saveBot, tickBots, BOT_DEFS } from "./strategy/bots.js";
+import { openPaperPosition, resolvePaperBook, ledgerSummary } from "./strategy/options/paper.js";
+import { runBacktest, walkForward } from "./strategy/options/backtest.js";
+import { scanFx } from "./strategy/options/fx.js";
 import { deepSearch } from "./deep_search.js";
 import * as imageProcessor from "./creative/imageProcessor.js";
 import * as aiFeatures from "./creative/aiFeatures.js";
 import * as promptEngine from "./creative/promptEngine.js";
 import * as videoProcessor from "./creative/videoProcessor.js";
 import * as templateLibrary from "./creative/templateLibrary.js";
+import * as cinema from "./creative/cinema.js";
+import * as designStudio from "./creative/design.js";
+import { setModelDb, MODEL_DEFAULTS, MODEL_KEYS, MODEL_META, overrideOf, M } from "./model_config.js";
 
 dotenv.config();
 
@@ -77,6 +87,7 @@ async function restoreFromBackup() {
 await restoreFromBackup();
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
+setModelDb(db); // model_overrides table + console-overridable slugs (see model_config.js)
 
 // Initialize Tables
 db.exec(`
@@ -282,6 +293,26 @@ db.exec(`
     sync_data TEXT,
     FOREIGN KEY(project_id) REFERENCES creative_projects(id)
   );
+  CREATE TABLE IF NOT EXISTS creative_elements (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    type TEXT DEFAULT 'character',
+    name TEXT,
+    reference_urls TEXT,
+    metadata TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS creative_brandkits (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    name TEXT,
+    colors TEXT,
+    font TEXT,
+    logo_url TEXT,
+    palette TEXT,
+    tone TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 
   -- Trading Suite Tables
   CREATE TABLE IF NOT EXISTS trading_watchlist (
@@ -386,17 +417,66 @@ if (!txnCols.includes("tx_hash")) {
 // Free tier (:free, 1000/day after $10 credits) sits BEHIND paid in every chain.
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const HAS_OR = !!OPENROUTER_API_KEY;
-const OR_PRIMARY = process.env.OR_PRIMARY_MODEL || "z-ai/glm-5.3-flash";
-const OR_FAST = process.env.OR_FAST_MODEL || "openai/gpt-oss-20b";
-const OR_DRAFT = process.env.OR_DRAFT_MODEL || "deepseek/deepseek-v4-flash";
-const OR_IMAGE_MODEL = process.env.OR_IMAGE_MODEL || "bytedance-seed/seedream-5-0-flash";
-const OR_STT_MODEL = process.env.OR_STT_MODEL || "openai/whisper-large-v3";
+// ---- Runtime model config (Creator console changes these LIVE) ----------
+// Every model slug below resolves as: admin override (DB) > env var > baked
+// default (see model_config.js — submodules resolve via M() at request time).
+// The creator swaps models from the app's Creator console
+// (GET+POST /admin/models) — new OpenRouter slugs go live with zero code
+// change, zero rebuild, zero redeploy. Verify slugs at openrouter.ai/models.
+let OR_PRIMARY = M("OR_PRIMARY_MODEL");
+let OR_FAST = M("OR_FAST_MODEL");
+let OR_DRAFT = M("OR_DRAFT_MODEL");
+let OR_IMAGE_MODEL = M("OR_IMAGE_MODEL");
+let OR_STT_MODEL = M("OR_STT_MODEL");
 // Graphic-design specialists (on demand, both currently FREE via NovitaAI):
 // design = text-to-image with legible text (prompt only — NO refs, NO aspect ratio, rejected otherwise);
 // layer = decomposes ONE flat design image into RGBA layers (needs exactly 1 input_reference + layer plan).
-const OR_DESIGN_MODEL = process.env.OR_DESIGN_MODEL || "inclusionai/ming-image-0.1-design";
-const OR_LAYER_MODEL = process.env.OR_LAYER_MODEL || "inclusionai/ming-image-0.1-design-layer";
-const OR_VIDEO_MODEL = process.env.OR_VIDEO_MODEL || "google/veo-3.1-lite"; // cheapest OpenRouter video-gen default (720p 4-8s)
+let OR_DESIGN_MODEL = M("OR_DESIGN_MODEL");
+let OR_LAYER_MODEL = M("OR_LAYER_MODEL");
+let OR_VIDEO_MODEL = M("OR_VIDEO_MODEL"); // HeyGen Video default (promo $0.01/s with audio, 720p/1080p 4-8s)
+// Genjutsu default: Seedance-class reference model — 4-30s, first/last frames,
+// up to 50 image/video/audio references (same family Higgsfield Cinema 4.0 uses).
+// Override per-call with {model} or globally (console/env OR_GENJUTSU_MODEL).
+let OR_GENJUTSU_MODEL = M("OR_GENJUTSU_MODEL");
+// Graphics/design default: legible-text design specialist (FREE). Override with
+// OR_GRAPHICS_MODEL for Recraft/Ideogram-class models when served on OpenRouter.
+let OR_GRAPHICS_MODEL = M("OR_GRAPHICS_MODEL") || OR_DESIGN_MODEL;
+// Craft routing (the pro-designer pattern): typography-led work -> type
+// specialist (Ideogram-class), logo/vector/brand-system work -> vector
+// specialist (Recraft-class), photographic plates -> photo model. Each
+// falls back down the chain so an unserved slug never kills the job.
+// Verify slugs at openrouter.ai/models before setting these.
+let OR_TYPE_MODEL = M("OR_TYPE_MODEL");
+let OR_VECTOR_MODEL = M("OR_VECTOR_MODEL");
+// Talking-avatar primary (HeyGen Avatar IV via the same OpenRouter /videos
+// pipeline — photo + voice, up to 1080p). Hedra stays as fallback engine.
+let OR_AVATAR_MODEL = M("OR_AVATAR_MODEL");
+// Neural lip-sync provider (optional): Sync Labs sync-2.0. Needs SYNC_LABS_API_KEY
+// + PUBLIC_BASE_URL (webhook receiver). Absent either -> transcript-timed dub.
+const SYNC_LABS_KEY = process.env.SYNC_LABS_API_KEY || "";
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
+// Hedra Character 3: photo + audio -> talking avatar (no source video needed).
+// Needs HEDRA_API_KEY + Supabase staging (signed URLs). Absent -> local fallback.
+const HEDRA_API_KEY = process.env.HEDRA_API_KEY || "";
+async function hedraFetch(path, { method = "GET", body = null } = {}) {
+  const attempt = async (auth) => fetch(`https://api.hedra.com${path}`, {
+    method,
+    headers: { Authorization: `${auth} ${HEDRA_API_KEY}`, "Content-Type": "application/json" },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(60_000),
+  });
+  let r = await attempt("Bearer");
+  if (r.status === 401) r = await attempt("Key"); // docs vary; retry alt scheme once
+  return r;
+}
+function hedraVideoUrl(job) {
+  const outs = job?.outputs || job?.data?.outputs || [];
+  for (const o of outs) {
+    const u = o?.url || o?.video_url || o?.download_url || o?.src;
+    if (typeof u === "string" && /^https?:\/\//.test(u)) return u;
+  }
+  return null;
+}
 // Free-tier models (zero token cost, count against 1000/day quota).
 // Verified Oct 2026: qwen3.8-27b (best free all-rounder, tools+vision),
 // nemotron-3-super (NVIDIA-backed, sticky). gpt-oss-20b:free 429s constantly
@@ -562,7 +642,7 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // fast = openai/gpt-oss-20b ($0.02/$0.10) — the gpt-oss-20b-class slot.
 // draft = qwen 30B-class cheap. Free :free models sit AFTER paid in chains.
 const GO_MODEL = process.env.OPENCODE_GO_MODEL || "glm-5.3-flash";
-const AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL));
+let AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL));
 const MODELS = {
   vision: process.env.VISION_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "mistral-large-latest"),
   agent: AGENT_PRIMARY,
@@ -620,6 +700,42 @@ const FALLBACK_CHAINS = {
 // The :free roster rotates — resolve the live list at boot, re-check every 6h.
 await refreshFreeModels();
 setInterval(() => { void refreshFreeModels(); }, 6 * 3600e3).unref?.();
+// Re-resolve every model slug (overrides > env > defaults) and rebuild the
+// role chains. Runs at boot and after every Creator-console model change, so
+// new OpenRouter slugs take effect instantly with no restart.
+function refreshModelConfig() {
+  OR_PRIMARY = M("OR_PRIMARY_MODEL");
+  OR_FAST = M("OR_FAST_MODEL");
+  OR_DRAFT = M("OR_DRAFT_MODEL");
+  OR_IMAGE_MODEL = M("OR_IMAGE_MODEL");
+  OR_STT_MODEL = M("OR_STT_MODEL");
+  OR_DESIGN_MODEL = M("OR_DESIGN_MODEL");
+  OR_LAYER_MODEL = M("OR_LAYER_MODEL");
+  OR_VIDEO_MODEL = M("OR_VIDEO_MODEL");
+  OR_GENJUTSU_MODEL = M("OR_GENJUTSU_MODEL");
+  OR_GRAPHICS_MODEL = M("OR_GRAPHICS_MODEL") || OR_DESIGN_MODEL;
+  OR_TYPE_MODEL = M("OR_TYPE_MODEL");
+  OR_VECTOR_MODEL = M("OR_VECTOR_MODEL");
+  OR_AVATAR_MODEL = M("OR_AVATAR_MODEL");
+  // :free keys: never clobber the live auto-resolved roster — only pin when
+  // the creator (or env) explicitly says so.
+  const pinFast = overrideOf("OR_FREE_FAST") || process.env.OR_FREE_FAST;
+  const pinDraft = overrideOf("OR_FREE_DRAFT") || process.env.OR_FREE_DRAFT;
+  if (pinFast) OR_FREE_FAST = pinFast;
+  if (pinDraft) OR_FREE_DRAFT = pinDraft;
+  AGENT_PRIMARY = process.env.AGENT_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL));
+  MODELS.vision = process.env.VISION_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "mistral-large-latest");
+  MODELS.agent = AGENT_PRIMARY;
+  MODELS.conversation = process.env.CONVERSATION_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : (HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL));
+  MODELS.tools = process.env.TOOLS_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL);
+  MODELS.coding = process.env.CODING_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "codestral-latest");
+  MODELS.fast = process.env.FAST_MODEL || (HAS_OR ? `openrouter:${OR_FAST}` : MISTRAL_FAST_MODEL);
+  FALLBACK_CHAINS.vision = buildVisionFallbackChain(MODELS.vision);
+  for (const role of ["agent", "tools", "conversation", "fast"]) {
+    FALLBACK_CHAINS[role] = buildFallbackChain(MODELS[role]);
+  }
+}
+refreshModelConfig();
 
 let PHONE_UI_SKILL = "";
 try {
@@ -1073,6 +1189,47 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
             };
           }
           const content = JSON.stringify(result);
+          // MEDIA SURFACING (no exceptions): generated images/videos must
+          // reach the phone as artifacts — rendered in chat with a Creative
+          // Suite link — never only as base64 buried in the tool transcript.
+          // (Placed after stringify: the brain keeps the small redacted note;
+          // the bytes travel in turnArtifacts instead of the context window.)
+          if ((name === "generate_image" || name === "design_image") && result?.ok && result?.data) {
+            const d = result.data;
+            const rawB64 = d.image_b64 ? String(d.image_b64).replace(/^data:[^,]+,/, "") : "";
+            if (rawB64 || d.image_url) {
+              turnArtifacts.push({
+                name: `generated-${Date.now()}.png`,
+                mime: "image/png",
+                size: 0,
+                base64: rawB64 || null,
+                content_base64: rawB64 || null,
+                url: d.image_url || null,
+              });
+              const redacted = {
+                ...result,
+                data: {
+                  ...d,
+                  image_b64: rawB64 ? "[image bytes returned to client separately — describe the result to the user, do not paste base64]" : d.image_b64,
+                },
+              };
+              fullMessages.push({ role: "tool", tool_call_id: tc.id, name: name, content: JSON.stringify(redacted) });
+              db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_call_id) VALUES (?, ?, ?, ?, ?)").run(
+                sessionId, fullMessages.length, "tool", JSON.stringify(redacted), tc.id
+              );
+              continue;
+            }
+          }
+          if (name === "generate_video" && result?.ok && result?.data?.job_id) {
+            // Async render: no bytes yet — the client shows a tracking card
+            // with a Creative Suite link until the video completes.
+            turnArtifacts.push({
+              name: `video-${result.data.job_id}.mp4`,
+              mime: "video/mp4",
+              size: 0,
+              content: `video_job:${result.data.job_id}`,
+            });
+          }
           fullMessages.push({ role: "tool", tool_call_id: tc.id, name: name, content });
           db.prepare("INSERT INTO agent_steps (session_id, step_n, role, content, tool_call_id) VALUES (?, ?, ?, ?, ?)").run(
             sessionId, fullMessages.length, "tool", content, tc.id
@@ -1136,7 +1293,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
     done,
     ledger,
     verification,
-    artifacts: turnArtifacts, // files (charts, CSVs, reports) generated by run_code this turn, full base64 included
+    artifacts: turnArtifacts, // files (charts, CSVs, reports) from run_code + generated images / video-job cards from the media tools, full bytes included
   };
 }
 
@@ -1149,7 +1306,7 @@ const CHAT_ROUTER_PROMPT = `You are FRIT's message router. Decide whether the us
 
 CONVERSATION means: greetings, small talk, thanks, "how are you", identity/opinion questions, jokes, or simple questions that need NO tools, NO phone actions, NO data fetching, NO code and NO search. Answer those briefly and warmly.
 
-TASK means: the user wants something DONE — real information retrieved (weather, market prices, analysis, web research, news), code written/run, a file or webpage created, an app opened or controlled on the phone, a message/call/alarm, a trade, or any multi-step work that needs tools.
+TASK means: the user wants something DONE — an image, video, logo, poster, or other media generated/edited (always a task, never chit-chat); real information retrieved (weather, market prices, analysis, web research, news), code written/run, a file or webpage created, an app opened or controlled on the phone, a message/call/alarm, a trade, or any multi-step work that needs tools.
 
 STYLE (both kinds): mirror the user's live tone, don't force a fixed personality. A fresh/neutral chat → warm neutral. Official signals (email, job application, bank/complaint, "Dear Sir", formal request) → act official: full sentences, structured, no slang. Casual signals (slang, pidgin, short chatty lines, jokes) → mirror casually and keep it short and human. The stored user profile tone is only the baseline default — the live chat mode always wins.
 
@@ -1472,7 +1629,8 @@ async function groundScene(brief) {
 }
 
 // Video generation via OpenRouter Videos API (async: submit -> poll -> download).
-// Cheap default: google/veo-3.1-lite 720p 4-8s. Alt: minimax/hailuo, alibaba/wan-2.6.
+// Default: heygen/heygen-video-1 (promo $0.01/s WITH audio). Alt: google/veo-3.1-lite,
+// minimax/hailuo, alibaba/wan-2.6 — per-call {model} or console OR_VIDEO_MODEL.
 function orVideoHeaders() {
   return {
     Authorization: `Bearer ${OPENROUTER_API_KEY}`,
@@ -1492,7 +1650,9 @@ async function submitVideo(prompt, opts = {}) {
       duration: opts.duration || 4,
       resolution: opts.resolution || "720p",
       aspect_ratio: opts.aspect_ratio || "16:9",
-      generate_audio: opts.generate_audio || false,
+      // Omit when unset: audio-capable models (HeyGen) default to WITH audio,
+      // which is what we want for the primary video model.
+      ...(opts.generate_audio !== undefined ? { generate_audio: opts.generate_audio } : {}),
       ...(opts.frame_images ? { frame_images: opts.frame_images } : {}),
       ...(opts.input_references ? { input_references: opts.input_references } : {}),
     }),
@@ -1561,13 +1721,35 @@ function walletSpend(user_id, amount_kobo, note = "") {
   return walletBalance(user_id);
 }
 const SUB_TIERS = {
-  // USD-pegged: naira price computed LIVE at subscribe time (ngnPerUsd).
-  // $10 Creator / $26 Pro. Caps bind worst-case cost ≈ price; overage covers the rest.
-  free: { usd: 0, days: 3650, turns_day: 15, clips_mo: 0, images_mo: 10, stt_min_mo: 30 },
-  creator: { usd: 10, days: 30, turns_day: 40, clips_mo: 8, images_mo: 100, stt_min_mo: 120 },
-  pro: { usd: 26, days: 30, turns_day: 100, clips_mo: 25, images_mo: 400, stt_min_mo: 480 },
-  owner: { usd: 0, days: 365000, turns_day: 999999, clips_mo: 999999, images_mo: 999999, stt_min_mo: 999999 },
+  // FIXED-NAIRA pricing (VAT-inclusive, bank-transfer friendly round numbers).
+  // Priced Oct 2026 at ~₦1,350/$ buffer (official ₦1,332, street ₦1,361-85):
+  //   Free    ₦0      — acquisition. Worst-case cost ~$1.00/mo (~₦1,350),
+  //                      typical ~$0.30 (free-model fallback absorbs chat).
+  //   Starter ₦7,500  (~$5.55) — ChatGPT-Go killer (₦7,000) + images/video/trading.
+  //                      Worst-case cost ~$3.12 → margin ~44%.
+  //   Creator ₦16,500 (~$12.22) — vs Midjourney $10 + Runway $15. Worst ~$9.02
+  //                      (all-8s clips) → margin ~26%; typical ~55%.
+  //   Pro     ₦35,000 (~$25.93) — price-matched to Plus ₦33,863 w/ VAT but 5x
+  //                      features. Worst ~$21.60 → margin ~17%; typical ~50%.
+  // Unit economics (OpenRouter list, Oct 2026 — budget at LIST, keep discount
+  // as extra margin): chat turn ~$0.0008 (GLM-Flash 6k in/1.2k out, DeepInfra
+  // pin halves it); image $0.018 (Seedream Flash); 8s 720p clip w/ audio ~$0.08
+  // (HeyGen Video promo $0.01/s); avatar clip ~$0.40/8s (Avatar IV $0.05/s);
+  // STT ~$0.006/min. Clips are the margin killer — quotas below are counted
+  // in up-to-8s equivalents. Review naira peg quarterly.
+  free: { usd: 0, naira_kobo: 0, days: 3650, turns_day: 20, clips_mo: 1, images_mo: 15, stt_min_mo: 45 },
+  starter: { usd: 5.55, naira_kobo: 750000, days: 30, turns_day: 50, clips_mo: 3, images_mo: 60, stt_min_mo: 90 },
+  creator: { usd: 12.22, naira_kobo: 1650000, days: 30, turns_day: 80, clips_mo: 8, images_mo: 150, stt_min_mo: 200 },
+  pro: { usd: 25.93, naira_kobo: 3500000, days: 30, turns_day: 200, clips_mo: 15, images_mo: 400, stt_min_mo: 600 },
+  // Tester: full Pro-level caps for trial runs. NOT purchasable (subscribe
+  // blocks it) — only via admin-minted codes (/billing/mint). Granted duration
+  // comes from SUB_TIERS days at REDEEM time (see /billing/redeem).
+  tester: { usd: 0, naira_kobo: 0, days: 7, turns_day: 200, clips_mo: 15, images_mo: 400, stt_min_mo: 600 },
+  owner: { usd: 0, naira_kobo: 0, days: 365000, turns_day: 999999, clips_mo: 999999, images_mo: 999999, stt_min_mo: 999999 },
 };
+export const TIER_ORDER = ["free", "starter", "creator", "pro", "tester", "owner"];
+export const YEARLY_MULT = 10; // annual = 10x monthly (2 months free)
+export const tierYearlyKobo = (tier) => (SUB_TIERS[tier]?.naira_kobo || 0) * YEARLY_MULT;
 // Live USD->NGN (keyless er-api, 6h cache, falls back to 1500).
 let _fxCache = { rate: 1500, exp: 0 };
 async function ngnPerUsd() {
@@ -1579,9 +1761,28 @@ async function ngnPerUsd() {
   } catch (e) { console.warn("[FX]", e.message); }
   return _fxCache.rate;
 }
-const tierNaira = (tier, rate) => Math.round(SUB_TIERS[tier].usd * rate * 100);
-// Per-unit wallet overage (excessive users stay profitable — billed in kobo):
-const OVERAGE = { turn_kobo: 2500, clip_kobo: 40000, image_kobo: 4000, stt_min_kobo: 1000 };
+const PEG_FLOOR = Number(process.env.PEG_FLOOR || 1370);
+const tierBaseKobo = (tier) => SUB_TIERS[tier]?.naira_kobo ?? 0; // sticker price at the floor
+// RATCHET PEG: floor ₦1,370/$ (Oct 2026: official ₦1,332, street ₦1,361-85).
+// While the dollar is at/below the floor, users pay the sticker price above.
+// When the dollar climbs past the floor, prices scale proportionally so margin
+// survives devaluation — rounded to the nearest ₦100 to stay transfer-typed.
+// Override the floor with PEG_FLOOR env (e.g. PEG_FLOOR=1500).
+const tierNaira = (tier, rate) => {
+  const base = tierBaseKobo(tier);
+  if (!base) return 0;
+  const eff = Math.max(Number(rate) || PEG_FLOOR, PEG_FLOOR);
+  const naira = Math.round((base / 100) * eff / PEG_FLOOR / 100) * 100;
+  return naira * 100;
+};
+// Per-unit wallet overage (EVERY line profitable at list cost — overage users
+// are your best margin, never throttled into loss):
+//   turn ₦30   vs cost ~₦1-2    (15-30x markup)
+//   image ₦50  vs cost ~₦24     (~2x)
+//   clip ₦650 (up-to-8s equiv) vs cost ₦270 (4s) – ₦540 (8s w/ audio) (~1.2-2.4x)
+//   stt ₦15/min vs cost ~₦8     (~2x)
+// Old flat ₦400/clip LOST money on 8s clips — never go back to it.
+const OVERAGE = { turn_kobo: 3000, clip_kobo: 65000, image_kobo: 5000, stt_min_kobo: 1500 };
 const MASTER_CODE = process.env.MASTER_CODE || "";
 const BTC_ADDRESS = process.env.BTC_ADDRESS || ""; // native Bitcoin (bc1/1/3…) — empty until you add one
 const USDT_TRON_ADDRESS = process.env.USDT_TRON_ADDRESS || "";
@@ -1791,6 +1992,7 @@ const TD_SYMBOLS = {
   EURUSD: "EUR/USD", GBPUSD: "GBP/USD", USDJPY: "USD/JPY", AUDUSD: "AUD/USD",
   USDCHF: "USD/CHF", USDCAD: "USD/CAD", NZDUSD: "NZD/USD", XAUUSD: "XAU/USD",
   XAGUSD: "XAG/USD", GBPJPY: "GBP/JPY", EURJPY: "EUR/JPY", EURGBP: "EUR/GBP",
+  SPY: "SPY", QQQ: "QQQ", IWM: "IWM", XSP: "XSP",
   BTC: "BTC/USD", ETH: "ETH/USD", SOL: "SOL/USD", BNB: "BNB/USD",
   XRP: "XRP/USD", DOGE: "DOGE/USD", ADA: "ADA/USD",
   BTCUSD: "BTC/USD", ETHUSD: "ETH/USD", SOLUSD: "SOL/USD", BNBUSD: "BNB/USD",
@@ -2302,6 +2504,55 @@ function hydrateSignal(row) {
   };
 }
 
+// ==================== OPTIONS SUITE HELPERS (paper signals only) =============
+// Nothing here places orders. Options execution has no rail in this build
+// (MT5 cannot trade equity options); these endpoints emit signals for the
+// phone's floating banner and record them for review.
+function storeOptionsSignal(user_id, signal) {
+  try {
+    ensureOptionsTables(db);
+    db.prepare(`
+      INSERT OR REPLACE INTO options_signals
+      (id, user_id, symbol, kind, decision, legs_json, credit, max_loss, rr,
+       breakevens_json, iv_rank, atm_iv, rv20, dte, expiration, exits_json,
+       reasoning, source, provisional, synthetic, timestamp, is_read)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+    `).run(
+      signal.id, user_id, signal.symbol, signal.kind || null, signal.decision || null,
+      signal.legs ? JSON.stringify(signal.legs) : (signal.band1d ? JSON.stringify({ band1d: signal.band1d, band7d: signal.band7d }) : null),
+      signal.credit ?? null, signal.maxLossDollars ?? signal.maxLoss ?? null, signal.rr ?? null,
+      signal.breakevens ? JSON.stringify(signal.breakevens) : null,
+      signal.ivRank ?? null, signal.atmIv ?? null, signal.rv20 ?? null,
+      signal.dte ?? null, signal.expiration || null,
+      signal.exits ? JSON.stringify(signal.exits) : (signal.strangle7d ? JSON.stringify(signal.strangle7d) : null),
+      (signal.reasoning || []).join(" | "),
+      signal.dataSource?.source || (signal.synthetic ? "model" : null),
+      signal.dataSource?.provisional ? 1 : 0, signal.synthetic ? 1 : 0,
+      signal.timestamp
+    );
+  } catch (e) {
+    console.warn("[storeOptionsSignal] failed:", e.message);
+  }
+}
+
+/** Pre-trade options guard: daily signal cap + modeled max-loss vs balance. */
+function optionsRiskCheck(user_id, signal, balance) {
+  const maxPerDay = Number(process.env.OPT_MAX_SIGNALS_DAY) || 3;
+  const maxTradePct = Number(process.env.RISK_MAX_TRADE_PCT) || 2;
+  try {
+    ensureOptionsTables(db);
+    const today = db.prepare(
+      "SELECT COUNT(*) AS c FROM options_signals WHERE user_id = ? AND date(timestamp/1000,'unixepoch') = date('now')"
+    ).get(user_id)?.c || 0;
+    if (today >= maxPerDay) return { ok: false, reason: `daily options-signal cap reached (${maxPerDay})` };
+  } catch { /* cap best-effort */ }
+  const riskDollars = Number(signal.maxLossDollars ?? signal.maxLoss ?? 0);
+  if (balance > 0 && riskDollars > balance * maxTradePct / 100) {
+    return { ok: false, reason: `modeled max loss $${riskDollars.toFixed(2)} exceeds ${maxTradePct}% of $${balance} — size down` };
+  }
+  return { ok: true };
+}
+
 async function fetchSentiment(symbol) {
   const sym = String(symbol).toUpperCase();
   const cacheKey = `sentiment:${sym}`;
@@ -2550,22 +2801,25 @@ function riskGate({ symbol, action, lotSize, entry, sl, balance }) {
 }
 
 // Recurring "everyday analyze XAUUSD" tasks — paper-first by design.
+// Shared trade executor: every auto path (/trade, scheduler, bots) funnels
+// through the risk gate + bridge + position monitor. No bypasses.
+async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual" }) {
+  const gate = riskGate({ symbol, action, lotSize, entry, sl, balance: 1000 });
+  if (!gate.allowed) {
+    console.log(`[executor] RISK-BLOCKED ${symbol}: ${gate.reasons.join(" | ")}`);
+    return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
+  }
+  const result = await sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason });
+  if (result.status !== "failed" && sl && tp) {
+    try {
+      positionMonitor.register({ symbol, action, lotSize, entry, sl, tp, source, reason });
+    } catch (e) { console.warn("[PositionMonitor] register failed:", e.message); }
+  }
+  return result;
+}
 const tradeScheduler = new TradeTaskScheduler({
   engine: mtfStrategy,
-  executor: async ({ symbol, action, lotSize, entry, sl, tp, reason }) => {
-    const gate = riskGate({ symbol, action, lotSize, entry, sl, balance: 1000 });
-    if (!gate.allowed) {
-      console.log(`[TradeTaskScheduler] RISK-BLOCKED ${symbol}: ${gate.reasons.join(" | ")}`);
-      return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
-    }
-    const result = await sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason });
-    if (result.status !== "failed" && sl && tp) {
-      try {
-        positionMonitor.register({ symbol, action, lotSize, entry, sl, tp, source: "scheduler", reason });
-      } catch (e) { console.warn("[PositionMonitor] scheduler register failed:", e.message); }
-    }
-    return result;
-  },
+  executor: (args) => executeTradeSignal({ ...args, source: "scheduler" }),
 });
 if (process.env.TRADE_TASKS === "true") {
   tradeScheduler.start();
@@ -2966,7 +3220,7 @@ app.get("/", (_req, res) => {
       images: ["/images/generate", "/images/decompose"],
       video: ["/videos/submit", "/videos/status/:jobId", "/videos/content/:jobId"],
       creative: ["/creative/compose", "/creative/revise", "/creative/assemble", "/creative/ground", "/creative/jobs"],
-      creativeSuite: ["/creative-suite/images/generate", "/creative-suite/images/edit", "/creative-suite/images/remove-background", "/creative-suite/images/retouch", "/creative-suite/images/style-transfer", "/creative-suite/images/upscale", "/creative-suite/images/generative-fill", "/creative-suite/images/batch", "/creative-suite/videos/generate", "/creative-suite/videos/edit", "/creative-suite/videos/subtitles", "/creative-suite/videos/translate-subtitles", "/creative-suite/storyboard", "/creative-suite/templates", "/creative-suite/style-presets", "/creative-suite/prompt-suggest", "/creative-suite/prompt-enhance", "/creative-suite/recommend", "/creative-suite/projects", "/creative-suite/export"],
+      creativeSuite: ["/creative-suite/images/generate", "/creative-suite/images/edit", "/creative-suite/images/remove-background", "/creative-suite/images/retouch", "/creative-suite/images/style-transfer", "/creative-suite/images/upscale", "/creative-suite/images/generative-fill", "/creative-suite/images/batch", "/creative-suite/videos/generate", "/creative-suite/videos/edit", "/creative-suite/videos/subtitles", "/creative-suite/videos/translate-subtitles", "/creative-suite/storyboard", "/creative-suite/templates", "/creative-suite/style-presets", "/creative-suite/prompt-suggest", "/creative-suite/prompt-enhance", "/creative-suite/recommend", "/creative-suite/projects", "/creative-suite/export", "/creative-suite/cinema/options", "/creative-suite/cinema/direct", "/creative-suite/cinema/generate", "/creative-suite/katana", "/creative-suite/genjutsu", "/creative-suite/elements", "/creative-suite/influencer", "/creative-suite/ads", "/creative-suite/lipsync", "/creative-suite/lipsync/:jobId/status", "/creative-suite/videos/models", "/creative-suite/cinema/recipes", "/creative-suite/autopilot", "/creative-suite/brandkit", "/creative-suite/design", "/creative-suite/design/templates", "/webhooks/lipsync"],
       billing: ["/billing/tiers", "/billing/pay-info", "/billing/subscribe", "/billing/submit-reference", "/billing/pending", "/billing/approve", "/billing/mint", "/billing/redeem", "/billing/status"],
       wallet: ["/wallet/balance", "/wallet/topup", "/wallet/spend", "/wallet/withdraw", "/wallet/withdrawals"],
       admin: ["/admin/inbox", "/admin/keys", "/admin/snapshot", "/admin/ledger/verify", "/admin/backup", "/admin/withdrawals/approve"],
@@ -2981,7 +3235,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "active",
     models: MODELS,
-    openrouter: { primary: OR_PRIMARY, fast: OR_FAST, draft: OR_DRAFT, image: OR_IMAGE_MODEL, stt: OR_STT_MODEL, free_fast: OR_FREE_FAST },
+    openrouter: { primary: OR_PRIMARY, fast: OR_FAST, draft: OR_DRAFT, image: OR_IMAGE_MODEL, stt: OR_STT_MODEL, video: OR_VIDEO_MODEL, avatar: OR_AVATAR_MODEL, free_fast: OR_FREE_FAST },
     twelve_data: !!TWELVE_DATA_KEY,
     mt5_bridge: !!MT5_BRIDGE_URL,
     sandbox_url: SANDBOX_URL,
@@ -3580,33 +3834,44 @@ app.post("/creative/assemble", requireAuth, limitCostly, async (req, res) => {
 // Paystack/Flutterwave webhooks — same tables.
 app.get("/billing/tiers", requireAuth, async (_req, res) => {
   const rate = await ngnPerUsd();
-  const tiers = Object.fromEntries(Object.entries(SUB_TIERS).map(([k, t]) => [k, { ...t, price_kobo_live: Math.round(t.usd * rate * 100) }]));
-  res.json({ ok: true, usd_ngn: rate, tiers, overage: OVERAGE });
+  const tiers = Object.fromEntries(Object.entries(SUB_TIERS).map(([k, t]) => [k, {
+    ...t,
+    price_kobo: tierNaira(k, rate), // ratchet-pegged — what the user actually pays today
+    price_kobo_live: tierNaira(k, rate), // compat alias (was FX-derived)
+    yearly_kobo: tierNaira(k, rate) * YEARLY_MULT,
+  }]));
+  res.json({ ok: true, usd_ngn: rate, peg_floor: PEG_FLOOR, tiers, overage: OVERAGE, yearly_mult: YEARLY_MULT, order: TIER_ORDER });
 });
 app.get("/billing/pay-info", requireAuth, async (_req, res) => {
   const rate = await ngnPerUsd();
+  const n = (kobo) => Math.round(kobo / 100);
+  const sK = tierNaira("starter", rate), cK = tierNaira("creator", rate), pK = tierNaira("pro", rate);
   res.json({
-    ok: true, usd_ngn: rate,
+    ok: true, usd_ngn: rate, peg_floor: PEG_FLOOR,
     bank: { bank_name: PAY_BANK_NAME || "(set PAY_BANK_NAME)", account_number: PAY_ACCOUNT_NUMBER || "(set PAY_ACCOUNT_NUMBER)", account_name: PAY_ACCOUNT_NAME || "(set PAY_ACCOUNT_NAME)" },
     crypto: {
       bsc_address: BSC_ADDRESS || "(set BSC_ADDRESS)",
       assets: ["USDT (BNB Smart Chain)", "BTC (BNB Smart Chain)"],
       note: "USDT + BTC auto-verify on txhash submit (12+ confirmations). Send ONLY on BNB Smart Chain — other networks will lose funds.",
     },
-    tiers: { creator_naira: Math.round(10 * rate), pro_naira: Math.round(26 * rate) },
+    tiers: { starter_naira: n(sK), creator_naira: n(cK), pro_naira: n(pK),
+      starter_kobo: sK, creator_kobo: cK, pro_kobo: pK,
+      starter_yearly: n(sK) * YEARLY_MULT, creator_yearly: n(cK) * YEARLY_MULT, pro_yearly: n(pK) * YEARLY_MULT },
     two_pots: {
       subscription: "Your payment for USING the app. Goes to our account as revenue, unlocks your tier for 30 days. Non-refundable, never spendable.",
       wallet: "YOUR money, held for the AI to spend FOR you (flights, orders, services). Fund it via /wallet/topup; the agent debits it via /wallet/spend per booking. Unspent balance stays yours.",
     },
-    note: "Prices track the dollar — the app shows the exact naira amount before you pay, and that quoted amount is locked on your order.",
+    note: "Prices are pegged at ₦1,370/$ — fixed while the dollar holds, and rise proportionally only if the dollar climbs past the peg. VAT-inclusive; the quoted amount is locked on your order. Yearly = 10x monthly (2 months free). Testers: redeem your trial code under Wallet → Redeem a code.",
   });
 });
 app.post("/billing/subscribe", requireAuth, limitNormal, async (req, res) => {
   const { tier, method } = req.body || {};
   const user_id = boundUser(req);
-  if (!SUB_TIERS[tier] || tier === "free" || tier === "owner") return res.status(400).json({ error: "paid tier required" });
+  // Only priced tiers are purchasable — free/tester/owner never reach checkout
+  // (tester comes from admin-minted trial codes, owner from MASTER_CODE).
+  if (!SUB_TIERS[tier] || !tierBaseKobo(tier)) return res.status(400).json({ error: "paid tier required (starter, creator or pro)" });
   const rate = await ngnPerUsd();
-  const amount_kobo = tierNaira(tier, rate); // locked at order time — FX moves don't change it after
+  const amount_kobo = tierNaira(tier, rate); // ratchet-pegged, locked at order time
   const id = `pay_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
   const passcode = makePasscode(); // auto-generated, user types it in "I've paid"
   db.prepare("INSERT INTO pending_payments (id, user_id, tier, amount_kobo, reference, purpose) VALUES (?, ?, ?, ?, ?, 'sub')").run(id, user_id, tier, amount_kobo, passcode);
@@ -3676,7 +3941,7 @@ app.post("/billing/submit-reference", requireAuth, limitNormal, async (req, res)
       const exp = new Date(Date.now() + SUB_TIERS[pay.tier].days * 864e5).toISOString();
       db.prepare("INSERT INTO activation_codes (code, tier, status, user_id, expires_at) VALUES (?, ?, 'unused', NULL, ?)").run(code, pay.tier, exp);
       takeSnapshot("approve-sub-crypto");
-      return res.json({ ok: true, payment_id, status: "approved", verified: v, activation_code: code, note: `${net.toUpperCase()} confirmed. Enter activation code in app to unlock ${pay.tier} until ${exp.slice(0, 10)}.` });
+      return res.json({ ok: true, payment_id, status: "approved", verified: v, activation_code: code, redeem_by: exp, note: `${net.toUpperCase()} confirmed. Enter activation code in app (Wallet → Redeem) before ${exp.slice(0, 10)} — the ${SUB_TIERS[pay.tier].days}-day subscription starts at redeem time.` });
     } catch (e) {
       db.prepare("UPDATE pending_payments SET status = 'awaiting_review' WHERE id = ?").run(payment_id);
       return res.json({ ok: false, payment_id, status: "awaiting_review", error: `auto-verify failed (${e.message}) — queued for manual review` });
@@ -3705,15 +3970,20 @@ app.post("/billing/approve", requireAdmin, (req, res) => {
   const exp = new Date(Date.now() + SUB_TIERS[pay.tier].days * 864e5).toISOString();
   db.prepare("INSERT INTO activation_codes (code, tier, status, user_id, expires_at) VALUES (?, ?, 'unused', NULL, ?)").run(code, pay.tier, exp);
   takeSnapshot("approve-sub");
-  res.json({ ok: true, purpose: "sub", user_id: pay.user_id, tier: pay.tier, activation_code: code, expires_at: exp });
+  res.json({ ok: true, purpose: "sub", user_id: pay.user_id, tier: pay.tier, activation_code: code, redeem_by: exp,
+    note: `Redeem in-app (Wallet → Redeem) before ${exp.slice(0, 10)} — the ${SUB_TIERS[pay.tier].days}-day subscription starts at redeem time.` });
 });
 app.post("/billing/mint", requireAdmin, (req, res) => {
-  // Admin: mint free-trial passcodes (e.g. 3-day Creator) for testers.
-  // They redeem in-app via /billing/redeem; each code is single-use with expiry.
-  const { tier, days, count } = req.body || {};
+  // Admin: mint trial codes (default: 7-day tester with full Pro-level caps).
+  // `days` = REDEEM-BY window only — the subscription clock (tier days) starts
+  // at redeem time, so testers always get their full week. Testers redeem in
+  // the app under Wallet → "Redeem a code"; nothing else needed from them.
+  // Examples: {tier:"tester", days:14, count:20} for a tester cohort,
+  // {tier:"creator", days:90, count:1} for your own long-lived key.
+  const { tier = "tester", days, count } = req.body || {};
   if (!SUB_TIERS[tier] || tier === "owner") return res.status(400).json({ error: "valid tier required" });
   const n = Math.min(Math.max(Number(count) || 1, 1), 100);
-  const d = Math.min(Math.max(Number(days) || 3, 1), 30);
+  const d = Math.min(Math.max(Number(days) || 7, 1), 365);
   const codes = [];
   for (let i = 0; i < n; i++) {
     const code = makeActivationCode();
@@ -3721,7 +3991,8 @@ app.post("/billing/mint", requireAdmin, (req, res) => {
     db.prepare("INSERT INTO activation_codes (code, tier, status, user_id, expires_at) VALUES (?, ?, 'unused', NULL, ?)").run(code, `${tier}`, exp);
     codes.push({ code, tier, expires_at: exp });
   }
-  res.json({ ok: true, codes });
+  res.json({ ok: true, codes, redeem_by: codes[0]?.expires_at || null,
+    howto: "Testers open Wallet → 'Redeem a code', paste the code, and get full features until the subscription expires. Re-pasting the same code refreshes it on that device." });
 });
 app.post("/billing/redeem", requireAuth, limitNormal, (req, res) => {
   // User enters activation code (or your MASTER_CODE) in-app -> tier unlocks.
@@ -3736,19 +4007,36 @@ app.post("/billing/redeem", requireAuth, limitNormal, (req, res) => {
     }
   }
   const row = db.prepare("SELECT * FROM activation_codes WHERE code = ?").get(c);
-  if (!row || row.status !== "unused") return res.status(400).json({ error: "invalid or used code" });
+  if (!row) return res.status(400).json({ error: "invalid code — check each character and try again" });
+  if (!SUB_TIERS[row.tier]) return res.status(400).json({ error: `this code is for retired tier '${row.tier}' — contact support for a fresh one` });
+  // Re-paste = refresh, not an error. A code already redeemed on THIS device
+  // re-grants a fresh subscription window instead of bouncing the user to
+  // free. (This was the "returns to free and won't accept my key again" bug:
+  // single-use codes + approve-time expiry stranded users on free.)
+  // Legacy bridge: codes redeemed under the old shared 'default' identity are
+  // adoptable once by the first device that re-pastes them.
+  const grantFresh = (why) => {
+    const exp = new Date(Date.now() + SUB_TIERS[row.tier].days * 864e5).toISOString();
+    db.prepare("UPDATE activation_codes SET status = 'used', user_id = ? WHERE code = ?").run(user_id, c);
+    db.prepare("INSERT INTO subscriptions (user_id, tier, status, expires_at) VALUES (?, ?, 'active', ?) ON CONFLICT(user_id) DO UPDATE SET tier=?, status='active', expires_at=?, updated_at=CURRENT_TIMESTAMP").run(user_id, row.tier, exp, row.tier, exp);
+    return res.json({ ok: true, tier: row.tier, expires_at: exp, refreshed: why });
+  };
+  if (row.status === "used") {
+    if (row.user_id === user_id || row.user_id === "default" || !row.user_id) return grantFresh(true);
+    return res.status(400).json({ error: "code already redeemed on another device — ask support for your own" });
+  }
+  if (row.status !== "unused") return res.status(400).json({ error: "code no longer valid — contact support for a fresh one" });
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
     db.prepare("UPDATE activation_codes SET status = 'expired' WHERE code = ?").run(c);
     return res.status(400).json({ error: "code expired — contact support for a fresh one" });
   }
-  db.prepare("UPDATE activation_codes SET status = 'used', user_id = ? WHERE code = ?").run(user_id, c);
-  db.prepare("INSERT INTO subscriptions (user_id, tier, status, expires_at) VALUES (?, ?, 'active', ?) ON CONFLICT(user_id) DO UPDATE SET tier=?, status='active', expires_at=?, updated_at=CURRENT_TIMESTAMP").run(user_id, row.tier, row.expires_at, row.tier, row.expires_at);
-  res.json({ ok: true, tier: row.tier, expires_at: row.expires_at });
+  return grantFresh(false);
 });
 app.get("/billing/status", requireAuth, limitNormal, (req, res) => {
   const user_id = boundUser(req);
   const sub = db.prepare("SELECT tier, expires_at FROM subscriptions WHERE user_id = ?").get(user_id);
-  res.json({ ok: true, user_id, tier: activeTier(user_id), expires_at: sub?.expires_at || null, usage_today: getUsage(user_id), usage_month: monthUsage(user_id) });
+  res.json({ ok: true, user_id, tier: activeTier(user_id), expires_at: sub?.expires_at || null, usage_today: getUsage(user_id), usage_month: monthUsage(user_id),
+    db_persistent: !EPHEMERAL_DB });
 });
 function takeSnapshot(kind) {
   const payload = JSON.stringify({
@@ -3849,6 +4137,72 @@ app.post("/admin/keys", requireAdmin, (req, res) => {
 app.get("/admin/keys", requireAdmin, (_req, res) => {
   res.json({ ok: true, keys: db.prepare("SELECT user_id, label, created_at FROM api_keys ORDER BY created_at DESC").all() });
 });
+// ---- Runtime models (Creator console) ----
+// The app's Creator console lists these, and the creator swaps any slug live:
+// new OpenRouter models go in with zero code change. {key, value} — empty
+// value clears the override (falls back to env, then baked default).
+const MODEL_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?$/;
+app.get("/admin/models", requireAdmin, (_req, res) => {
+  res.json({
+    ok: true, verify_at: "https://openrouter.ai/models",
+    models: MODEL_KEYS.map((k) => ({
+      key: k, value: M(k),
+      override: overrideOf(k), env: process.env[k] || "", default: MODEL_DEFAULTS[k] || "",
+      source: overrideOf(k) ? "console" : (process.env[k] ? "env" : "default"),
+      ...(MODEL_META[k] || {}),
+    })),
+  });
+});
+app.post("/admin/models", requireAdmin, (req, res) => {
+  const { key, value } = req.body || {};
+  if (!MODEL_KEYS.includes(key)) return res.status(400).json({ error: `unknown model key (pick from ${MODEL_KEYS.join(", ")})` });
+  const v = String(value ?? "").trim();
+  if (v && !MODEL_SLUG_RE.test(v)) return res.status(400).json({ error: "value must be a model slug like vendor/model-name (optionally :free). Empty clears it." });
+  if (!v) db.prepare("DELETE FROM model_overrides WHERE key = ?").run(key);
+  else db.prepare("INSERT INTO model_overrides (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP").run(key, v, v);
+  refreshModelConfig();
+  res.json({ ok: true, key, value: M(key), cleared: !v, source: v ? "console" : (process.env[key] ? "env" : "default") });
+});
+// ---- Self-describing endpoint catalog (Owner console auto-populates) ----
+// Walks the live Express route table, so every endpoint added to this server
+// appears in the app's Endpoint console with NO app update. Curated buttons
+// in the app stay as shortcuts; this catalog is the source of truth.
+const ADMIN_CATALOG_PATHS = new Set([
+  "GET /billing/approve", "GET /billing/pending", "POST /billing/approve",
+  "POST /billing/mint", "GET /feedback", "GET /admin/keys", "POST /admin/keys",
+]);
+function endpointCatalog() {
+  const out = [];
+  for (const layer of (app._router?.stack || [])) {
+    if (!layer.route) continue;
+    const path = String(layer.route.path || "");
+    if (!path.startsWith("/")) continue;
+    for (const m of Object.keys(layer.route.methods || {})) {
+      if (m === "_all" || m === "head" || m === "options") continue;
+      const method = m.toUpperCase();
+      const admin = path.startsWith("/admin") || ADMIN_CATALOG_PATHS.has(`${method} ${path}`);
+      const params = [...path.matchAll(/:([A-Za-z0-9_]+)/g)].map((x) => x[1]);
+      let group = "Other";
+      if (/^\/(billing|wallet)/.test(path)) group = admin ? "Money (admin)" : "Money";
+      else if (/^\/(creative-suite|videos|images|cinema)/.test(path)) group = "Creative & media";
+      else if (/^\/(market|trade|positions|strategy|tasks|agent|screen|tools|transcribe|sandbox|enhanced|memory|weather)/.test(path)) group = "Trading & agent";
+      else if (/^\/(models|systems|health|feedback|admin)/.test(path)) group = admin ? "Money (admin)" : "System";
+      out.push({
+        method, path, group, admin,
+        path_params: params,
+        needs_body: ["POST", "PUT", "PATCH"].includes(method),
+      });
+    }
+  }
+  out.sort((a, b) => a.group.localeCompare(b.group) || a.path.localeCompare(b.path) || a.method.localeCompare(b.method));
+  return out;
+}
+const catalogHandler = (_req, res) => {
+  const endpoints = endpointCatalog();
+  res.json({ ok: true, count: endpoints.length, endpoints });
+};
+app.get("/models/endpoints", requireAuth, limitNormal, catalogHandler); // app token: path catalog only
+app.get("/admin/endpoints", requireAdmin, catalogHandler); // admin alias
 app.get("/wallet/balance", requireAuth, limitNormal, (req, res) => {
   const user_id = boundUser(req);
   res.json({ ok: true, user_id, balance_kobo: walletBalance(user_id) });
@@ -3974,14 +4328,18 @@ app.post("/creative/ground", requireAuth, limitNormal, async (req, res) => {
 // ==================== CREATIVE SUITE ====================
 app.post("/creative-suite/images/generate", requireAuth, limitCostly, async (req, res) => {
   try {
-    const { prompt, style_preset, aspect_ratio, n, model } = req.body || {};
+    const { prompt, style_preset, aspect_ratio, n, model, reference_images } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt required" });
     const uid = boundUser(req);
     const cap = checkCap(uid, "image");
     if (!cap.ok) return res.status(402).json({ error: cap.message });
     const preset = promptEngine.STYLE_PRESETS.find(p => p.id === style_preset);
     const enhancedPrompt = preset ? `${prompt}, ${preset.description}` : prompt;
-    const data = await generateImage(enhancedPrompt, { aspect_ratio, n, model });
+    const refs = Array.isArray(reference_images) ? reference_images.filter(u => typeof u === "string" && u.length > 0).slice(0, 3) : [];
+    const data = await generateImage(enhancedPrompt, {
+      aspect_ratio, n, model,
+      input_references: refs.length ? refs.map(u => ({ type: "image_url", image_url: { url: u } })) : undefined,
+    });
     db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
     const assetId = `img_${Date.now()}`;
     db.prepare("INSERT INTO creative_assets (id, user_id, kind, source, current_url, metadata) VALUES (?, ?, 'image', 'generated', ?, ?)")
@@ -4075,16 +4433,28 @@ app.post("/creative-suite/images/batch", requireAuth, limitCostly, async (req, r
     const jobId = `batch_${Date.now()}`;
     db.prepare("INSERT INTO creative_batch_jobs (id, user_id, operation, asset_ids, params, status, total_count) VALUES (?, ?, ?, ?, ?, 'processing', ?)")
       .run(jobId, uid, operation, JSON.stringify(images), JSON.stringify(params || {}), images.length);
+    // AI ops return {image_url | image_b64} objects; Sharp ops return Buffers.
+    // Normalize both to a displayable URL/data-URL (never "[object Object]").
+    function normalizeImageResult(r) {
+      if (!r) return null;
+      if (typeof r === "string") return r;
+      if (r.image_url) return r.image_url;
+      if (r.image_b64) return `data:image/png;base64,${r.image_b64}`;
+      if (Buffer.isBuffer(r)) return `data:image/png;base64,${r.toString("base64")}`;
+      return null;
+    }
     const results = [];
     for (let i = 0; i < images.length; i++) {
       try {
-        const imgBuffer = Buffer.from(images[i].replace(/^data:image\/\w+;base64,/, ""), "base64");
-        let resultBuffer;
-        if (operation === "remove_bg") resultBuffer = await aiFeatures.removeBackground(imgBuffer);
-        else if (operation === "upscale") resultBuffer = await aiFeatures.upscaleImage(imgBuffer, params?.scale || 2);
-        else if (operation === "style_transfer") resultBuffer = await aiFeatures.styleTransfer(imgBuffer, params?.style || "realistic");
-        else resultBuffer = await imageProcessor.applyOperations(imgBuffer, [{ type: operation, params: params || {} }]);
-        results.push({ index: i, ok: true, result: resultBuffer.image_url || resultBuffer.result || `data:image/png;base64,${resultBuffer.toString("base64")}` });
+        const imgBuffer = Buffer.from(String(images[i]).replace(/^data:image\/\w+;base64,/, ""), "base64");
+        let out;
+        if (operation === "remove_bg") out = await aiFeatures.removeBackground(imgBuffer);
+        else if (operation === "upscale") out = await aiFeatures.upscaleImage(imgBuffer, params?.scale || 2);
+        else if (operation === "style_transfer") out = await aiFeatures.styleTransfer(imgBuffer, params?.style || "realistic");
+        else out = await imageProcessor.applyOperations(imgBuffer, [{ type: operation, params: params || {} }]);
+        const url = normalizeImageResult(out);
+        if (!url) throw new Error("empty result from image provider");
+        results.push({ index: i, ok: true, result: url });
       } catch (e) {
         results.push({ index: i, ok: false, error: e.message });
       }
@@ -4115,12 +4485,92 @@ app.post("/creative-suite/videos/generate", requireAuth, limitCostly, async (req
   }
 });
 
+// Video edit helpers: base64-or-URL -> sandbox-sized base64, and the
+// sandbox ffmpeg call itself. Ops chain: each op's MP4 feeds the next.
+async function mediaToB64(s) {
+  const str = String(s || "");
+  let buf;
+  if (/^https?:\/\//i.test(str)) {
+    const r = await fetch(str, { signal: AbortSignal.timeout(120_000) });
+    if (!r.ok) throw new Error(`media fetch HTTP ${r.status}`);
+    buf = Buffer.from(await r.arrayBuffer());
+  } else {
+    buf = Buffer.from(str.replace(/^data:[\w/;-]+;base64,/, ""), "base64");
+  }
+  if (!buf.length || buf.length > 8 * 1024 * 1024) throw new Error("media empty or >8MB (sandbox cap — trim source first or use 720p 4-8s clips)");
+  return buf.toString("base64");
+}
+async function sandboxMedia(payload) {
+  const r = await fetch(`${SANDBOX_URL}/media/assemble`, {
+    method: "POST",
+    headers: sandboxAuthHeaders(),
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(180_000),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data?.base64) throw new Error(data?.error || `media assemble HTTP ${r.status}`);
+  return data;
+}
+// Real timeline ops: trim | replace_audio | subtitles_burn | concat.
+// Single call chains ops in order (each MP4 feeds the next).
 app.post("/creative-suite/videos/edit", requireAuth, limitCostly, async (req, res) => {
   try {
-    const { video, operations } = req.body || {};
-    if (!video) return res.status(400).json({ error: "video required" });
-    const results = await videoProcessor.processVideo(Buffer.from(video, "base64"), operations || []);
-    res.json({ ok: true, results });
+    const { video, audio, subtitles, clips, operations } = req.body || {};
+    if (!video && !(Array.isArray(clips) && clips.length)) return res.status(400).json({ error: "video or clips[] required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Video editing needs Creator or Pro." });
+    let current = video ? await mediaToB64(video) : null;
+    const applied = [];
+    for (const op of (Array.isArray(operations) ? operations : [])) {
+      const p = op.params || {};
+      if (op.type === "trim") {
+        if (!current) throw new Error("trim needs a video first");
+        const out = await sandboxMedia({ op: "trim", files: [{ base64: current }], start_s: p.start_s ?? 0, end_s: p.end_s ?? 0 });
+        current = out.base64; applied.push({ type: "trim", ok: true, size: out.size });
+      } else if (op.type === "replace_audio") {
+        if (!current) throw new Error("replace_audio needs a video first");
+        const ab = audio || p.audio;
+        if (!ab) throw new Error("replace_audio needs audio");
+        const out = await sandboxMedia({ op: "replace_audio", files: [{ base64: current }, { base64: await mediaToB64(ab) }] });
+        current = out.base64; applied.push({ type: "replace_audio", ok: true, size: out.size });
+      } else if (op.type === "subtitles_burn") {
+        if (!current) throw new Error("subtitles_burn needs a video first");
+        const subs = Array.isArray(subtitles) && subtitles.length ? subtitles : p.subtitles;
+        if (!Array.isArray(subs) || !subs.length) throw new Error("subtitles_burn needs subtitles[]");
+        const out = await sandboxMedia({ op: "subtitles", files: [{ base64: current }], subtitles: subs });
+        current = out.base64; applied.push({ type: "subtitles_burn", ok: true, size: out.size });
+      } else if (op.type === "concat") {
+        const list = Array.isArray(clips) && clips.length ? clips : (Array.isArray(p.clips) ? p.clips : []);
+        if (list.length < 1) throw new Error("concat needs clips[] (2-6 videos)");
+        const b64s = [];
+        for (const c of list.slice(0, 6)) b64s.push({ base64: await mediaToB64(c) });
+        const out = await sandboxMedia({ op: "concat", files: b64s });
+        current = out.base64; applied.push({ type: "concat", ok: true, size: out.size, clips: b64s.length });
+      } else {
+        applied.push({ type: op.type || "unknown", ok: false, error: "unsupported op (use trim|replace_audio|subtitles_burn|concat)" });
+      }
+    }
+    if (!current) return res.status(400).json({ error: "no operations applied — send operations[]" });
+    const id = `vedit_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video_edit', 'done', ?)").run(id, uid, `ops=${applied.map(a => a.type).join(",")}`);
+    res.json({ ok: true, job_id: id, applied, mime: "video/mp4", video_base64: current });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Live capability table: which video models support what (durations,
+// resolutions, frame control, references) — the app reads this to route
+// Genjutsu/Cinema to a capable model instead of guessing.
+app.get("/creative-suite/videos/models", requireAuth, limitNormal, async (_req, res) => {
+  try {
+    const r = await fetch("https://openrouter.ai/api/v1/videos/models", {
+      headers: orVideoHeaders(),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data?.error?.message || `models HTTP ${r.status}`);
+      res.json({ ok: true, defaults: { text_to_video: OR_VIDEO_MODEL, genjutsu: OR_GENJUTSU_MODEL, avatar: OR_AVATAR_MODEL, avatar_fallback: HEDRA_API_KEY ? "hedra-character-3" : "local" }, models: data.data || data.models || [] });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -4156,15 +4606,15 @@ app.post("/creative-suite/storyboard", requireAuth, limitCostly, async (req, res
     const uid = boundUser(req);
     if (activeTier(uid) === "free") return res.status(402).json({ error: "Storyboard needs Creator or Pro." });
     const frames = await aiFeatures.storyboard(script, style, num_frames || 6);
-    const generatedFrames = [];
-    for (const frame of frames.slice(0, 8)) {
+    // Parallel fan-out: 8 sequential generations took ~8x single latency.
+    const generatedFrames = await Promise.all(frames.slice(0, 8).map(async (frame) => {
       try {
         const img = await generateImage(frame.prompt, { model: OR_IMAGE_MODEL });
-        generatedFrames.push({ ...frame, image_url: img.image_url });
+        return { ...frame, image_url: img.image_url || null };
       } catch (e) {
-        generatedFrames.push({ ...frame, image_url: null, error: e.message });
+        return { ...frame, image_url: null, error: e.message };
       }
-    }
+    }));
     res.json({ ok: true, frames: generatedFrames });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4336,6 +4786,575 @@ app.post("/creative-suite/export", requireAuth, limitCostly, async (req, res) =>
   }
 });
 
+// ==================== CINEMA STUDIO / KATANA / GENJUTSU / SOUL ID ====================
+// Director's Panel option tables (genre, era, tempo, camera, lens, aperture,
+// moves, angles, lighting, palettes, emotions, aspect ratios).
+app.get("/creative-suite/cinema/options", requireAuth, limitNormal, (_req, res) => {
+  res.json({ ok: true, options: cinema.CINEMA_OPTIONS });
+});
+
+// AI Director: brief -> shot list with pre-filled cinematography params.
+app.post("/creative-suite/cinema/direct", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { brief, num_shots } = req.body || {};
+    if (!brief) return res.status(400).json({ error: "brief required" });
+    const shots = await cinema.aiDirect(brief, Math.min(8, Math.max(1, Number(num_shots) || 4)));
+    res.json({ ok: true, shots });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Cinema generate: prompt + Director's Panel params + optional character/
+// location references -> image (sync) or video (async job). References are
+// base64 data URLs or http URLs (max 8 per call).
+app.post("/creative-suite/cinema/generate", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { prompt, kind, director, references, aspect_ratio, duration, resolution } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+    const uid = boundUser(req);
+    const refs = Array.isArray(references) ? references.slice(0, 8) : [];
+    const inputRefs = refs.map(r => ({ type: "image_url", image_url: { url: String(r) } }));
+    const directed = cinema.buildDirectorPrompt({ prompt, ...(director || {}) });
+    if ((kind || "image") === "video") {
+      if (activeTier(uid) === "free") return res.status(402).json({ error: "Video needs Creator or Pro." });
+      const cap = checkCap(uid, "clip");
+      if (!cap.ok) return res.status(402).json({ error: cap.message });
+      const job = await submitVideo(directed, {
+        duration: duration || 4,
+        resolution: resolution || "720p",
+        aspect_ratio: aspect_ratio || "16:9",
+        ...(inputRefs.length ? { input_references: inputRefs } : {}),
+      });
+      const id = `vid_${Date.now()}`;
+      db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video', 'submitted', ?)").run(id, uid, directed.slice(0, 1000));
+      db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+      return res.json({ ok: true, kind: "video", job_id: id, provider_job: job });
+    }
+    const cap = checkCap(uid, "image");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const data = await generateImage(directed, {
+      aspect_ratio: aspect_ratio || undefined,
+      ...(inputRefs.length ? { input_references: inputRefs } : {}),
+    });
+    db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    res.json({ ok: true, kind: "image", directed_prompt: directed, ...data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Katana: one natural-language command -> parsed ops -> executed pipeline.
+// Body: { command, video? (base64/url), audio? (base64) }. Returns ops +
+// per-op results (captions generated via Whisper, trims via sandbox, etc).
+app.post("/creative-suite/katana", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { command, video, audio, language } = req.body || {};
+    if (!command) return res.status(400).json({ error: "command required" });
+    const { ops, reply } = await cinema.katanaParse(command);
+    const results = [];
+    for (const op of ops) {
+      try {
+        if (op.type === "captions" || op.type === "translate_captions") {
+          if (!audio && !video) { results.push({ type: op.type, ok: false, error: "audio or video required for captions" }); continue; }
+          const buf = Buffer.from(String(audio || video || "").replace(/^data:[\w/;-]+;base64,/, ""), "base64");
+          const subs = await aiFeatures.generateSubtitles(buf, op.params?.language || language || "auto");
+          let out = subs.subtitles || [];
+          if (op.type === "translate_captions" && op.params?.target_language) {
+            out = await aiFeatures.translateSubtitles(out, op.params.target_language);
+          }
+          results.push({ type: op.type, ok: true, subtitles: out });
+        } else if (op.type === "export") {
+          results.push({ type: op.type, ok: true, preset: templateLibrary.EXPORT_PRESETS[op.params?.platform] || null });
+        } else if (op.type === "trim" && video) {
+          const out = await sandboxMedia({ op: "trim", files: [{ base64: await mediaToB64(video) }], start_s: op.params?.start_s ?? 0, end_s: op.params?.end_s ?? 0 });
+          results.push({ type: op.type, ok: true, size: out.size, video_base64: out.base64 });
+        } else if (op.type === "replace_audio" && video && (audio || op.params?.audio)) {
+          const out = await sandboxMedia({ op: "replace_audio", files: [{ base64: await mediaToB64(video) }, { base64: await mediaToB64(audio || op.params.audio) }] });
+          results.push({ type: op.type, ok: true, size: out.size, video_base64: out.base64 });
+        } else {
+          results.push({ type: op.type, ok: true, note: "queued — run via /creative-suite/videos/edit", params: op.params || {} });
+        }
+      } catch (e) {
+        results.push({ type: op.type, ok: false, error: e.message });
+      }
+    }
+    const id = `kat_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'katana', 'done', ?, ?)").run(id, boundUser(req), String(command).slice(0, 500), JSON.stringify(results).slice(0, 4000));
+    res.json({ ok: true, job_id: id, ops, reply, results });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Genjutsu: Motion Transfer (keep motion/camera/timing, rebuild scene from
+// references) or Object Swap (swap one element, keep the rest). Implemented
+// on the video model via frame_images + input_references so motion/timing
+// carry over from the source clip.
+app.post("/creative-suite/genjutsu", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { mode, video, references, description, preset, duration, resolution, model } = req.body || {};
+    if (!video) return res.status(400).json({ error: "video (base64 or http URL) required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Genjutsu needs Creator or Pro." });
+    const cap = checkCap(uid, "clip");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const m = (mode || "motion_transfer").toLowerCase();
+    const refs = Array.isArray(references) ? references.slice(0, 30) : [];
+    const prompt = m === "object_swap"
+      ? `Object swap: ${description || preset || "swap the specified element"}. Preserve everything else in the shot exactly — same motion, camera, timing, lighting.`
+      : `Motion transfer: keep the source motion, camera work and timing exactly. Rebuild the scene: ${description || preset || "new cast, location and look"}. ${refs.length ? "Match the provided character/location references in every frame." : ""}`;
+    const s = String(video);
+    // OpenRouter shape: frame_images entries need {frame_type: first_frame|last_frame};
+    // source CLIPS + style refs ride as multimodal input_references (Seedance-class).
+    const videoRef = { type: "video_url", video_url: { url: s } };
+    const refObjs = refs.map(r => ({ type: "image_url", image_url: { url: String(r) } }));
+    const job = await submitVideo(prompt, {
+      model: model || OR_GENJUTSU_MODEL,
+      duration: duration || 4,
+      resolution: resolution || "720p",
+      input_references: [videoRef, ...refObjs],
+    });
+    const id = `gen_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'genjutsu', 'submitted', ?)").run(id, uid, prompt.slice(0, 1000));
+    db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    res.json({ ok: true, job_id: id, mode: m, model: model || OR_GENJUTSU_MODEL, provider_job: job });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Soul ID / Elements: reusable characters, locations, props for consistency.
+app.post("/creative-suite/elements", requireAuth, limitNormal, (req, res) => {
+  try {
+    const { name, type, references, metadata } = req.body || {};
+    if (!name) return res.status(400).json({ error: "name required" });
+    const id = `el_${Date.now().toString(36)}`;
+    db.prepare("INSERT INTO creative_elements (id, user_id, type, name, reference_urls, metadata) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(id, boundUser(req), type || "character", name, JSON.stringify(Array.isArray(references) ? references.slice(0, 30) : []), JSON.stringify(metadata || {}));
+    res.json({ ok: true, element_id: id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.get("/creative-suite/elements", requireAuth, limitNormal, (req, res) => {
+  const uid = boundUser(req);
+  const { type } = req.query || {};
+  const rows = type
+    ? db.prepare("SELECT * FROM creative_elements WHERE user_id = ? AND type = ? ORDER BY created_at DESC LIMIT 100").all(uid, type)
+    : db.prepare("SELECT * FROM creative_elements WHERE user_id = ? ORDER BY created_at DESC LIMIT 100").all(uid);
+  res.json({ ok: true, elements: rows.map(r => ({ ...r, reference_urls: JSON.parse(r.reference_urls || "[]"), metadata: JSON.parse(r.metadata || "{}") })) });
+});
+app.post("/creative-suite/elements/:id/delete", requireAuth, limitNormal, (req, res) => {
+  db.prepare("DELETE FROM creative_elements WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+// AI Influencer: attributes -> persona + consistent character sheet + post batch.
+app.post("/creative-suite/influencer", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { attributes, posts } = req.body || {};
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "AI Influencer needs Creator or Pro." });
+    const persona = await cinema.influencerPersona(attributes || {});
+    const cap = checkCap(uid, "image");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    let sheet = null;
+    if (persona.character_prompt) {
+      try {
+        sheet = await generateImage(`Character reference sheet, same person three angles (front, profile, three-quarter), neutral background. ${persona.character_prompt}`, {});
+        db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+      } catch (e) { sheet = { error: e.message }; }
+    }
+    // Post batch: first 3 visuals generated in parallel against the SAME
+    // character sheet reference (that is what keeps one consistent face).
+    // Remaining ideas ship as ready prompts so the client can render on demand.
+    const ideas = Array.isArray(persona.post_ideas) ? persona.post_ideas : [];
+    const sheetRef = sheet?.image_url
+      ? [{ type: "image_url", image_url: { url: sheet.image_url } }]
+      : [];
+    const visualCount = Math.min(3, ideas.length);
+    const visuals = await Promise.all(ideas.slice(0, visualCount).map(async (idea) => {
+      try {
+        const img = await generateImage(
+          `Same person as reference, photorealistic lifestyle photo. ${idea.visual_prompt || idea.caption || ""} ${persona.character_prompt || ""}`,
+          sheetRef.length ? { input_references: sheetRef } : {}
+        );
+        db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+        return { caption: idea.caption || "", image_url: img.image_url || null, image_b64: img.image_b64 || null };
+      } catch (e) {
+        return { caption: idea.caption || "", image_url: null, error: e.message };
+      }
+    }));
+    const id = `inf_${Date.now()}`;
+    db.prepare("INSERT INTO creative_elements (id, user_id, type, name, reference_urls, metadata) VALUES (?, ?, 'character', ?, ?, ?)")
+      .run(id, uid, persona.name || "Influencer", JSON.stringify(sheet?.image_url ? [sheet.image_url] : []), JSON.stringify({ persona, character_prompt: persona.character_prompt || "" }));
+    res.json({ ok: true, element_id: id, persona, character_sheet: sheet, posts: visuals, queued_prompts: ideas.slice(visualCount).map(i => ({ caption: i.caption || "", visual_prompt: i.visual_prompt || "" })) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Ads (Marketing Studio): product + brief -> script + shots + static ad poster.
+app.post("/creative-suite/ads", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { brief, product, product_image } = req.body || {};
+    if (!brief) return res.status(400).json({ error: "brief required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Ads Studio needs Creator or Pro." });
+    const plan = await cinema.adPlan(brief, product || "");
+    const cap = checkCap(uid, "image");
+    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    let poster = null;
+    try {
+      const refs = product_image ? [{ type: "image_url", image_url: { url: String(product_image) } }] : [];
+      poster = await generateImage(`Premium product advertisement poster, studio lighting, 1:1. ${plan.static_ad_prompt || brief}. Product must match reference exactly.`, refs.length ? { input_references: refs } : {});
+      db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    } catch (e) { poster = { error: e.message }; }
+    const id = `ad_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'ad', 'done', ?, ?)").run(id, uid, String(brief).slice(0, 500), JSON.stringify(plan).slice(0, 4000));
+    res.json({ ok: true, job_id: id, plan, poster });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Lip-sync, two engines:
+// A) Neural (Sync Labs sync-2.0): real mouth re-animation. Needs SYNC_LABS_API_KEY
+//    + PUBLIC_BASE_URL (webhook). Media is staged via Supabase signed URLs.
+// B) Local (always available): transcript-timed captions + sandbox dub mix.
+// The response always says which engine ran — never a silent downgrade.
+async function supaStageMedia(buf, filename, mime) {
+  if (!HAS_REMOTE_BACKUP) throw new Error("Supabase storage not configured");
+  await supaBucket();
+  const path = `lipsync/${Date.now()}-${filename}`.replace(/[^a-zA-Z0-9._/-]/g, "_");
+  const up = await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY, "Content-Type": mime, "x-upsert": "true" },
+    body: buf,
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!up.ok) throw new Error(`media stage upload HTTP ${up.status}`);
+  const sign = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${SUPABASE_BUCKET}/${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ expiresIn: 3600 }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const sj = await sign.json().catch(() => ({}));
+  if (!sj?.signedURL) throw new Error("media stage sign failed");
+  return `${SUPABASE_URL}${sj.signedURL}`;
+}
+app.post("/webhooks/lipsync", async (req, res) => {
+  // Sync Labs completion webhook: ?job=<our creative_jobs id>.
+  try {
+    const ours = String(req.query.job || "");
+    const b = req.body || {};
+    const url = b.videoUrl || b.video_url || b.output || b.result_url || null;
+    const status = /fail|error/i.test(String(b.status || b.state || "")) ? "failed" : (url ? "done" : "processing");
+    if (ours) db.prepare("UPDATE creative_jobs SET status = ?, result_url = ? WHERE id = ?").run(status, url ? String(url).slice(0, 1000) : null, ours);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(200).json({ ok: false, error: e.message });
+  }
+});
+app.post("/creative-suite/lipsync", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { video, image, audio, language, mode, aspect_ratio, avatar_prompt } = req.body || {};
+    if (!audio) return res.status(400).json({ error: "audio required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Lip-sync needs Creator or Pro." });
+    const id = `lip_${Date.now()}`;
+    // Engine Y (PRIMARY avatar): HeyGen Avatar IV via OpenRouter /videos —
+    // photo + voice -> expressive lip-synced talking head ($0.05/s, to 1080p).
+    // Same key as everything else (no extra subscription). Any failure falls
+    // through to Hedra, then local — the chain never breaks the request.
+    if ((mode === "avatar" || (!video && image)) && image && HAS_OR) {
+      try {
+        const portrait = String(image).startsWith("data:")
+          ? String(image)
+          : `data:image/png;base64,${String(image).replace(/^data:[\w/;-]+;base64,/, "")}`;
+        const job = await submitVideo(
+          String(avatar_prompt || "A person speaking to the camera with natural micro-expressions, head motion and gestures matching the vocal emotion").slice(0, 1000),
+          {
+            model: OR_AVATAR_MODEL,
+            duration: 8,
+            resolution: "720p",
+            aspect_ratio: aspect_ratio || "9:16",
+            input_references: [{ type: "image_url", image_url: { url: portrait } }],
+          }
+        );
+        const pid = job?.id || job?.data?.id;
+        if (!pid) throw new Error("heygen submit returned no job id");
+        db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'submitted', ?, ?)").run(id, uid, `heygen:${pid} lang=${language || "auto"}`, JSON.stringify(job).slice(0, 1000));
+        return res.json({ ok: true, job_id: id, engine: "heygen", status_url: `/creative-suite/lipsync/${id}/status`, content_url: `/videos/content/${pid}`, note: "HeyGen talking-avatar render queued — poll status until done, then GET content_url." });
+      } catch (e) {
+        console.warn("[lipsync] heygen engine failed, falling back:", e.message);
+      }
+    }
+    // Engine H (fallback avatar): Hedra Character 3 — one portrait + audio, no video needed.
+    if ((mode === "avatar" || (!video && image)) && image && HEDRA_API_KEY && HAS_REMOTE_BACKUP) {
+      try {
+        const strip = (s) => Buffer.from(String(s).replace(/^data:[\w/;-]+;base64,/, ""), "base64");
+        const [portraitUrl, audioUrl] = await Promise.all([
+          supaStageMedia(strip(image), "portrait.png", "image/png"),
+          supaStageMedia(strip(audio), "voice.mp3", "audio/mpeg"),
+        ]);
+        const sub = await hedraFetch("/v3/models/hedra-character-3", {
+          method: "POST",
+          body: {
+            input: {
+              aspect_ratio: aspect_ratio || "9:16",
+              resolution: "720p",
+              start_image: { source: "url", url: portraitUrl },
+              audio: { source: "url", url: audioUrl },
+              prompt: String(avatar_prompt || "A person speaking to the camera, natural micro-expressions").slice(0, 500),
+            },
+          },
+        });
+        const sd = await sub.json().catch(() => ({}));
+        if (sub.status !== 202 && !sub.ok) throw new Error(sd?.message || sd?.error || `hedra HTTP ${sub.status}`);
+        const hid = sd.id || sd.job_id || sd.jobId || null;
+        if (!hid) throw new Error("hedra returned no job id");
+        db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'submitted', ?, ?)").run(id, uid, `hedra:${hid} lang=${language || "auto"}`, JSON.stringify(sd).slice(0, 1000));
+        return res.json({ ok: true, job_id: id, engine: "hedra", status_url: `/creative-suite/lipsync/${id}/status`, note: "Talking-avatar render queued — poll status until done." });
+      } catch (e) {
+        console.warn("[lipsync] hedra engine failed, falling back:", e.message);
+      }
+    }
+    // Engine A: neural lip-sync via Sync Labs (mouth re-animation).
+    if (video && SYNC_LABS_KEY && PUBLIC_BASE_URL && HAS_REMOTE_BACKUP) {
+      try {
+        const strip = (s) => Buffer.from(String(s).replace(/^data:[\w/;-]+;base64,/, ""), "base64");
+        const [videoUrl, audioUrl] = await Promise.all([
+          supaStageMedia(strip(video), "source.mp4", "video/mp4"),
+          supaStageMedia(strip(audio), "voice.mp3", "audio/mpeg"),
+        ]);
+        const sub = await fetch("https://api.synclabs.so/lipsync", {
+          method: "POST",
+          headers: { "x-api-key": SYNC_LABS_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            videoUrl, audioUrl, model: "sync-2.0",
+            webhookUrl: `${PUBLIC_BASE_URL}/webhooks/lipsync?job=${id}`,
+          }),
+          signal: AbortSignal.timeout(60_000),
+        });
+        const sd = await sub.json().catch(() => ({}));
+        if (!sub.ok) throw new Error(sd?.message || sd?.error || `synclabs HTTP ${sub.status}`);
+        db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'submitted', ?, ?)").run(id, uid, `neural lang=${language || "auto"}`, JSON.stringify(sd).slice(0, 1000));
+        return res.json({ ok: true, job_id: id, engine: "synclabs", status_url: `/creative-suite/lipsync/${id}/status`, provider_job: sd, note: "Neural render queued — poll status until done, then GET the video URL." });
+      } catch (e) {
+        console.warn("[lipsync] neural engine failed, falling back to local:", e.message);
+      }
+    }
+    // Engine B: local fallback — timed captions + dub mix plan.
+    const buf = Buffer.from(String(audio).replace(/^data:[\w/;-]+;base64,/, ""), "base64");
+    const { subtitles, text } = await aiFeatures.generateSubtitles(buf, language || "auto");
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'done', ?, ?)").run(id, uid, `local lang=${language || "auto"}`, JSON.stringify(subtitles).slice(0, 4000));
+    res.json({
+      ok: true, job_id: id, engine: "local", transcript: text, subtitles,
+      mix: { op: "replace_audio", note: "Render in sandbox: replace video audio track with the voiceover, then burn in subtitles" },
+      ...(SYNC_LABS_KEY ? {} : { upgrade: "Set SYNC_LABS_API_KEY + PUBLIC_BASE_URL for neural mouth re-animation." }),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.get("/creative-suite/lipsync/:jobId/status", requireAuth, limitNormal, async (req, res) => {
+  const row = db.prepare("SELECT id, kind, status, prompt, result_url, created_at FROM creative_jobs WHERE id = ?").get(req.params.jobId);
+  if (!row) return res.status(404).json({ error: "job not found" });
+  // Hedra jobs: poll live (no webhook needed) and flip the row when done.
+  const m = String(row.prompt || "").match(/^hedra:(\S+)/);
+  // HeyGen jobs (OpenRouter /videos pipeline): poll the provider job; the MP4
+  // is served via /videos/content/<providerId> once completed.
+  const hy = String(row.prompt || "").match(/^heygen:(\S+)/);
+  if (hy && row.status !== "done" && HAS_OR) {
+    try {
+      const p = await pollVideo(hy[1].split(" ")[0]);
+      const st = String(p?.data?.status || p?.status || "").toLowerCase();
+      if (st === "completed") {
+        const curl = `/videos/content/${hy[1].split(" ")[0]}`;
+        db.prepare("UPDATE creative_jobs SET status = 'done', result_url = ? WHERE id = ?").run(curl, row.id);
+        return res.json({ ok: true, ...row, status: "done", result_url: curl });
+      }
+      if (st === "failed" || st === "cancelled" || st === "expired") {
+        db.prepare("UPDATE creative_jobs SET status = 'failed' WHERE id = ?").run(row.id);
+        return res.json({ ok: true, ...row, status: "failed", provider_error: p?.data?.error || p?.error || st });
+      }
+      return res.json({ ok: true, ...row, provider_status: st || "processing" });
+    } catch (e) {
+      return res.json({ ok: true, ...row, provider_error: e.message });
+    }
+  }
+  if (m && row.status !== "done" && HEDRA_API_KEY) {
+    try {
+      const st = await hedraFetch(`/v3/jobs/${encodeURIComponent(m[1])}/status`);
+      const sj = await st.json().catch(() => ({}));
+      const s = String(sj.status || sj.state || "").toUpperCase();
+      if (s === "COMPLETED" || s === "COMPLETE" || s === "DONE") {
+        const job = await (await hedraFetch(`/v3/jobs/${encodeURIComponent(m[1])}`)).json().catch(() => ({}));
+        const url = hedraVideoUrl(job);
+        if (url) {
+          db.prepare("UPDATE creative_jobs SET status = 'done', result_url = ? WHERE id = ?").run(url, row.id);
+          return res.json({ ok: true, ...row, status: "done", result_url: url });
+        }
+      }
+      if (s === "FAILED" || s === "ERROR" || s === "CANCELLED") {
+        db.prepare("UPDATE creative_jobs SET status = 'failed' WHERE id = ?").run(row.id);
+        return res.json({ ok: true, ...row, status: "failed" });
+      }
+      return res.json({ ok: true, ...row, provider_status: s || "processing" });
+    } catch (e) {
+      return res.json({ ok: true, ...row, provider_error: e.message });
+    }
+  }
+  res.json({ ok: true, ...row });
+});
+
+// Shot Recipes: curated one-tap looks (several FRIT-originals).
+app.get("/creative-suite/cinema/recipes", requireAuth, limitNormal, (_req, res) => {
+  res.json({ ok: true, recipes: cinema.SHOT_RECIPES });
+});
+
+// Auto-Pilot (FRIT-original): script -> AI-directed shots -> one image per
+// shot (parallel) -> assembled MP4 slideshow film via sandbox ffmpeg.
+app.post("/creative-suite/autopilot", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { script, per_shot_secs, aspect_ratio } = req.body || {};
+    if (!script) return res.status(400).json({ error: "script required" });
+    const uid = boundUser(req);
+    if (activeTier(uid) === "free") return res.status(402).json({ error: "Auto-Pilot needs Creator or Pro." });
+    const shots = await cinema.aiDirect(script, 4);
+    const perSecs = Math.min(4, Math.max(1, Number(per_shot_secs) || 2));
+    const files = [];
+    const directedShots = await Promise.all(shots.map(async (s) => {
+      const directed = cinema.buildDirectorPrompt({
+        prompt: s.prompt, genre: s.genre, camera: s.camera, lens: s.lens,
+        aperture: s.aperture, move: s.move, angle: s.angle, lighting: s.lighting,
+        palette: s.palette, emotion: s.emotion, tempo: "Single Shot",
+      });
+      try {
+        const img = await generateImage(directed, { aspect_ratio: aspect_ratio || "16:9" });
+        db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+        let b64 = img.image_b64 || null;
+        if (!b64 && img.image_url) {
+          const r = await fetch(img.image_url, { signal: AbortSignal.timeout(120_000) });
+          if (!r.ok) throw new Error(`frame fetch HTTP ${r.status}`);
+          b64 = Buffer.from(await r.arrayBuffer()).toString("base64");
+        }
+        if (!b64) throw new Error("empty frame");
+        if (Buffer.from(b64, "base64").length > 8 * 1024 * 1024) throw new Error("frame >8MB");
+        files.push({ base64: b64 });
+        return { ...s, directed_prompt: directed, ok: true };
+      } catch (e) {
+        return { ...s, directed_prompt: directed, ok: false, error: e.message };
+      }
+    }));
+    if (!files.length) return res.status(500).json({ ok: false, error: "all shot generations failed", shots: directedShots });
+    const r = await fetch(`${SANDBOX_URL}/media/assemble`, {
+      method: "POST",
+      headers: sandboxAuthHeaders(),
+      body: JSON.stringify({ op: "slideshow", files, per_image_secs: perSecs }),
+      signal: AbortSignal.timeout(180_000),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data?.base64) throw new Error(data?.error || `assemble HTTP ${r.status}`);
+    const id = `film_${Date.now()}`;
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'autofilm', 'done', ?)").run(id, uid, String(script).slice(0, 500));
+    res.json({ ok: true, job_id: id, shots: directedShots, film: { mime: "video/mp4", size: data.size, base64: data.base64 } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Brand Kit (FRIT-original): brand lock (colors/font/logo/palette/tone)
+// applied to every generation via prompt injection — no extra model cost.
+app.post("/creative-suite/brandkit", requireAuth, limitNormal, (req, res) => {
+  try {
+    const { name, colors, font, logo_url, palette, tone } = req.body || {};
+    if (!name) return res.status(400).json({ error: "name required" });
+    const id = `brand_${Date.now().toString(36)}`;
+    db.prepare("INSERT INTO creative_brandkits (id, user_id, name, colors, font, logo_url, palette, tone) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(id, boundUser(req), name, JSON.stringify(Array.isArray(colors) ? colors.slice(0, 6) : []), font || "", logo_url || "", palette || "", tone || "");
+    res.json({ ok: true, brandkit_id: id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.get("/creative-suite/brandkit", requireAuth, limitNormal, (req, res) => {
+  const rows = db.prepare("SELECT * FROM creative_brandkits WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(boundUser(req));
+  res.json({ ok: true, brandkits: rows.map(r => ({ ...r, colors: JSON.parse(r.colors || "[]") })) });
+});
+app.post("/creative-suite/brandkit/:id/delete", requireAuth, limitNormal, (req, res) => {
+  db.prepare("DELETE FROM creative_brandkits WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Design Studio (graphics niche): flyers, posters, thumbnails, cards with REAL
+// legible text. Routed to the design specialist (OR_GRAPHICS_MODEL), never the
+// photo model. Template zones + brand kit keep every piece on-brand.
+app.get("/creative-suite/design/templates", requireAuth, limitNormal, (_req, res) => {
+  res.json({ ok: true, templates: templateLibrary.getGraphicsTemplates() });
+});
+app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { template, headline, body, cta, palette, brandkit_id, logo_url, style_refs, craft, variations, aspect_ratio } = req.body || {};
+    if (!headline && !template) return res.status(400).json({ error: "headline or template required" });
+    const uid = boundUser(req);
+    const gate = checkCap(uid, "image");
+    if (!gate.ok) return res.status(402).json({ error: gate.message });
+    const tpl = templateLibrary.getGraphicsTemplate(template || "") || null;
+    let brand = null;
+    if (brandkit_id) {
+      const b = db.prepare("SELECT * FROM creative_brandkits WHERE id = ?").get(brandkit_id);
+      if (b) brand = { name: b.name, colors: JSON.parse(b.colors || "[]"), font: b.font, palette: b.palette, tone: b.tone };
+    }
+    // Craft routing: each deliverable goes to the model built for it.
+    const want = (craft || "auto").toLowerCase();
+    const resolved = want === "auto" ? designStudio.pickCraft({ template, headline, body }) : want;
+    const chain = resolved === "type"
+      ? [OR_TYPE_MODEL, OR_GRAPHICS_MODEL, OR_IMAGE_MODEL]
+      : resolved === "vector"
+        ? [OR_VECTOR_MODEL, OR_GRAPHICS_MODEL, OR_IMAGE_MODEL]
+        : resolved === "photo"
+          ? [OR_IMAGE_MODEL, OR_GRAPHICS_MODEL]
+          : [OR_GRAPHICS_MODEL, OR_IMAGE_MODEL];
+    const models = [...new Set(chain.filter(Boolean))];
+    if (!models.length) return res.status(500).json({ ok: false, error: "no graphics model configured" });
+    const refs = [];
+    if (logo_url) refs.push({ type: "image_url", image_url: { url: String(logo_url) } });
+    for (const r of (Array.isArray(style_refs) ? style_refs : []).slice(0, 4)) {
+      refs.push({ type: "image_url", image_url: { url: String(r) } });
+    }
+    const n = designStudio.variationCount(variations);
+    const base = { template: tpl, headline, body, cta, palette, brand, styleMood: refs.length > 1 ? "match the mood-board references" : "" };
+    // Same brief, distinct art directions, rendered in parallel — pick, don't settle.
+    const designs = await Promise.all(Array.from({ length: n }, async (_, v) => {
+      const prompt = designStudio.buildDesignPrompt({ ...base, variation: v });
+      let lastErr = null;
+      for (const model of models) {
+        try {
+          const out = await generateImage(prompt, {
+            model,
+            output_format: "png",
+            ...(aspect_ratio ? { aspect_ratio } : {}),
+            ...(refs.length ? { input_references: refs } : {}),
+          });
+          db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+          return { ok: true, model_used: model, image_url: out.image_url || null, image_b64: out.image_b64 || null };
+        } catch (e) { lastErr = e; }
+      }
+      return { ok: false, error: lastErr?.message || "all design models failed" };
+    }));
+    const id = `gfx_${Date.now()}`;
+    const firstUrl = designs.find(d => d.image_url)?.image_url || "";
+    db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'design', 'done', ?, ?)").run(id, uid, `craft=${resolved} ${String(headline || template || "").slice(0, 300)}`, firstUrl.slice(0, 1000));
+    res.json({ ok: true, job_id: id, template: tpl?.id || null, zones: tpl?.zones || [], craft: resolved, brand_applied: !!brand, designs });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Trial feedback: testers on trial codes tell us what broke (rating 1-5 + text).
 app.post("/feedback", requireAuth, limitNormal, (req, res) => {
   const { message, rating } = req.body || {};
@@ -4438,6 +5457,64 @@ app.get("/systems/status", requireAuth, (_req, res) => {
     positions: positionMonitor.status(),
   });
 });
+
+// ==================== TRADING BOTS (options / intraday / longterm) ==========
+// One config surface for the phone's AI-help Bots UI. Intraday/longterm auto
+// flows through executeTradeSignal (risk gate + bridge + monitor); the
+// options bot auto-scans + notifies + paper-tracks and NEVER executes.
+app.get("/api/trading/bots", requireAuth, async (_req, res) => {
+  try {
+    res.json({ bots: getBots(db), defs: BOT_DEFS });
+  } catch (err) {
+    res.status(500).json({ error: "Bots failed", details: err.message });
+  }
+});
+
+app.post("/api/trading/bots/:name", requireAuth, async (req, res) => {
+  try {
+    const bot = saveBot(db, req.params.name, req.body || {});
+    res.json({ ok: true, bot });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/api/trading/bots/runs", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 30, 100);
+    const runs = db.prepare("SELECT * FROM bot_runs ORDER BY fired_at DESC LIMIT ?").all(limit);
+    res.json({ runs });
+  } catch (err) {
+    res.status(500).json({ error: "Bot runs failed", details: err.message });
+  }
+});
+
+// Bots runner: 60s tick, each bot fires on its own cadence (see bots.js).
+setInterval(async () => {
+  try {
+    await tickBots({
+      db,
+      mtfAnalyze: (symbol, opts) => mtfStrategy.analyze(symbol, opts),
+      longtermAnalyze: (symbol, closes) => analyzeLongterm(symbol, closes),
+      fetchDaily: async (symbol) => {
+        const candles = await fetchCandles(symbol, "1day", 300);
+        if (!candles?.length) throw new Error(`no daily candles for ${symbol}`);
+        return candles.map((c) => c.close).filter((c) => c > 0);
+      },
+      getChain: (symbol) => getChain(symbol),
+      scanSymbol: (args) => scanSymbol({ ...args, db }),
+      scanFx: (args) => scanFx(args),
+      storeSignal: (userId, signal) => storeSignalHistory(userId, signal),
+      formatSignal: (symbol, result) => formatTradingSignal(symbol, result),
+      storeOptionsSignal: (userId, signal) => storeOptionsSignal(userId, signal),
+      openPaper: (userId, signal) => openPaperPosition(db, userId, signal),
+      executor: (args) => executeTradeSignal({ ...args, source: "bots" }),
+      log: (...a) => console.log("[bots]", ...a),
+    });
+  } catch (e) {
+    console.warn("[bots] tick failed:", e.message);
+  }
+}, 60_000).unref?.();
 
 // ==================== TRADING SUITE API ====================
 // Comprehensive AI-powered trading endpoints for mobile app
@@ -4587,6 +5664,156 @@ app.delete("/api/trading/signals/:id", requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: "Delete signal failed", details: err.message });
+  }
+});
+
+// ==================== OPTIONS SUITE (paper signals only) =====================
+// No execution rail exists for equity options in this build (MT5 cannot trade
+// them; no Tradier/IBKR token configured), so these endpoints SCAN + RECORD.
+// The phone's floating banner reads /options/scan and /options/fx-scan.
+
+// --- Equity options scan: Strategy-A credit spreads on SPY/QQQ ---------------
+app.post("/options/scan", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbols, balance } = req.body || {};
+    const scanSymbols = (Array.isArray(symbols) && symbols.length ? symbols : ["SPY", "QQQ"])
+      .map((s) => String(s).toUpperCase()).slice(0, 4);
+    const bal = Number(balance) || 0;
+    const signals = [], skipped = [];
+    for (const sym of scanSymbols) {
+      try {
+        const chain = await getChain(sym);
+        const closes = await fetchDailyCloses(sym, { years: 1.3 });
+        const out = scanSymbol({ symbol: sym, chain, closes, db });
+        if (out.signal) {
+          const gate = optionsRiskCheck(user_id, out.signal, bal);
+          out.signal.riskGate = gate;
+          if (gate.ok) {
+            storeOptionsSignal(user_id, out.signal);
+            // Paper book: the same signal becomes a tracked paper position so
+            // the ledger (not marketing copy) is what sells the subscription.
+            const px = openPaperPosition(db, user_id, { ...out.signal, entrySpot: chain.underlying });
+            if (px.skipped) out.signal.paperNote = px.why;
+            else out.signal.paperId = px.id;
+            signals.push(out.signal);
+          } else {
+            skipped.push({ symbol: sym, why: gate.reason });
+          }
+        } else {
+          skipped.push({ symbol: sym, why: out.why });
+        }
+      } catch (e) {
+        console.warn(`[options/scan] ${sym} failed:`, e.message);
+        skipped.push({ symbol: sym, why: e.message });
+      }
+    }
+    res.json({ signals, skipped, scannedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Options scan failed", details: err.message });
+  }
+});
+
+// --- FX model signals: expected-move bands + regime (synthetic, no chain) ----
+app.post("/options/fx-scan", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbols } = req.body || {};
+    const scanSymbols = (Array.isArray(symbols) && symbols.length ? symbols : ["EURUSD", "GBPUSD", "XAUUSD"])
+      .map((s) => String(s).toUpperCase()).slice(0, 6);
+    const signals = [], skipped = [];
+    for (const sym of scanSymbols) {
+      try {
+        const closes = await fetchDailyCloses(sym, { years: 1 });
+        const out = scanFx({ symbol: sym, closes });
+        if (out.signal) {
+          storeOptionsSignal(user_id, out.signal);
+          signals.push(out.signal);
+        } else skipped.push({ symbol: sym, why: out.why });
+      } catch (e) {
+        console.warn(`[options/fx-scan] ${sym} failed:`, e.message);
+        skipped.push({ symbol: sym, why: e.message });
+      }
+    }
+    res.json({ signals, skipped, scannedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "FX options scan failed", details: err.message });
+  }
+});
+
+// --- Options signal history ---------------------------------------------------
+app.get("/options/signals/history", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbol, limit = 50 } = req.query;
+    let query = "SELECT * FROM options_signals WHERE user_id = ?";
+    const params = [user_id];
+    if (symbol) { query += " AND symbol = ?"; params.push(String(symbol).toUpperCase()); }
+    query += " ORDER BY timestamp DESC LIMIT ?";
+    params.push(Number(limit) || 50);
+    ensureOptionsTables(db);
+    const rows = db.prepare(query).all(...params).map((r) => ({
+      ...r,
+      legs: r.legs_json ? JSON.parse(r.legs_json) : null,
+      breakevens: r.breakevens_json ? JSON.parse(r.breakevens_json) : null,
+      exits: r.exits_json ? JSON.parse(r.exits_json) : null,
+      provisional: r.provisional === 1, synthetic: r.synthetic === 1,
+    }));
+    res.json({ signals: rows, total: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: "Options history failed", details: err.message });
+  }
+});
+
+// --- Options paper ledger: the verifiable track record -----------------------
+app.get("/options/ledger", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    // Mark before reporting so the book reflects live quotes, not last scan.
+    let resolveNote = null;
+    try {
+      await resolvePaperBook(db, user_id, (sym) => getChain(sym));
+    } catch (e) {
+      resolveNote = `mark skipped (chain unreachable: ${e.message})`;
+    }
+    const ledger = ledgerSummary(db, user_id);
+    if (resolveNote) ledger.resolveNote = resolveNote;
+    res.json(ledger);
+  } catch (err) {
+    res.status(500).json({ error: "Options ledger failed", details: err.message });
+  }
+});
+
+app.post("/options/paper/resolve", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const resolved = await resolvePaperBook(db, user_id, (sym) => getChain(sym));
+    res.json({ resolved, ledger: ledgerSummary(db, user_id) });
+  } catch (err) {
+    res.status(500).json({ error: "Paper resolve failed", details: err.message });
+  }
+});
+
+// --- Options backtest: modeled chains, bid/ask fills, full costs -------------
+app.post("/options/backtest", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const { symbol = "SPY", years = 3, walkForward: wf = true, cfg = {} } = req.body || {};
+    const sym = String(symbol).toUpperCase();
+    const closes = await fetchDailyCloses(sym, { years: Number(years) || 3 });
+    if (closes.length < 150) return res.status(400).json({ error: "not enough history for backtest" });
+    const out = wf ? walkForward(closes, {}) : { test: runBacktest(closes, cfg) };
+    const test = out.test || out;
+    res.json({
+      symbol: sym, bars: closes.length,
+      bestMarkup: out.bestMarkup ?? null, trainTotal: out.trainTotal ?? null,
+      stats: test.stats,
+      trades: test.trades.slice(0, 20),
+      tradeCount: test.trades.length,
+      modeledChain: true,
+      warning: "Chains are modeled from realized vol (no $0 historical-chain source exists). Validates strategy logic and costs, not the VRP edge itself.",
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Backtest failed", details: err.message });
   }
 });
 

@@ -13,8 +13,14 @@
 // ============================================================================
 
 export const INTERVALS = {
+  "1m": 60,
+  "5m": 5 * 60,
+  "15m": 15 * 60,
   "30m": 30 * 60,
+  "1h": 3600,
   "4h": 4 * 3600,
+  "1d": 86400,
+  "1w": 7 * 86400,
 };
 
 const KEEP_CLOSED = 300; // per symbol+interval
@@ -106,7 +112,9 @@ export class CandleStore {
   // kline: { openTime, open, high, low, close, volume, isClosed }
   ingestKline(symbol, interval, kline) {
     const sym = String(symbol || "").toUpperCase();
-    const iv = interval === "4h" ? "4h" : "30m";
+    // Accept any built interval (Binance pushes 1m/30m/4h klines); unknown
+    // strings fall back to 30m rather than throwing the candle away.
+    const iv = INTERVALS[interval] ? interval : "30m";
     const secs = INTERVALS[iv];
     const bucket = bucketStart(Number(kline.openTime), secs);
     const c = {

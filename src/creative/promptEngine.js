@@ -1,7 +1,7 @@
 import fetch from "node-fetch";
+import { M } from "../model_config.js";
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
-const OR_FAST_MODEL = process.env.OR_FAST_MODEL || "openai/gpt-oss-20b";
 
 function orHeaders() {
   return {
@@ -16,7 +16,7 @@ async function callOpenRouterChat(messages, maxTokens = 800) {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: orHeaders(),
-    body: JSON.stringify({ model: OR_FAST_MODEL, messages, temperature: 0.3, max_tokens: maxTokens }),
+    body: JSON.stringify({ model: M("OR_FAST_MODEL"), messages, temperature: 0.3, max_tokens: maxTokens }),
     signal: AbortSignal.timeout(90_000),
   });
   const data = await res.json().catch(() => ({}));

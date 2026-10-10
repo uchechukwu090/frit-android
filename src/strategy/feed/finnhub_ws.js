@@ -69,12 +69,16 @@ export class FinnhubFeed extends WsBase {
   }
 
   // Free REST gap-fill: returns engine-shaped candles oldest->newest or null.
-  async fetchCandles(fritSymbol, interval /* "30m" | "4h" */, count = 150) {
+  // Supports every bot timeframe (1m..1w); unknown strings fall back to 30m.
+  async fetchCandles(fritSymbol, interval = "30m", count = 150) {
     const sym = String(fritSymbol || "").toUpperCase();
     const fh = FINNHUB_MAP[sym];
     if (!fh || !this.fetchImpl) return null;
-    const secs = interval === "4h" ? 240 * 60 : 30 * 60;
-    const resolution = interval === "4h" ? "240" : "30";
+    const RES = {
+      "1m": [60, "1"], "5m": [300, "5"], "15m": [900, "15"], "30m": [1800, "30"],
+      "1h": [3600, "60"], "4h": [14400, "240"], "1d": [86400, "D"], "1w": [604800, "W"],
+    };
+    const [secs, resolution] = RES[interval] || RES["30m"];
     const to = Math.floor(Date.now() / 1000);
     const from = to - secs * (count + 5);
     const [venue, raw] = fh.includes(":") ? fh.split(":") : ["", fh];

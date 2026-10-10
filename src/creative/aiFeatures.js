@@ -1,7 +1,6 @@
 import fetch from "node-fetch";
+import { M } from "../model_config.js";
 
-const OR_IMAGE_MODEL = process.env.OR_IMAGE_MODEL || "bytedance-seed/seedream-5-0-flash";
-const OR_STT_MODEL = process.env.OR_STT_MODEL || "openai/whisper-large-v3";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 
 function orHeaders() {
@@ -15,7 +14,7 @@ function orHeaders() {
 
 async function callOpenRouterImage(prompt, opts = {}) {
   if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY missing");
-  const body = { model: opts.model || OR_IMAGE_MODEL, prompt: String(prompt || "") };
+  const body = { model: opts.model || M("OR_IMAGE_MODEL"), prompt: String(prompt || "") };
   if (opts.output_format) body.output_format = opts.output_format;
   if (opts.input_references?.length) body.input_references = opts.input_references;
   if (opts.aspect_ratio) body.aspect_ratio = opts.aspect_ratio;
@@ -43,7 +42,7 @@ async function callOpenRouterChat(messages, maxTokens = 800) {
     method: "POST",
     headers: orHeaders(),
     body: JSON.stringify({
-      model: process.env.OR_FAST_MODEL || "openai/gpt-oss-20b",
+      model: M("OR_FAST_MODEL"),
       messages,
       temperature: 0.3,
       max_tokens: maxTokens,
@@ -123,7 +122,7 @@ export async function generateSubtitles(audioBuffer, language = "auto") {
   const res = await fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
     method: "POST",
     headers: orHeaders(),
-    body: JSON.stringify({ model: OR_STT_MODEL, input_audio: { data: b64, format: "wav" }, language: language === "auto" ? undefined : language }),
+    body: JSON.stringify({ model: M("OR_STT_MODEL"), input_audio: { data: b64, format: "wav" }, language: language === "auto" ? undefined : language }),
     signal: AbortSignal.timeout(120_000),
   });
   if (!res.ok) return { subtitles: [], text: "" };

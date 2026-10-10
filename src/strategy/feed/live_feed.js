@@ -121,15 +121,45 @@ export class LiveFeed {
 
   _routeAll() {
     const syms = [...this.watched.keys()];
+    const binanceLive = this.binance.status() === "live";
+    const finnhubLive = this.finnhub ? this.finnhub.status() === "live" : false;
+    // Dynamic failover (re-evaluated every resync, i.e. every 5 min):
+    //   crypto       : Binance WS -> Finnhub WS -> REST net
+    //   forex/metals : Finnhub WS -> Dukascopy poll -> REST net
+    // A provider that dies mid-session loses its symbols to the next tier
+    // instead of leaving them dark; recovery routes them back up.
     const crypto = syms.filter(s => BINANCE_WS_MAP[s]);
-    const fh = this.finnhub ? syms.filter(s => FINNHUB_MAP[s]) : [];
-    // Forex/metals (or anything) not covered by Binance/Finnhub -> Dukascopy
-    // poll; crypto stays Binance-first (Finnhub fallback added if down).
-    const dukaSyms = syms.filter(s => !BINANCE_WS_MAP[s] && !fh.includes(s));
+    // Crypto prefers Binance; Finnhub takes only what Binance can't serve live.
+    const fhSyms = this.finnhub
+      ? [...new Set([
+        ...crypto.filter(() => !binanceLive),
+        ...syms.filter(s => FINNHUB_MAP[s] && !BINANCE_WS_MAP[s] && finnhubLive),
+      ])]
+      : [];
+    // Anything without a live WS tier falls to Dukascopy poll (it keeps only
+    // symbols it actually lists, via NAME_MAP).
+    const dukaSyms = syms.filter(s => !BINANCE_WS_MAP[s] && !(this.finnhub && FINNHUB_MAP[s] && finnhubLive));
     this.binance.setSymbols(crypto);
-    if (this.finnhub) this.finnhub.setSymbols(fh);
+    if (this.finnhub) this.finnhub.setSymbols(fhSyms);
+    const prevDuka = [...(this.dukascopy.symbols || [])].sort().join(",");
     this.dukascopy.setSymbols(dukaSyms);
+    const nextDuka = [...(this.dukascopy.symbols || [])].sort().join(",");
+    if (nextDuka !== prevDuka && this.dukascopy.running) {
+      // Set changed mid-run: restart so new symbols get instrument ids.
+      // _resolveIds is one HTTP call; resyncs are 5 min apart.
+      this.dukascopy.stop();
+      this.dukascopy.start().catch(() => {});
+      this.log(`[livefeed] dukascopy rerouted: ${nextDuka || "(none)"}`);
+    }
     if (dukaSyms.length && !this.dukascopy.running) this.dukascopy.start().catch(() => {});
+    const routing = {};
+    for (const s of syms) {
+      routing[s] = BINANCE_WS_MAP[s] && binanceLive ? "binance-ws"
+        : (this.finnhub && FINNHUB_MAP[s] && finnhubLive) ? "finnhub-ws"
+        : (this.dukascopy.symbols || []).includes(s) ? "dukascopy-poll"
+        : "rest-only";
+    }
+    this.routing = routing;
   }
 
   // ---- backfill (free first, Twelve Data last, budget-guarded) ----
@@ -218,6 +248,10 @@ export class LiveFeed {
   // ---- scan on candle close ----
   async _onCandleClose(sym, interval, _candle) {
     if (!this.watched.has(sym) || this.scanning.has(sym)) return;
+    // Engine scans fire on 30M/4H closes only. Finer intervals (1m/5m/...) just
+    // accumulate in the store for the bots UI and scalping freshness — a full
+    // 30M/4H analysis on every 1-minute close would burn CPU for zero signal.
+    if (interval !== "30m" && interval !== "4h") return;
     // Scan on 30M closes (the engine's primary TF); 4H closes also trigger
     // since regime flips matter. Skip forming-candle noise: only closed events
     // arrive here by construction.
@@ -269,6 +303,7 @@ export class LiveFeed {
     return {
       enabled: this.enabled,
       watched: [...this.watched.keys()],
+      routing: this.routing || {},
       providers: this.providerStatus,
       budgetUsedToday: this._budgetUsedToday(),
       budgetMax: this.backfillBudget,
