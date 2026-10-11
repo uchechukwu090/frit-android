@@ -1,11 +1,13 @@
 import fetch from "node-fetch";
 import { M } from "../model_config.js";
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+function orKey() {
+  return process.env.OPENROUTER_API_KEY || "";
+}
 
 function orHeaders() {
   return {
-    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    Authorization: `Bearer ${orKey()}`,
     "Content-Type": "application/json",
     "HTTP-Referer": "https://frit.local",
     "X-Title": "FRIT",
@@ -13,7 +15,7 @@ function orHeaders() {
 }
 
 async function callOpenRouterImage(prompt, opts = {}) {
-  if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY missing");
+  if (!orKey()) throw new Error("OPENROUTER_API_KEY missing");
   const body = { model: opts.model || M("OR_IMAGE_MODEL"), prompt: String(prompt || "") };
   if (opts.output_format) body.output_format = opts.output_format;
   if (opts.input_references?.length) body.input_references = opts.input_references;

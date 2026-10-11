@@ -36,6 +36,11 @@ export class CandleStore {
     this.forming = new Map(); // `${sym}:${iv}` -> candle object
     this.onClose = opts.onClose || null; // (symbol, interval, closedCandle) => void
     this.lastTick = new Map(); // sym -> { price, ts }
+    // Order-flow ring (Binance aggTrade sides only — Finnhub/Dukascopy ticks
+    // carry no side). sym -> [{s:+1|-1, v}] capped, memory-only: OFI is a
+    // short-horizon microstructure read, history has no value after restart.
+    this.sides = new Map();
+    this.sideCap = opts.sideCap || 300;
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS feed_candles (
@@ -106,6 +111,31 @@ export class CandleStore {
     f.volume += vol;
     f.count += 1;
     return null;
+  }
+
+  // ---- sided-trade path (Binance aggTrade: m=true => buyer is maker,
+  // i.e. seller-initiated => sign -1). Feeds candles AND the OFI ring.
+  ingestTrade(symbol, price, volume = 0, tsMs = Date.now(), sideSign = 0) {
+    const sym = String(symbol || "").toUpperCase();
+    const s = sideSign > 0 ? 1 : sideSign < 0 ? -1 : 0;
+    if (s !== 0) {
+      let ring = this.sides.get(sym);
+      if (!ring) { ring = []; this.sides.set(sym, ring); }
+      ring.push({ s, v: Number(volume) || 0 });
+      if (ring.length > this.sideCap) ring.splice(0, ring.length - this.sideCap);
+    }
+    return this.ingestTick(symbol, price, volume, tsMs);
+  }
+
+  // Order-flow imbalance over the last n sided trades, volume-weighted,
+  // in [-1, +1]. null when no sided flow (non-crypto feeds).
+  ofi(symbol, n = 100) {
+    const ring = this.sides.get(String(symbol || "").toUpperCase());
+    if (!ring || ring.length < 10) return null;
+    const w = ring.slice(-n);
+    let num = 0, den = 0;
+    for (const t of w) { const v = t.v > 0 ? t.v : 1; num += t.s * v; den += v; }
+    return den > 0 ? num / den : null;
   }
 
   // ---- pre-built candle path (Binance kline_30m / kline_4h) ----

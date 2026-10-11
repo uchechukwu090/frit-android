@@ -76,11 +76,14 @@ export class FinnhubFeed extends WsBase {
     if (!fh || !this.fetchImpl) return null;
     const RES = {
       "1m": [60, "1"], "5m": [300, "5"], "15m": [900, "15"], "30m": [1800, "30"],
-      "1h": [3600, "60"], "4h": [14400, "240"], "1d": [86400, "D"], "1w": [604800, "W"],
+      // Finnhub free tier has no 240 resolution — 4h is aggregated from 4x1h candles.
+      "1h": [3600, "60"], "4h": [14400, "60"], "1d": [86400, "D"], "1w": [604800, "W"],
     };
     const [secs, resolution] = RES[interval] || RES["30m"];
+    // 4h is aggregated from 4x1h: widen the window so `count` 4h candles are covered.
+    const need = interval === "4h" ? count * 4 : count;
     const to = Math.floor(Date.now() / 1000);
-    const from = to - secs * (count + 5);
+    const from = to - secs * (need + 5);
     const [venue, raw] = fh.includes(":") ? fh.split(":") : ["", fh];
     let url;
     if (/^[A-Z]+$/.test(raw) && !raw.includes("_") && !raw.includes("USD")) {
@@ -95,11 +98,24 @@ export class FinnhubFeed extends WsBase {
       const res = await this.fetchImpl(url, { signal: AbortSignal.timeout(20_000) });
       const d = await res.json();
       if (d.s !== "ok" || !Array.isArray(d.c) || d.c.length < 10) return null;
-      return d.c.map((c, i) => ({
+      const hourly = d.c.map((c, i) => ({
         time: d.t[i] * 1000,
         open: d.o[i], high: d.h[i], low: d.l[i], close: c,
         volume: (d.v && d.v[i]) || 0,
       }));
+      if (interval !== "4h") return hourly;
+      // Aggregate 4x1h into 4h candles (4h bucket = 14400s).
+      const out = [];
+      for (let i = 0; i + 3 < hourly.length; i += 4) {
+        const g = hourly.slice(i, i + 4);
+        out.push({
+          time: g[0].time,
+          open: g[0].open, high: Math.max(...g.map(c => c.high)),
+          low: Math.min(...g.map(c => c.low)), close: g[3].close,
+          volume: g.reduce((a, c) => a + (c.volume || 0), 0),
+        });
+      }
+      return out.length >= 10 ? out : null;
     } catch (e) {
       if (this.log) this.log(`[finnhub] candle fetch failed ${sym}: ${e.message}`);
       return null;

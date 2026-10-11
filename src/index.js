@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -12,6 +13,7 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { MTFStrategyEngine } from "./strategy/engine.js";
 import { LiveFeed } from "./strategy/feed/live_feed.js";
+import { signalFromCandles, recordPaper, settleOpen, pocketStats, ensurePocketTables, nextBoundaryMs, profileFor, calibFor } from "./strategy/pocket/engine.js";
 import { TradeTaskScheduler } from "./strategy/scheduler.js";
 import { PositionMonitor } from "./strategy/position_monitor.js";
 import { PullbackJournal } from "./strategy/journal.js";
@@ -28,13 +30,15 @@ import { deepSearch } from "./deep_search.js";
 import * as imageProcessor from "./creative/imageProcessor.js";
 import * as aiFeatures from "./creative/aiFeatures.js";
 import * as promptEngine from "./creative/promptEngine.js";
-import * as videoProcessor from "./creative/videoProcessor.js";
 import * as templateLibrary from "./creative/templateLibrary.js";
 import * as cinema from "./creative/cinema.js";
 import * as designStudio from "./creative/design.js";
 import { setModelDb, MODEL_DEFAULTS, MODEL_KEYS, MODEL_META, overrideOf, M } from "./model_config.js";
 
 dotenv.config();
+
+process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", r));
+process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
@@ -85,7 +89,13 @@ async function restoreFromBackup() {
   }
 }
 await restoreFromBackup();
-const db = new Database(DB_PATH);
+let db;
+try {
+  db = new Database(DB_PATH);
+} catch (e) {
+  console.error(`[db] failed to open database at ${DB_PATH}:`, e?.message || e);
+  process.exit(1);
+}
 db.pragma("journal_mode = WAL");
 setModelDb(db); // model_overrides table + console-overridable slugs (see model_config.js)
 
@@ -207,6 +217,29 @@ db.exec(`
     tier TEXT,
     rating INTEGER,
     message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS user_credits (
+    user_id TEXT PRIMARY KEY,
+    balance INTEGER DEFAULT 0,
+    total_earned INTEGER DEFAULT 0,
+    total_spent INTEGER DEFAULT 0,
+    plan_grant_month TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS credit_txns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    amount INTEGER,
+    kind TEXT,
+    note TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS provider_jobs (
+    provider_id TEXT PRIMARY KEY,
+    user_id TEXT,
+    kind TEXT,
+    charged INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS creative_projects (
@@ -540,6 +573,10 @@ const TWELVE_DATA_KEY = process.env.TWELVE_DATA_KEY || "";
 const FINNHUB_KEY = process.env.FINNHUB_KEY || "";
 const FEED_ENABLED = process.env.FEED_ENABLED !== "0";
 const FEED_BACKFILL_BUDGET = Number(process.env.FEED_BACKFILL_BUDGET || 200);
+// Pocket fixed-expiry signals (manual execution only — never auto-trades).
+const POCKET_ENABLED = process.env.POCKET_ENABLED !== "0";
+const POCKET_EXPIRY_MIN = Number(process.env.POCKET_EXPIRY_MIN || 5);
+const POCKET_PAYOUT = Number(process.env.POCKET_PAYOUT || 0.8); // broker payout assumption for stats
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
 // The sandbox service requires its own auth token. The AI never sees this —
 // the server attaches it when forwarding run_code calls.
@@ -650,7 +687,7 @@ const MODELS = {
   tools: process.env.TOOLS_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : HAS_ZEN ? `go:${GO_MODEL}` : MISTRAL_MODEL),
   coding: process.env.CODING_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "codestral-latest"),
   fast: process.env.FAST_MODEL || (HAS_OR ? `openrouter:${OR_FAST}` : MISTRAL_FAST_MODEL),
-  voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || "voxtral-mini-transcribe-realtime",
+  voxtral: process.env.MISTRAL_VOXTRAIL_MODEL || process.env.MISTRAL_VOXTRAL_MODEL || "voxtral-mini-transcribe-realtime",
   local: process.env.LOCAL_MODEL || "gemma-3n-e2b", // on-device offline fallback (Android), not called here
 };
 
@@ -739,7 +776,7 @@ refreshModelConfig();
 
 let PHONE_UI_SKILL = "";
 try {
-  PHONE_UI_SKILL = readFileSync(new URL("./skills/phone-ui.md", import.meta.url), "utf8").trim();
+  PHONE_UI_SKILL = readFileSync(new URL("../skills/phone-ui.md", import.meta.url), "utf8").trim();
 } catch (e) {
   console.warn("[skills] phone-ui.md not loaded:", e.message);
 }
@@ -756,7 +793,7 @@ function loadAppFlows(goal = "") {
   for (const { keys, file } of APP_FLOW_KEYWORDS) {
     if (!keys.some(k => g.includes(k))) continue;
     try {
-      const text = readFileSync(new URL(`./skills/flows/${file}`, import.meta.url), "utf8").trim();
+      const text = readFileSync(new URL(`../skills/flows/${file}`, import.meta.url), "utf8").trim();
       if (text) out.push(`APP FLOW (${file}):\n${text}`);
     } catch (_) { /* not written yet — skip */ }
   }
@@ -1133,7 +1170,21 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
     const looksLikeSentence = (s) => /\b(and|to|that|reply|check|open|task)\b/i.test(s) && s.split(/\s+/).length > 4;
     const badAppCalls = [];
     const androidCalls = [];
+    // Device automation is a paid surface: phone-control tools need the
+    // "automation" feature. Blocked calls bounce with an explanatory error
+    // (same pattern as malformed calls) so the brain reroutes to chat.
+    grantMonthlyCredits(session.user_id);
+    const automationTier = activeTier(session.user_id);
+    const automationAllowed = planAllows(automationTier, "automation");
+    const blockedAutomation = !automationAllowed && rawAndroidCalls.length > 0;
     for (let tc of rawAndroidCalls.map(t => rewriteSettingsNavigation(t, session.goal))) {
+      if (!automationAllowed) {
+        fullMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.function.name, content: JSON.stringify({
+          ok: false,
+          error: `Phone automation isn't in your ${automationTier} plan — upgrade to an Automation plan or Pro to control apps on this device. I can still chat, answer questions and analyse markets.`,
+        }) });
+        continue;
+      }
       if (tc.function.name === "open_app") {
         const appName = (tc.function.arguments || {}).app_name || "";
         if (appName.length > MAX_APP_NAME_LEN || looksLikeSentence(appName)) {
@@ -1169,10 +1220,21 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
           const name = tc.function.name;
           const args = tc.function.arguments || {};
           let result;
-          try {
-            result = await runLocalTool(name, args, { deviceState: deviceStateForPrompt });
-          } catch (err) {
-            result = { ok: false, error: err.message };
+          const gate = gateLoopTool(session.user_id, name);
+          if (!gate.ok) {
+            result = { ok: false, error: gate.message };
+          } else {
+            try {
+              result = await runLocalTool(name, args, { deviceState: deviceStateForPrompt });
+            } catch (err) {
+              result = { ok: false, error: err.message };
+            }
+            // Bill AFTER success only. Async video: track now, charge on completion.
+            if (result?.ok && gate.charge) debitCredits(session.user_id, gate.charge, `agent:${name}`);
+            if (result?.ok && name === "generate_video") {
+              const pid = result?.data?.id || result?.data?.data?.id;
+              trackProviderJob(pid, session.user_id, "clip");
+            }
           }
           
           if (name === "run_code" && Array.isArray(result?.data?.artifacts) && result.data.artifacts.length) {
@@ -1250,6 +1312,7 @@ async function runAgentStep(sessionId, toolResults = null, deviceState = null, o
       }
     }
 
+    if (blockedAutomation && !serverCalls.length && !isLastIter) continue; // brain reads the block notice and answers in chat
     androidPending = androidCalls;
     break;
   }
@@ -1405,13 +1468,14 @@ app.post("/agent/start", requireAuth, limitNormal, async (req, res) => {
   const { goal, device_state, memory, history } = req.body;
   if (!goal) return res.status(400).json({ error: "Goal required" });
   const uid = boundUser(req);
-  const cap = checkCap(uid, "turn");
-  if (!cap.ok) return res.status(402).json({ error: cap.message });
+  const ent = checkEntitlement(uid, "chat");
+  if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
 
   // Fast pre-route: pure conversation never touches the agentic loop.
   try {
     const routed = await routeChatOrTask(goal, Array.isArray(history) ? history : []);
     if (!routed.isTask) {
+      debitCredits(uid, "turn", "chat reply"); // post-success
       return res.json({ done: true, assistant_text: routed.reply });
     }
   } catch (_) {
@@ -1456,6 +1520,7 @@ app.post("/agent/start", requireAuth, limitNormal, async (req, res) => {
 
     const result = await runAgentStep(sessionId, null, device_state, { memory: safeMemory });
     db.prepare("UPDATE usage_daily SET turns = turns + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    debitCredits(uid, "turn", "agent start"); // post-success: loop failures are not billed
     res.json(result);
   } catch (err) {
     console.error("[agent/start]", err);
@@ -1470,10 +1535,11 @@ app.post("/agent/resume", requireAuth, limitNormal, async (req, res) => {
   try {
     const sess = db.prepare("SELECT user_id FROM agent_sessions WHERE id = ?").get(sessionId);
     const uid = String(sess?.user_id || "default");
-    const cap = checkCap(uid, "turn");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "chat");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const result = await runAgentStep(sessionId, tool_results, device_state);
     db.prepare("UPDATE usage_daily SET turns = turns + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    debitCredits(uid, "turn", "agent resume"); // post-success: loop failures are not billed
     res.json(result);
   } catch (err) {
     res.status(err.code === "ALL_MODELS_UNAVAILABLE" ? 503 : 500).json({ error: err.message, code: err.code || "UNKNOWN" });
@@ -1720,6 +1786,91 @@ function walletSpend(user_id, amount_kobo, note = "") {
   run();
   return walletBalance(user_id);
 }
+
+// ---- Credit ledger (spending currency for all AI features) ----
+function creditBalance(user_id) {
+  const row = db.prepare("SELECT balance FROM user_credits WHERE user_id = ?").get(user_id);
+  return row?.balance ?? 0;
+}
+function creditTxn(user_id, amount, kind, note = "") {
+  const run = db.transaction(() => {
+    db.prepare("INSERT INTO credit_txns (user_id, amount, kind, note) VALUES (?, ?, ?, ?)").run(user_id, amount, kind, note);
+    db.prepare("INSERT INTO user_credits (user_id, balance, total_earned, total_spent, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?, total_earned = total_earned + MAX(0, ?), total_spent = total_spent + MAX(0, -?), updated_at = CURRENT_TIMESTAMP").run(user_id, amount, Math.max(0, amount), Math.max(0, -amount), amount, amount, amount);
+  });
+  run();
+  return creditBalance(user_id);
+}
+function grantMonthlyCredits(user_id) {
+  const tier = activeTier(user_id);
+  const t = SUB_TIERS[tier];
+  if (!t?.credits_mo) return creditBalance(user_id);
+  const month = monthStr();
+  const grantKey = `${tier}:${month}`; // tier-scoped: a mid-month upgrade still receives the new plan's credits
+  const row = db.prepare("SELECT plan_grant_month FROM user_credits WHERE user_id = ?").get(user_id);
+  if (row?.plan_grant_month === grantKey) return creditBalance(user_id);
+  // Anti-farming: monthly credits only flow to REAL installs (a key issued by
+  // /auth/install for this install_id) or paying subscribers. Self-asserted
+  // master-token ids with neither get nothing — otherwise one shared token +
+  // random user_ids = infinite 200-credit accounts.
+  const hasKey = db.prepare("SELECT 1 FROM api_keys WHERE user_id = ?").get(user_id);
+  const hasSub = db.prepare("SELECT 1 FROM subscriptions WHERE user_id = ?").get(user_id);
+  if (!hasKey && !hasSub) return creditBalance(user_id);
+  creditTxn(user_id, t.credits_mo, "plan_grant", `${tier} ${month}`);
+  db.prepare("UPDATE user_credits SET plan_grant_month = ? WHERE user_id = ?").run(grantKey, user_id);
+  return creditBalance(user_id);
+}
+function planAllows(tier, feature) {
+  const f = SUB_TIERS[tier]?.features || [];
+  if (feature === "stt") return f.includes("chat"); // voice INPUT is part of chat; "voice" feature = creator voice tools
+  return f.includes(feature);
+}
+function checkEntitlement(user_id, feature) {
+  grantMonthlyCredits(user_id);
+  const tier = activeTier(user_id);
+  if (!planAllows(tier, feature)) {
+    const need = tier === "free" ? `a paid plan with ${FEATURE_LABELS[feature] || feature}` : `a plan that includes ${FEATURE_LABELS[feature] || feature}`;
+    return { ok: false, code: "feature_locked", message: `${FEATURE_LABELS[feature] || feature} isn't in your ${tier} plan — upgrade to ${need}.` };
+  }
+  const charge = FEATURE_CHARGE[feature] ?? "turn";
+  const cost = CREDIT_COSTS[charge] ?? 1;
+  const bal = creditBalance(user_id);
+  if (bal < cost) {
+    return { ok: false, code: "insufficient_credits", message: `Not enough credits (${bal} left, need ${cost}). Top up in Wallet.`, balance: bal, needed: cost };
+  }
+  return { ok: true, tier, charge, cost, balance: bal };
+}
+// Atomic post-success debit: single guarded UPDATE, so concurrent requests
+// can't double-spend the same balance. Returns ok:false (no partial debit)
+// when the balance moved under us — caller treats it as insufficient.
+// Zero-cost charges skip the DB entirely. NEVER debit before the work.
+function debitCredits(user_id, charge, note = "") {
+  const cost = CREDIT_COSTS[charge] ?? 1;
+  if (!cost) return { ok: true, balance: creditBalance(user_id), cost: 0 };
+  const run = db.transaction(() => {
+    const r = db.prepare("UPDATE user_credits SET balance = balance - ?, total_spent = total_spent + ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND balance >= ?").run(cost, cost, user_id, cost);
+    if (!r.changes) return { ok: false, balance: creditBalance(user_id) };
+    db.prepare("INSERT INTO credit_txns (user_id, amount, kind, note) VALUES (?, ?, 'spend', ?)").run(user_id, -cost, note || charge);
+    return { ok: true, balance: creditBalance(user_id) };
+  });
+  return run();
+}
+// Async provider jobs (OpenRouter /videos) bill US only on COMPLETION, so we
+// charge on completion too — submit is free, download/status-completed debits
+// exactly once (charged flag). Failed renders never bill either side.
+function trackProviderJob(provider_id, user_id, kind) {
+  if (!provider_id) return;
+  try {
+    db.prepare("INSERT INTO provider_jobs (provider_id, user_id, kind, charged) VALUES (?, ?, ?, 0) ON CONFLICT(provider_id) DO NOTHING").run(String(provider_id), user_id, kind);
+  } catch {}
+}
+function chargeProviderJob(provider_id) {
+  if (!provider_id) return { ok: false };
+  const row = db.prepare("SELECT user_id, kind, charged FROM provider_jobs WHERE provider_id = ?").get(String(provider_id));
+  if (!row || row.charged) return { ok: !!row?.charged, already: !!row?.charged };
+  const r = debitCredits(row.user_id, row.kind || "clip", `provider ${row.kind || "clip"} completed`);
+  if (r.ok) db.prepare("UPDATE provider_jobs SET charged = 1 WHERE provider_id = ?").run(String(provider_id));
+  return r;
+}
 const SUB_TIERS = {
   // FIXED-NAIRA pricing (VAT-inclusive, bank-transfer friendly round numbers).
   // Priced Oct 2026 at ~₦1,350/$ buffer (official ₦1,332, street ₦1,361-85):
@@ -1737,19 +1888,66 @@ const SUB_TIERS = {
   // (HeyGen Video promo $0.01/s); avatar clip ~$0.40/8s (Avatar IV $0.05/s);
   // STT ~$0.006/min. Clips are the margin killer — quotas below are counted
   // in up-to-8s equivalents. Review naira peg quarterly.
-  free: { usd: 0, naira_kobo: 0, days: 3650, turns_day: 20, clips_mo: 1, images_mo: 15, stt_min_mo: 45 },
-  starter: { usd: 5.55, naira_kobo: 750000, days: 30, turns_day: 50, clips_mo: 3, images_mo: 60, stt_min_mo: 90 },
-  creator: { usd: 12.22, naira_kobo: 1650000, days: 30, turns_day: 80, clips_mo: 8, images_mo: 150, stt_min_mo: 200 },
-  pro: { usd: 25.93, naira_kobo: 3500000, days: 30, turns_day: 200, clips_mo: 15, images_mo: 400, stt_min_mo: 600 },
+  free: { usd: 0, naira_kobo: 0, days: 3650, credits_mo: 200, features: ["chat", "market_data"] },
+  starter: { usd: 5.55, naira_kobo: 750000, days: 30, credits_mo: 800, features: ["chat", "automation", "agent", "market_data"] },
+  creator: { usd: 12.22, naira_kobo: 1650000, days: 30, credits_mo: 1500, features: ["chat", "image", "video", "voice", "creative", "market_data"] },
+  trader: { usd: 8.8, naira_kobo: 1200000, days: 30, credits_mo: 1200, features: ["chat", "trading", "market_data"] },
+  pro: { usd: 25.93, naira_kobo: 3500000, days: 30, credits_mo: 3500, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data"] },
   // Tester: full Pro-level caps for trial runs. NOT purchasable (subscribe
   // blocks it) — only via admin-minted codes (/billing/mint). Granted duration
   // comes from SUB_TIERS days at REDEEM time (see /billing/redeem).
-  tester: { usd: 0, naira_kobo: 0, days: 7, turns_day: 200, clips_mo: 15, images_mo: 400, stt_min_mo: 600 },
-  owner: { usd: 0, naira_kobo: 0, days: 365000, turns_day: 999999, clips_mo: 999999, images_mo: 999999, stt_min_mo: 999999 },
+  tester: { usd: 0, naira_kobo: 0, days: 7, credits_mo: 3500, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data"] },
+  owner: { usd: 0, naira_kobo: 0, days: 365000, credits_mo: 999999, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data"] },
 };
-export const TIER_ORDER = ["free", "starter", "creator", "pro", "tester", "owner"];
+export const TIER_ORDER = ["free", "starter", "creator", "trader", "pro", "tester", "owner"];
 export const YEARLY_MULT = 10; // annual = 10x monthly (2 months free)
 export const tierYearlyKobo = (tier) => (SUB_TIERS[tier]?.naira_kobo || 0) * YEARLY_MULT;
+
+// Credit economics: 1 credit = ₦10 (at ₦1,370/$ peg). Any top-up converts at this rate.
+// PRICED WITH HEADROOM (Oct 2026 verified live costs + buffer for hikes):
+// - turn: GLM-Flash list $0.15/$0.50 → 6k in/1.2k out ≈ $0.0015 ≈ ₦2. 1cr = 5x now, 2.5x if GLM doubles.
+// - image: Seedream Flash $0.018 ≈ ₦25. 4cr (₦40) = 1.6x now; survives a rise to Pro-class $0.045.
+// - clip: HeyGen promo $0.01/s → 8s ≈ $0.08 ≈ ₦110; POST-PROMO $0.03/s → $0.24 ≈ ₦329.
+//   65cr (₦650) = 6x promo, 2x post-promo, matches the old ₦650 overage. THE buffer that matters.
+// - avatar: Avatar IV $0.05/s → 8s $0.40 ≈ ₦548. 65cr = 1.2x; Hedra fallback ~same.
+// - stt_min: buffered at OpenAI $0.006/min ≈ ₦8 (OpenRouter route is $0.0005/min — pure margin). 2cr = 2.4x.
+// - agent_task: 5 heavy GLM calls ≈ $0.008 ≈ ₦11. 5cr (₦50) = 4.5x.
+// - trade_analysis: 1 engine call ≈ $0.0015 ≈ ₦2. 1cr = 5x.
+// - run_code: own sandbox ≈ $0 marginal + abuse brake. 2cr.
+// - creative: 1 compose call ≈ $0.002 ≈ ₦3. 2cr.
+// - market_data: Twelve/Dukascopy free tiers. 0cr (gated by feature only).
+export const CREDIT_NAIRA_KOBO = 1000;
+export const CREDIT_COSTS = {
+  turn: 1,
+  image: 4,
+  clip: 65,
+  avatar: 65,
+  stt_min: 2,
+  creative: 2,
+  agent_task: 5,
+  trade_analysis: 1,
+  run_code: 2,
+  market_data: 0,
+};
+// Feature (access lock) -> default charge code (spending). Kept as an explicit
+// map so a lock and its price can NEVER silently diverge again.
+export const FEATURE_CHARGE = {
+  chat: "turn", image: "image", video: "clip", voice: "avatar",
+  creative: "creative", trading: "trade_analysis", automation: "turn",
+  agent: "agent_task", market_data: "market_data",
+};
+// Feature flags per plan (for UI display and server-side gating).
+export const FEATURE_LABELS = {
+  chat: "Chat",
+  image: "Image generation",
+  video: "Video generation",
+  voice: "Voice / STT",
+  creative: "Creative suite",
+  trading: "Trading engine",
+  automation: "Phone automation",
+  agent: "Advanced agent",
+  market_data: "Market data",
+};
 // Live USD->NGN (keyless er-api, 6h cache, falls back to 1500).
 let _fxCache = { rate: 1500, exp: 0 };
 async function ngnPerUsd() {
@@ -1792,10 +1990,10 @@ const USDT_TRON_ADDRESS = process.env.USDT_TRON_ADDRESS || "";
 const BSC_ADDRESS = (process.env.BSC_ADDRESS || "").toLowerCase();
 const BSC_RPC = process.env.BSC_RPC || "https://bsc-dataseed.binance.org/";
 const BSC_TOKENS = {
-  usdt: { contract: "0x55d398a7e2f2100c2afca4aa5a4be64d0f2452b50", decimals: 18, usd: 1 },
-  btcb: { contract: "0x7130d987a9e31d56f7ba9fd9a99d33047c6e216", decimals: 18, usd: null }, // priced live via Binance ticker
+  usdt: { contract: "0x55d398326f99059ff775485246999027b3197955", decimals: 18, usd: 1 },
+  btcb: { contract: "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", decimals: 18, usd: null }, // priced live via Binance ticker
 };
-const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df288b6e9";
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 async function bscRpc(method, params) {
   const r = await fetch(BSC_RPC, {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -1875,30 +2073,9 @@ function monthUsage(user_id) {
   const rows = db.prepare("SELECT * FROM usage_daily WHERE user_id = ? AND day LIKE ?").all(user_id, `${monthStr()}%`);
   return rows.reduce((a, r) => ({ turns: a.turns + r.turns, clips: a.clips + r.clips, images: a.images + r.images, stt_mins: a.stt_mins + r.stt_mins }), { turns: 0, clips: 0, images: 0, stt_mins: 0 });
 }
-// Cap check: returns {ok} or {ok:false, overage_kobo, message}. Overage debits wallet.
-function checkCap(user_id, kind) {
-  const tier = activeTier(user_id);
-  const t = SUB_TIERS[tier];
-  const u = getUsage(user_id);
-  const m = monthUsage(user_id);
-  if (kind === "turn" && u.turns >= t.turns_day) {
-    if (walletBalance(user_id) < OVERAGE.turn_kobo) return { ok: false, message: `Daily turn cap reached (${tier}). Top up wallet — overage ₦${OVERAGE.turn_kobo / 100}/turn.` };
-    walletSpend(user_id, OVERAGE.turn_kobo, "turn overage");
-  }
-  if (kind === "clip" && m.clips >= t.clips_mo) {
-    if (walletBalance(user_id) < OVERAGE.clip_kobo) return { ok: false, message: `Monthly clip cap reached (${tier}). Top up — overage ₦${OVERAGE.clip_kobo / 100}/clip.` };
-    walletSpend(user_id, OVERAGE.clip_kobo, "clip overage");
-  }
-  if (kind === "image" && m.images >= t.images_mo) {
-    if (walletBalance(user_id) < OVERAGE.image_kobo) return { ok: false, message: `Monthly image cap reached (${tier}). Top up — overage ₦${OVERAGE.image_kobo / 100}/image.` };
-    walletSpend(user_id, OVERAGE.image_kobo, "image overage");
-  }
-  if (kind === "stt" && m.stt_mins >= t.stt_min_mo) {
-    if (walletBalance(user_id) < OVERAGE.stt_min_kobo) return { ok: false, message: `Monthly voice cap reached (${tier}). Top up — overage ₦${OVERAGE.stt_min_kobo / 100}/min.` };
-    walletSpend(user_id, OVERAGE.stt_min_kobo, "stt overage");
-  }
-  return { ok: true, tier };
-}
+// NOTE: checkCap (old quota + wallet-overage model) is retired — entitlements
+// are checkEntitlement (feature lock + credit preview) with debitCredits
+// (atomic post-success debit). usage_daily counters remain for analytics.
 // Keyless NATIVE-BTC verify via mempool.space (only for bc1/1/3… addresses —
 // NOT for BTCB-on-BSC, which verifyBscTx handles). USDT-Tron has no keyless
 // API (trongrid needs a key) -> manual approve path in /billing/pending.
@@ -2080,7 +2257,7 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
   }
 
   // Fallback for crypto if Binance somehow failed and TwelveData also has no key/entry
-  if (!CRYPTO_SET.has(sym) && BINANCE_SYM[sym]) {
+  if (BINANCE_SYM[sym]) {
     try {
       const url = `https://api.binance.com/api/v3/klines?symbol=${BINANCE_SYM[sym]}&interval=${toBinanceInterval(iv)}&limit=${Math.min(size, 1000)}`;
       const res = await fetch(url);
@@ -2774,13 +2951,78 @@ const liveFeed = new LiveFeed({
   finnhubKey: FINNHUB_KEY,
   enabled: FEED_ENABLED,
   backfillBudget: FEED_BACKFILL_BUDGET,
+  pocketEnabled: POCKET_ENABLED,
   log: (...a) => console.log(...a),
+  onCandleClose: (sym, interval) => { try { pocketOnClose(sym, interval); } catch (e) { console.warn("[pocket] close hook:", e.message); } },
 });
 globalThis.__liveFeed = liveFeed;
 if (!FINNHUB_KEY) {
   console.log("[livefeed] FINNHUB_KEY unset — forex/metals run on Dukascopy poll backup; add key for WS streaming");
 }
 liveFeed.start().catch(e => console.warn("[livefeed] start failed:", e.message));
+
+// ==================== POCKET FIXED-EXPIRY SIGNALS ====================
+// Manual-execution signals for Pocket Option style trading (CALL/PUT +
+// fixed expiry). Closed-candle only; paper ledger settles against OUR feed
+// (broker OTC price may differ — stats are indicative, never P&L).
+ensurePocketTables(db);
+
+function pocketClosed(sym, interval, n) {
+  const arr = liveFeed.store.getCandles(sym, interval, n);
+  // Drop the still-forming live edge — signals read closed candles only.
+  return arr.length > 1 ? arr.slice(0, -1) : arr;
+}
+
+function pocketScan(sym, expiryMin = POCKET_EXPIRY_MIN) {
+  const prof = profileFor(expiryMin);
+  const trend = pocketClosed(sym, prof.trendIv, 160);
+  const trig = pocketClosed(sym, prof.trigIv, 120);
+  const base = { cryptoSet: CRYPTO_SET, expiryMin: prof.expiryMin, payout: POCKET_PAYOUT, ofi: liveFeed.store.ofi(sym) };
+  // Pass 1 (no calibration) reveals the setup bucket; pass 2 applies the
+  // learned win-rate gate. Two local runs cost nothing.
+  const probe = signalFromCandles(sym, trend, trig, base);
+  if (!probe.setupKey) return probe;
+  const calib = calibFor(db, probe.setupKey);
+  if (!calib) return probe;
+  return signalFromCandles(sym, trend, trig, { ...base, calib });
+}
+
+function pocketOnClose(sym, interval) {
+  if (!POCKET_ENABLED) return;
+  // Scan on trigger-TF closes (1m/5m/15m are the v2 trigger timeframes).
+  if (!["1m", "5m", "15m"].includes(interval)) return;
+  for (const expiryMin of [1, 5, 15]) {
+    const prof = profileFor(expiryMin);
+    if (prof.trigIv !== interval) continue;
+    const signal = pocketScan(sym, expiryMin);
+    if (signal.decision !== "CALL" && signal.decision !== "PUT") continue;
+    // Dedupe: one paper per symbol+expiry per expiry window (system row gates
+    // the per-user fan-out).
+    try {
+      const last = db.prepare(
+        "SELECT entry_ts FROM pocket_paper WHERE user_id = '__pocket__' AND symbol = ? AND expiry_min = ? ORDER BY entry_ts DESC LIMIT 1"
+      ).get(sym, signal.expiryMin);
+      if (last && Date.now() - last.entry_ts < signal.expiryMin * 60_000) continue;
+    } catch { /* ignore */ }
+    recordPaper(db, { userId: "__pocket__", signal, payout: POCKET_PAYOUT });
+    let watchers = [];
+    try {
+      watchers = db.prepare("SELECT user_id FROM trading_watchlist WHERE symbol = ? AND is_enabled = 1").all(sym);
+    } catch { /* ignore */ }
+    for (const w of watchers) {
+      recordPaper(db, { userId: w.user_id, signal, payout: POCKET_PAYOUT });
+    }
+    console.log(`[pocket] ${signal.decision} ${sym} conf=${signal.confidence} expiry=${signal.expiryMin}m`);
+  }
+}
+
+// Settle expired paper trades every 20s against live-feed prices.
+setInterval(() => {
+  try {
+    const r = settleOpen(db, (s) => liveFeed.lastPrice(s));
+    if (r.settled) console.log(`[pocket] settled ${r.settled}`);
+  } catch (e) { console.warn("[pocket] settle failed:", e.message); }
+}, 20_000).unref?.();
 
 // Every 30 min, replay 30M candles and resolve journaled setups (win/loss/
 // expired). Only symbols with pending rows cost API calls; engine + fetch
@@ -2836,6 +3078,42 @@ const SERVER_SIDE_TOOLS = new Set(["search_web", "get_weather", "get_market_data
   "analyze_market", "run_code", "wait_and_verify", "assert_text_visible", "get_frit_manual",
   "delegate_subtasks", "generate_image", "design_image", "decompose_design", "generate_video", "create_content", "ground_scene"
 ]);
+
+// ---- In-loop entitlement: WHAT the brain may touch is decided by the PLAN,
+// not the route (market questions arrive via /agent/start like everything
+// else). Server tools are gated + billed here; device tools need "automation".
+// Billed strictly AFTER success — blocked/failed steps cost nothing.
+const LOOP_TOOL_FEATURE = {
+  analyze_market: "trading",
+  get_market_data: "market_data", get_market_news: "market_data",
+  run_code: "chat",
+  generate_image: "image", design_image: "image", decompose_design: "image",
+  generate_video: "video",
+  create_content: "creative", ground_scene: "chat",
+  delegate_subtasks: "agent",
+  search_web: "chat", get_weather: "chat", get_frit_manual: "chat",
+  wait_and_verify: "chat", assert_text_visible: "chat",
+};
+const LOOP_TOOL_CHARGE = {
+  analyze_market: "trade_analysis",
+  generate_image: "image", design_image: "image", decompose_design: "image",
+  run_code: "run_code", delegate_subtasks: "agent_task",
+  create_content: "turn",
+  // generate_video is async: tracked at submit, charged once on completion.
+};
+function gateLoopTool(uid, name) {
+  const feature = LOOP_TOOL_FEATURE[name] || "chat";
+  grantMonthlyCredits(uid);
+  const tier = activeTier(uid);
+  if (!planAllows(tier, feature)) {
+    return { ok: false, message: `${FEATURE_LABELS[feature] || feature} isn't in your ${tier} plan — upgrade to use ${name}. Step blocked, no credits spent.` };
+  }
+  const charge = LOOP_TOOL_CHARGE[name];
+  if (charge && creditBalance(uid) < (CREDIT_COSTS[charge] ?? 1)) {
+    return { ok: false, message: `Not enough credits for ${name} (${creditBalance(uid)} left). Top up in Wallet — step blocked, nothing spent.` };
+  }
+  return { ok: true, charge: charge || null };
+}
 
 const AGENT_TOOLS = [
   // ---- Phone/UI control (executed on Android) ----
@@ -3317,7 +3595,7 @@ app.post("/screen/clear", requireAuth, (req, res) => {
 });
 
 // ==================== MARKET ROUTES ====================
-app.get("/market/quote", async (req, res) => {
+app.get("/market/quote", requireAuth, limitNormal, async (req, res) => {
   try {
     const symbol = String(req.query.symbol || "BTCUSD").toUpperCase();
     const data = await fetchMarketPrices([symbol]);
@@ -3327,7 +3605,7 @@ app.get("/market/quote", async (req, res) => {
   }
 });
 
-app.post("/market/batch", async (req, res) => {
+app.post("/market/batch", requireAuth, limitNormal, async (req, res) => {
   try {
     const { symbols = [] } = req.body || {};
     if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" });
@@ -3379,12 +3657,17 @@ app.all("/market/analyze", requireAuth, async (req, res) => {
     const query = req.query || {};
     const sym = req.method === "GET" ? query.symbol : body.symbol ?? query.symbol;
     if (!sym) return res.status(400).json({ error: "symbol required" });
+    const uid = boundUser(req);
+    const ent = checkEntitlement(uid, "trading");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const symbol = String(sym).toUpperCase();
     const interval = normalizeInterval(req.method === "GET" ? query.interval : body.interval ?? query.interval ?? "1h");
     const outputsize = (req.method === "GET" ? query.outputsize : body.outputsize ?? query.outputsize)
       ? Number(req.method === "GET" ? query.outputsize : body.outputsize ?? query.outputsize)
       : null;
-    res.json(await analyzeSymbol(symbol, interval, outputsize));
+    const out = await analyzeSymbol(symbol, interval, outputsize);
+    debitCredits(uid, "trade_analysis", "market analyze"); // post-success
+    res.json(out);
   } catch (err) {
     console.error("/market/analyze", err.message);
     res.status(500).json({ error: "Analysis failed", details: err.message });
@@ -3412,10 +3695,14 @@ app.post("/trade", requireAuth, limitNormal, async (req, res) => {
   if (balance != null && (!Number.isFinite(Number(balance)) || Number(balance) > 1_000_000)) {
     return res.status(400).json({ error: "balance must be ≤ 1,000,000" });
   }
+  const uid = boundUser(req);
+  const ent = checkEntitlement(uid, "trading");
+  if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
 
   try {
     const result = await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
     console.log(`[/trade] ${symbol} ${result.decision} — reasons: ${JSON.stringify(result.reasons || [])}`);
+    debitCredits(uid, "trade_analysis", "trade engine"); // engine ran — post-success
 
     if (["NO_TRADE", "WAIT", "WAIT_PULLBACK", "WAIT_RANGE", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
       return res.status(200).json({ status: "blocked", ...withoutEngineReasons(result) });
@@ -3593,7 +3880,7 @@ app.post("/risk/check", requireAuth, (req, res) => {
   }
 });
 
-app.get("/weather", async (req, res) => {
+app.get("/weather", requireAuth, limitNormal, async (req, res) => {
   try {
     const city = String(req.query.city || "Lagos");
     const result = await getWeather(city);
@@ -3608,11 +3895,12 @@ app.post("/transcribe", requireAuth, limitCostly, async (req, res) => {
     const { audio_base64, mime_type = "audio/webm" } = req.body || {};
     if (!audio_base64) return res.status(400).json({ error: "audio_base64 required" });
     const uid = boundUser(req);
-    const cap = checkCap(uid, "stt");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "chat");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const text = await mistralTranscribe(audio_base64, mime_type);
     if (!text) return res.status(500).json({ error: "Transcription failed" });
     db.prepare("UPDATE usage_daily SET stt_mins = stt_mins + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    debitCredits(uid, "stt_min", "transcribe"); // post-success: ~1 min voice at 2cr
     res.json({ text, model_used: OR_STT_MODEL });
   } catch (err) {
     console.error("[/transcribe]", err.message);
@@ -3625,10 +3913,11 @@ app.post("/images/generate", requireAuth, limitCostly, async (req, res) => {
     const { prompt, aspect_ratio, n, model } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt required" });
     const uid = boundUser(req);
-    const cap = checkCap(uid, "image");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const data = await generateImage(prompt, { aspect_ratio, n, model });
     db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    debitCredits(uid, "image", "image generate"); // post-success only
     res.json({ ok: true, model: model || OR_IMAGE_MODEL, ...data });
   } catch (err) {
     console.error("[/images/generate]", err.message);
@@ -3683,13 +3972,13 @@ app.post("/videos/submit", requireAuth, limitCostly, async (req, res) => {
     const { prompt, duration, resolution, aspect_ratio, model } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Video needs Creator or Pro." });
-    const cap = checkCap(uid, "clip");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "video");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const job = await submitVideo(prompt, { duration, resolution, aspect_ratio, model });
     const id = `vid_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video', 'submitted', ?)").run(id, uid, String(prompt).slice(0, 1000));
     db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    trackProviderJob(job?.id || job?.data?.id, uid, "clip"); // charged once on completion, never on failure
     res.json({ ok: true, job_id: id, provider_job: job });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -3700,8 +3989,9 @@ app.get("/videos/status/:jobId", requireAuth, limitNormal, async (req, res) => {
     const data = await pollVideo(req.params.jobId);
     const st = data?.data?.status || data?.status;
     if (st === "failed" || st === "cancelled" || st === "expired") {
-      return res.status(500).json({ ok: false, status: st, error: data?.data?.error || data?.error || `video job ${st} — resubmit (failed generations are not billed)` });
+      return res.status(500).json({ ok: false, status: st, error: data?.data?.error || data?.error || `video job ${st} — resubmit (failed generations are never billed)` });
     }
+    if (st === "completed") chargeProviderJob(req.params.jobId); // completion = provider bills us = we bill once
     res.json({ ok: true, ...data });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -3719,6 +4009,7 @@ app.get("/videos/content/:jobId", requireAuth, limitNormal, async (req, res) => 
     }
     const buf = await downloadVideo(jobId, Number(req.query.index || 0));
     if (!buf?.length) return res.status(500).json({ ok: false, error: "video download came back empty — retry shortly" });
+    chargeProviderJob(jobId); // completion billing (no-op if already charged via status)
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${jobId}.mp4"`);
     res.send(buf);
@@ -3733,7 +4024,8 @@ app.post("/creative/compose", requireAuth, limitCostly, async (req, res) => {
   try {
     const { brief, transcript, frame_notes } = req.body || {};
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Creative mode needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "creative");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const input = String(transcript || brief || "");
     if (!input) return res.status(400).json({ error: "transcript or brief required" });
     const ground = await groundScene(input); // before-math: real sizes + camera first
@@ -3747,6 +4039,7 @@ app.post("/creative/compose", requireAuth, limitCostly, async (req, res) => {
     const text = out.choices[0].message.content || "";
     const id = `cc_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'compose', 'done', ?, ?)").run(id, uid, input.slice(0, 1000), text.slice(0, 4000));
+    debitCredits(uid, "creative", "creative compose");
     res.json({ ok: true, job_id: id, draft: text, note: "Reply with corrections to /creative/revise with job_id." });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -3781,7 +4074,8 @@ app.post("/creative/assemble", requireAuth, limitCostly, async (req, res) => {
   try {
     const { clips = [], images = [], per_image_secs = 2 } = req.body || {};
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Creative mode needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "creative");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     if ((!Array.isArray(clips) || !clips.length) && (!Array.isArray(images) || !images.length)) {
       return res.status(400).json({ error: "clips[] (jobIds/urls) or images[] (base64) required" });
     }
@@ -3836,16 +4130,24 @@ app.get("/billing/tiers", requireAuth, async (_req, res) => {
   const rate = await ngnPerUsd();
   const tiers = Object.fromEntries(Object.entries(SUB_TIERS).map(([k, t]) => [k, {
     ...t,
-    price_kobo: tierNaira(k, rate), // ratchet-pegged — what the user actually pays today
-    price_kobo_live: tierNaira(k, rate), // compat alias (was FX-derived)
+    price_kobo: tierNaira(k, rate),
+    price_kobo_live: tierNaira(k, rate),
     yearly_kobo: tierNaira(k, rate) * YEARLY_MULT,
+    features: t.features || [],
+    credits_mo: t.credits_mo || 0,
   }]));
-  res.json({ ok: true, usd_ngn: rate, peg_floor: PEG_FLOOR, tiers, overage: OVERAGE, yearly_mult: YEARLY_MULT, order: TIER_ORDER });
+  res.json({
+    ok: true, usd_ngn: rate, peg_floor: PEG_FLOOR, tiers, overage: OVERAGE,
+    yearly_mult: YEARLY_MULT, order: TIER_ORDER,
+    credit_costs: CREDIT_COSTS,
+    credits_per_naira: CREDIT_NAIRA_KOBO,
+    feature_labels: FEATURE_LABELS,
+  });
 });
 app.get("/billing/pay-info", requireAuth, async (_req, res) => {
   const rate = await ngnPerUsd();
   const n = (kobo) => Math.round(kobo / 100);
-  const sK = tierNaira("starter", rate), cK = tierNaira("creator", rate), pK = tierNaira("pro", rate);
+  const sK = tierNaira("starter", rate), cK = tierNaira("creator", rate), pK = tierNaira("pro", rate), tK = tierNaira("trader", rate);
   res.json({
     ok: true, usd_ngn: rate, peg_floor: PEG_FLOOR,
     bank: { bank_name: PAY_BANK_NAME || "(set PAY_BANK_NAME)", account_number: PAY_ACCOUNT_NUMBER || "(set PAY_ACCOUNT_NUMBER)", account_name: PAY_ACCOUNT_NAME || "(set PAY_ACCOUNT_NAME)" },
@@ -3854,7 +4156,7 @@ app.get("/billing/pay-info", requireAuth, async (_req, res) => {
       assets: ["USDT (BNB Smart Chain)", "BTC (BNB Smart Chain)"],
       note: "USDT + BTC auto-verify on txhash submit (12+ confirmations). Send ONLY on BNB Smart Chain — other networks will lose funds.",
     },
-    tiers: { starter_naira: n(sK), creator_naira: n(cK), pro_naira: n(pK),
+    tiers: { starter_naira: n(sK), creator_naira: n(cK), pro_naira: n(pK), trader_naira: n(tK), trader_kobo: tK, trader_yearly: n(tK) * YEARLY_MULT,
       starter_kobo: sK, creator_kobo: cK, pro_kobo: pK,
       starter_yearly: n(sK) * YEARLY_MULT, creator_yearly: n(cK) * YEARLY_MULT, pro_yearly: n(pK) * YEARLY_MULT },
     two_pots: {
@@ -3869,7 +4171,7 @@ app.post("/billing/subscribe", requireAuth, limitNormal, async (req, res) => {
   const user_id = boundUser(req);
   // Only priced tiers are purchasable — free/tester/owner never reach checkout
   // (tester comes from admin-minted trial codes, owner from MASTER_CODE).
-  if (!SUB_TIERS[tier] || !tierBaseKobo(tier)) return res.status(400).json({ error: "paid tier required (starter, creator or pro)" });
+  if (!SUB_TIERS[tier] || !tierBaseKobo(tier)) return res.status(400).json({ error: "paid tier required (starter, creator, trader or pro)" });
   const rate = await ngnPerUsd();
   const amount_kobo = tierNaira(tier, rate); // ratchet-pegged, locked at order time
   const id = `pay_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
@@ -3937,6 +4239,13 @@ app.post("/billing/submit-reference", requireAuth, limitNormal, async (req, res)
         takeSnapshot("approve-topup-crypto");
         return res.json({ ok: true, payment_id, status: "approved", verified: v, balance_kobo: bal });
       }
+      if (pay.purpose === "credit_topup") {
+        // Was falling through to the SUBSCRIPTION branch: crypto paid, user got a useless free activation code and 0 credits.
+        const credits = Math.floor(pay.amount_kobo / CREDIT_NAIRA_KOBO);
+        const bal = creditTxn(pay.user_id, credits, "topup", `credit top-up ${payment_id} (${net} ${cleanTx.slice(0, 12)})`);
+        takeSnapshot("approve-credit-topup-crypto");
+        return res.json({ ok: true, payment_id, status: "approved", verified: v, credits_added: credits, balance: bal });
+      }
       const code = makeActivationCode();
       const exp = new Date(Date.now() + SUB_TIERS[pay.tier].days * 864e5).toISOString();
       db.prepare("INSERT INTO activation_codes (code, tier, status, user_id, expires_at) VALUES (?, ?, 'unused', NULL, ?)").run(code, pay.tier, exp);
@@ -3954,6 +4263,35 @@ app.get("/billing/pending", requireAdmin, (_req, res) => {
   // YOUR admin queue: review sender names / txids vs bank alerts, then approve.
   res.json({ ok: true, pending: db.prepare("SELECT * FROM pending_payments WHERE status IN ('pending','awaiting_review') ORDER BY created_at DESC LIMIT 100").all() });
 });
+// Credit top-up: any amount → credits at ₦10/credit. Same rails as wallet top-up.
+app.post("/billing/topup-credits", requireAuth, limitNormal, async (req, res) => {
+  const { amount_kobo, method } = req.body || {};
+  const user_id = boundUser(req);
+  if (!Number.isInteger(Number(amount_kobo)) || amount_kobo < 10000) return res.status(400).json({ error: "integer amount_kobo (min ₦100) required" });
+  const credits = Math.floor(Number(amount_kobo) / CREDIT_NAIRA_KOBO);
+  if (credits < 1) return res.status(400).json({ error: `minimum top-up is ₦${CREDIT_NAIRA_KOBO / 100} (1 credit)` });
+  const id = `ctop_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+  const passcode = makePasscode();
+  db.prepare("INSERT INTO pending_payments (id, user_id, tier, amount_kobo, reference, purpose) VALUES (?, ?, 'free', ?, ?, 'credit_topup')").run(id, user_id, Number(amount_kobo), passcode);
+  const m = String(method || "bank").toLowerCase();
+  const naira = (Number(amount_kobo) / 100).toLocaleString();
+  res.json({
+    ok: true, payment_id: id, amount_kobo: Number(amount_kobo), credits, passcode, purpose: "credit top-up",
+    ...(m === "crypto"
+      ? { pay_to: { bsc_address: BSC_ADDRESS, assets: ["USDT (BNB Smart Chain)", "BTC (BNB Smart Chain)"] }, instruction: `Send USDT or BTC on BNB Smart Chain equal to ~₦${naira} to ${BSC_ADDRESS}, then submit txhash + this passcode: ${passcode}.` }
+      : { pay_to: { bank_name: PAY_BANK_NAME, account_number: PAY_ACCOUNT_NUMBER, account_name: PAY_ACCOUNT_NAME }, instruction: `Transfer ₦${naira} with narration ${passcode}, then enter passcode ${passcode} in "I've paid".` }),
+  });
+});
+// Credit balance + ledger for the app.
+app.get("/billing/credits", requireAuth, limitNormal, (req, res) => {
+  const user_id = boundUser(req);
+  grantMonthlyCredits(user_id);
+  const bal = creditBalance(user_id);
+  const txns = db.prepare("SELECT amount, kind, note, created_at FROM credit_txns WHERE user_id = ? ORDER BY id DESC LIMIT 50").all(user_id);
+  const tier = activeTier(user_id);
+  res.json({ ok: true, user_id, balance: bal, tier, credits_per_naira: CREDIT_NAIRA_KOBO,
+    linked: !!db.prepare("SELECT 1 FROM api_keys WHERE user_id = ?").get(user_id), txns });
+});
 app.post("/billing/approve", requireAdmin, (req, res) => {
   // YOU call this after confirming the bank alert / txid (same AUTH_TOKEN = admin).
   // Subs return an ACTIVATION CODE (send it to the user); top-ups credit wallet directly.
@@ -3965,6 +4303,12 @@ app.post("/billing/approve", requireAdmin, (req, res) => {
     const bal = walletCredit(pay.user_id, pay.amount_kobo, `topup ${payment_id}`);
     takeSnapshot("approve-topup");
     return res.json({ ok: true, purpose: "topup", user_id: pay.user_id, balance_kobo: bal });
+  }
+  if (pay.purpose === "credit_topup") {
+    const credits = Math.floor(pay.amount_kobo / CREDIT_NAIRA_KOBO);
+    const bal = creditTxn(pay.user_id, credits, "topup", `credit top-up ${payment_id}`);
+    takeSnapshot("approve-credit-topup");
+    return res.json({ ok: true, purpose: "credit_topup", user_id: pay.user_id, credits_added: credits, balance: bal });
   }
   const code = makeActivationCode();
   const exp = new Date(Date.now() + SUB_TIERS[pay.tier].days * 864e5).toISOString();
@@ -3992,7 +4336,7 @@ app.post("/billing/mint", requireAdmin, (req, res) => {
     codes.push({ code, tier, expires_at: exp });
   }
   res.json({ ok: true, codes, redeem_by: codes[0]?.expires_at || null,
-    howto: "Testers open Wallet → 'Redeem a code', paste the code, and get full features until the subscription expires. Re-pasting the same code refreshes it on that device." });
+    howto: "Testers open Wallet → 'Redeem a code', paste the code, and get full features until the subscription expires. Re-pasting reports status but never extends it." });
 });
 app.post("/billing/redeem", requireAuth, limitNormal, (req, res) => {
   // User enters activation code (or your MASTER_CODE) in-app -> tier unlocks.
@@ -4009,12 +4353,11 @@ app.post("/billing/redeem", requireAuth, limitNormal, (req, res) => {
   const row = db.prepare("SELECT * FROM activation_codes WHERE code = ?").get(c);
   if (!row) return res.status(400).json({ error: "invalid code — check each character and try again" });
   if (!SUB_TIERS[row.tier]) return res.status(400).json({ error: `this code is for retired tier '${row.tier}' — contact support for a fresh one` });
-  // Re-paste = refresh, not an error. A code already redeemed on THIS device
-  // re-grants a fresh subscription window instead of bouncing the user to
-  // free. (This was the "returns to free and won't accept my key again" bug:
-  // single-use codes + approve-time expiry stranded users on free.)
-  // Legacy bridge: codes redeemed under the old shared 'default' identity are
-  // adoptable once by the first device that re-pastes them.
+  // Re-paste NEVER extends: the subscription clock starts at FIRST redeem only.
+  // (The old code reset 30 days on every paste — one payment, lifetime sub.)
+  // Same-device re-paste just reports the live subscription. Legacy bridge:
+  // codes redeemed under the old shared 'default' identity are adoptable ONCE
+  // by the first device that re-pastes them.
   const grantFresh = (why) => {
     const exp = new Date(Date.now() + SUB_TIERS[row.tier].days * 864e5).toISOString();
     db.prepare("UPDATE activation_codes SET status = 'used', user_id = ? WHERE code = ?").run(user_id, c);
@@ -4022,7 +4365,13 @@ app.post("/billing/redeem", requireAuth, limitNormal, (req, res) => {
     return res.json({ ok: true, tier: row.tier, expires_at: exp, refreshed: why });
   };
   if (row.status === "used") {
-    if (row.user_id === user_id || row.user_id === "default" || !row.user_id) return grantFresh(true);
+    if (row.user_id === user_id) {
+      const cur = db.prepare("SELECT tier, expires_at FROM subscriptions WHERE user_id = ?").get(user_id);
+      const live = cur && cur.expires_at && new Date(cur.expires_at).getTime() > Date.now();
+      if (live) return res.json({ ok: true, tier: cur.tier, expires_at: cur.expires_at, refreshed: false, note: `Already active until ${String(cur.expires_at).slice(0, 10)} — re-pasting never extends it.` });
+      return res.status(400).json({ error: "code already used and its subscription has expired — subscribe again for a fresh code" });
+    }
+    if (row.user_id === "default" || !row.user_id) return grantFresh(true); // one-time legacy adoption
     return res.status(400).json({ error: "code already redeemed on another device — ask support for your own" });
   }
   if (row.status !== "unused") return res.status(400).json({ error: "code no longer valid — contact support for a fresh one" });
@@ -4034,9 +4383,20 @@ app.post("/billing/redeem", requireAuth, limitNormal, (req, res) => {
 });
 app.get("/billing/status", requireAuth, limitNormal, (req, res) => {
   const user_id = boundUser(req);
+  grantMonthlyCredits(user_id);
   const sub = db.prepare("SELECT tier, expires_at FROM subscriptions WHERE user_id = ?").get(user_id);
-  res.json({ ok: true, user_id, tier: activeTier(user_id), expires_at: sub?.expires_at || null, usage_today: getUsage(user_id), usage_month: monthUsage(user_id),
-    db_persistent: !EPHEMERAL_DB });
+  const tier = activeTier(user_id);
+  const t = SUB_TIERS[tier] || {};
+  res.json({
+    ok: true, user_id, tier, expires_at: sub?.expires_at || null,
+    credits: creditBalance(user_id),
+    credits_mo: t.credits_mo || 0,
+    features: t.features || [],
+    feature_labels: FEATURE_LABELS,
+    linked: !!db.prepare("SELECT 1 FROM api_keys WHERE user_id = ?").get(user_id),
+    usage_today: getUsage(user_id), usage_month: monthUsage(user_id),
+    db_persistent: !EPHEMERAL_DB,
+  });
 });
 function takeSnapshot(kind) {
   const payload = JSON.stringify({
@@ -4136,6 +4496,23 @@ app.post("/admin/keys", requireAdmin, (req, res) => {
 });
 app.get("/admin/keys", requireAdmin, (_req, res) => {
   res.json({ ok: true, keys: db.prepare("SELECT user_id, label, created_at FROM api_keys ORDER BY created_at DESC").all() });
+});
+// Per-install device keys (anti free-credit farming). The app registers its
+// install UUID once, stores the returned key in app-private prefs, and calls
+// everything with it — the server then binds quota/credits/tier to a real
+// install instead of a self-asserted id. Strictly rate-limited (5/hour/IP);
+// one live key per install_id (re-register rotates). Farming now costs a
+// reinstall + IP budget per 200 credits instead of one random string.
+const limitInstall = rateLimit({ windowMs: 3600e3, max: 5 });
+app.post("/auth/install", limitInstall, (req, res) => {
+  const install_id = String(req.body?.install_id || "").trim();
+  if (!/^app_[0-9a-f]{12}$/.test(install_id)) return res.status(400).json({ error: "install_id required (app_ + 12 hex chars)" });
+  const key = `frit_${crypto.randomBytes(24).toString("hex")}`;
+  db.transaction(() => {
+    db.prepare("DELETE FROM api_keys WHERE user_id = ?").run(install_id);
+    db.prepare("INSERT INTO api_keys (key_hash, user_id, label) VALUES (?, ?, 'install')").run(hashKey(key), install_id);
+  })();
+  res.json({ ok: true, user_id: install_id, api_key: key, note: "Store on device (app-private prefs). Shown once — re-register rotates it." });
 });
 // ---- Runtime models (Creator console) ----
 // The app's Creator console lists these, and the creator swaps any slug live:
@@ -4331,8 +4708,8 @@ app.post("/creative-suite/images/generate", requireAuth, limitCostly, async (req
     const { prompt, style_preset, aspect_ratio, n, model, reference_images } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt required" });
     const uid = boundUser(req);
-    const cap = checkCap(uid, "image");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const preset = promptEngine.STYLE_PRESETS.find(p => p.id === style_preset);
     const enhancedPrompt = preset ? `${prompt}, ${preset.description}` : prompt;
     const refs = Array.isArray(reference_images) ? reference_images.filter(u => typeof u === "string" && u.length > 0).slice(0, 3) : [];
@@ -4344,6 +4721,7 @@ app.post("/creative-suite/images/generate", requireAuth, limitCostly, async (req
     const assetId = `img_${Date.now()}`;
     db.prepare("INSERT INTO creative_assets (id, user_id, kind, source, current_url, metadata) VALUES (?, ?, 'image', 'generated', ?, ?)")
       .run(assetId, uid, data.image_url || "", JSON.stringify({ prompt, style_preset, model: data.model }));
+    debitCredits(uid, "image", "image generate"); // post-success only: failed generations are not billed
     res.json({ ok: true, asset_id: assetId, ...data });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4472,13 +4850,13 @@ app.post("/creative-suite/videos/generate", requireAuth, limitCostly, async (req
     const { prompt, duration, resolution, aspect_ratio, model } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Video needs Creator or Pro." });
-    const cap = checkCap(uid, "clip");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "video");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const job = await submitVideo(prompt, { duration, resolution, aspect_ratio, model });
     const id = `vid_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video', 'submitted', ?)").run(id, uid, String(prompt).slice(0, 1000));
     db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    trackProviderJob(job?.id || job?.data?.id, uid, "clip"); // charged once on completion
     res.json({ ok: true, job_id: id, provider_job: job });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4518,7 +4896,8 @@ app.post("/creative-suite/videos/edit", requireAuth, limitCostly, async (req, re
     const { video, audio, subtitles, clips, operations } = req.body || {};
     if (!video && !(Array.isArray(clips) && clips.length)) return res.status(400).json({ error: "video or clips[] required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Video editing needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "video");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     let current = video ? await mediaToB64(video) : null;
     const applied = [];
     for (const op of (Array.isArray(operations) ? operations : [])) {
@@ -4553,6 +4932,8 @@ app.post("/creative-suite/videos/edit", requireAuth, limitCostly, async (req, re
     if (!current) return res.status(400).json({ error: "no operations applied — send operations[]" });
     const id = `vedit_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video_edit', 'done', ?)").run(id, uid, `ops=${applied.map(a => a.type).join(",")}`);
+    // Local ffmpeg work (own sandbox, no provider video model) — compute rate, not clip rate.
+    debitCredits(uid, "agent_task", "video edit");
     res.json({ ok: true, job_id: id, applied, mime: "video/mp4", video_base64: current });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4604,7 +4985,8 @@ app.post("/creative-suite/storyboard", requireAuth, limitCostly, async (req, res
     const { script, style, num_frames } = req.body || {};
     if (!script) return res.status(400).json({ error: "script required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Storyboard needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const frames = await aiFeatures.storyboard(script, style, num_frames || 6);
     // Parallel fan-out: 8 sequential generations took ~8x single latency.
     const generatedFrames = await Promise.all(frames.slice(0, 8).map(async (frame) => {
@@ -4615,6 +4997,8 @@ app.post("/creative-suite/storyboard", requireAuth, limitCostly, async (req, res
         return { ...frame, image_url: null, error: e.message };
       }
     }));
+    // Pay per delivered frame only — failed frames are not billed.
+    for (const f of generatedFrames) if (f.image_url) debitCredits(uid, "image", "storyboard frame");
     res.json({ ok: true, frames: generatedFrames });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4817,9 +5201,8 @@ app.post("/creative-suite/cinema/generate", requireAuth, limitCostly, async (req
     const inputRefs = refs.map(r => ({ type: "image_url", image_url: { url: String(r) } }));
     const directed = cinema.buildDirectorPrompt({ prompt, ...(director || {}) });
     if ((kind || "image") === "video") {
-      if (activeTier(uid) === "free") return res.status(402).json({ error: "Video needs Creator or Pro." });
-      const cap = checkCap(uid, "clip");
-      if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "video");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
       const job = await submitVideo(directed, {
         duration: duration || 4,
         resolution: resolution || "720p",
@@ -4829,15 +5212,17 @@ app.post("/creative-suite/cinema/generate", requireAuth, limitCostly, async (req
       const id = `vid_${Date.now()}`;
       db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'video', 'submitted', ?)").run(id, uid, directed.slice(0, 1000));
       db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+      trackProviderJob(job?.id || job?.data?.id, uid, "clip"); // charged once on completion (was unbilled before)
       return res.json({ ok: true, kind: "video", job_id: id, provider_job: job });
     }
-    const cap = checkCap(uid, "image");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const data = await generateImage(directed, {
       aspect_ratio: aspect_ratio || undefined,
       ...(inputRefs.length ? { input_references: inputRefs } : {}),
     });
     db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    debitCredits(uid, "image", "cinema image"); // post-success only (was pre-charged before)
     res.json({ ok: true, kind: "image", directed_prompt: directed, ...data });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4851,6 +5236,9 @@ app.post("/creative-suite/katana", requireAuth, limitCostly, async (req, res) =>
   try {
     const { command, video, audio, language } = req.body || {};
     if (!command) return res.status(400).json({ error: "command required" });
+    const katanaUid = boundUser(req);
+    const katanaEnt = checkEntitlement(katanaUid, "chat");
+    if (!katanaEnt.ok) return res.status(402).json({ error: katanaEnt.message, code: katanaEnt.code, needed: katanaEnt.needed, balance: katanaEnt.balance });
     const { ops, reply } = await cinema.katanaParse(command);
     const results = [];
     for (const op of ops) {
@@ -4881,6 +5269,7 @@ app.post("/creative-suite/katana", requireAuth, limitCostly, async (req, res) =>
     }
     const id = `kat_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'katana', 'done', ?, ?)").run(id, boundUser(req), String(command).slice(0, 500), JSON.stringify(results).slice(0, 4000));
+    debitCredits(katanaUid, "turn", "katana"); // post-success: parse + ops ran
     res.json({ ok: true, job_id: id, ops, reply, results });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4896,9 +5285,8 @@ app.post("/creative-suite/genjutsu", requireAuth, limitCostly, async (req, res) 
     const { mode, video, references, description, preset, duration, resolution, model } = req.body || {};
     if (!video) return res.status(400).json({ error: "video (base64 or http URL) required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Genjutsu needs Creator or Pro." });
-    const cap = checkCap(uid, "clip");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
+    const ent = checkEntitlement(uid, "video");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const m = (mode || "motion_transfer").toLowerCase();
     const refs = Array.isArray(references) ? references.slice(0, 30) : [];
     const prompt = m === "object_swap"
@@ -4918,6 +5306,7 @@ app.post("/creative-suite/genjutsu", requireAuth, limitCostly, async (req, res) 
     const id = `gen_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'genjutsu', 'submitted', ?)").run(id, uid, prompt.slice(0, 1000));
     db.prepare("UPDATE usage_daily SET clips = clips + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    trackProviderJob(job?.id || job?.data?.id, uid, "clip"); // charged once on completion
     res.json({ ok: true, job_id: id, mode: m, model: model || OR_GENJUTSU_MODEL, provider_job: job });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -4955,10 +5344,9 @@ app.post("/creative-suite/influencer", requireAuth, limitCostly, async (req, res
   try {
     const { attributes, posts } = req.body || {};
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "AI Influencer needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const persona = await cinema.influencerPersona(attributes || {});
-    const cap = checkCap(uid, "image");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
     let sheet = null;
     if (persona.character_prompt) {
       try {
@@ -4989,6 +5377,9 @@ app.post("/creative-suite/influencer", requireAuth, limitCostly, async (req, res
     const id = `inf_${Date.now()}`;
     db.prepare("INSERT INTO creative_elements (id, user_id, type, name, reference_urls, metadata) VALUES (?, ?, 'character', ?, ?, ?)")
       .run(id, uid, persona.name || "Influencer", JSON.stringify(sheet?.image_url ? [sheet.image_url] : []), JSON.stringify({ persona, character_prompt: persona.character_prompt || "" }));
+    // Pay per delivered visual only (sheet + successful post visuals).
+    if (sheet?.image_url) debitCredits(uid, "image", "influencer sheet");
+    for (const v of visuals) if (v.image_url) debitCredits(uid, "image", "influencer post");
     res.json({ ok: true, element_id: id, persona, character_sheet: sheet, posts: visuals, queued_prompts: ideas.slice(visualCount).map(i => ({ caption: i.caption || "", visual_prompt: i.visual_prompt || "" })) });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -5001,16 +5392,18 @@ app.post("/creative-suite/ads", requireAuth, limitCostly, async (req, res) => {
     const { brief, product, product_image } = req.body || {};
     if (!brief) return res.status(400).json({ error: "brief required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Ads Studio needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const plan = await cinema.adPlan(brief, product || "");
-    const cap = checkCap(uid, "image");
-    if (!cap.ok) return res.status(402).json({ error: cap.message });
     let poster = null;
     try {
       const refs = product_image ? [{ type: "image_url", image_url: { url: String(product_image) } }] : [];
       poster = await generateImage(`Premium product advertisement poster, studio lighting, 1:1. ${plan.static_ad_prompt || brief}. Product must match reference exactly.`, refs.length ? { input_references: refs } : {});
       db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
     } catch (e) { poster = { error: e.message }; }
+    // Plan call (~1cr) + delivered poster only — failed posters are not billed.
+    debitCredits(uid, "turn", "ads plan");
+    if (poster?.image_url || poster?.image_b64) debitCredits(uid, "image", "ads poster");
     const id = `ad_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'ad', 'done', ?, ?)").run(id, uid, String(brief).slice(0, 500), JSON.stringify(plan).slice(0, 4000));
     res.json({ ok: true, job_id: id, plan, poster });
@@ -5063,7 +5456,8 @@ app.post("/creative-suite/lipsync", requireAuth, limitCostly, async (req, res) =
     const { video, image, audio, language, mode, aspect_ratio, avatar_prompt } = req.body || {};
     if (!audio) return res.status(400).json({ error: "audio required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Lip-sync needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "voice");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const id = `lip_${Date.now()}`;
     // Engine Y (PRIMARY avatar): HeyGen Avatar IV via OpenRouter /videos —
     // photo + voice -> expressive lip-synced talking head ($0.05/s, to 1080p).
@@ -5087,6 +5481,7 @@ app.post("/creative-suite/lipsync", requireAuth, limitCostly, async (req, res) =
         const pid = job?.id || job?.data?.id;
         if (!pid) throw new Error("heygen submit returned no job id");
         db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'submitted', ?, ?)").run(id, uid, `heygen:${pid} lang=${language || "auto"}`, JSON.stringify(job).slice(0, 1000));
+        trackProviderJob(pid, uid, "avatar"); // charged once on completion, never on failure
         return res.json({ ok: true, job_id: id, engine: "heygen", status_url: `/creative-suite/lipsync/${id}/status`, content_url: `/videos/content/${pid}`, note: "HeyGen talking-avatar render queued — poll status until done, then GET content_url." });
       } catch (e) {
         console.warn("[lipsync] heygen engine failed, falling back:", e.message);
@@ -5117,6 +5512,7 @@ app.post("/creative-suite/lipsync", requireAuth, limitCostly, async (req, res) =
         const hid = sd.id || sd.job_id || sd.jobId || null;
         if (!hid) throw new Error("hedra returned no job id");
         db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'submitted', ?, ?)").run(id, uid, `hedra:${hid} lang=${language || "auto"}`, JSON.stringify(sd).slice(0, 1000));
+        debitCredits(uid, "avatar", "hedra avatar"); // post-success only
         return res.json({ ok: true, job_id: id, engine: "hedra", status_url: `/creative-suite/lipsync/${id}/status`, note: "Talking-avatar render queued — poll status until done." });
       } catch (e) {
         console.warn("[lipsync] hedra engine failed, falling back:", e.message);
@@ -5142,6 +5538,7 @@ app.post("/creative-suite/lipsync", requireAuth, limitCostly, async (req, res) =
         const sd = await sub.json().catch(() => ({}));
         if (!sub.ok) throw new Error(sd?.message || sd?.error || `synclabs HTTP ${sub.status}`);
         db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'submitted', ?, ?)").run(id, uid, `neural lang=${language || "auto"}`, JSON.stringify(sd).slice(0, 1000));
+        debitCredits(uid, "avatar", "neural lipsync"); // provider render queued — post-success only
         return res.json({ ok: true, job_id: id, engine: "synclabs", status_url: `/creative-suite/lipsync/${id}/status`, provider_job: sd, note: "Neural render queued — poll status until done, then GET the video URL." });
       } catch (e) {
         console.warn("[lipsync] neural engine failed, falling back to local:", e.message);
@@ -5151,6 +5548,7 @@ app.post("/creative-suite/lipsync", requireAuth, limitCostly, async (req, res) =
     const buf = Buffer.from(String(audio).replace(/^data:[\w/;-]+;base64,/, ""), "base64");
     const { subtitles, text } = await aiFeatures.generateSubtitles(buf, language || "auto");
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'lipsync', 'done', ?, ?)").run(id, uid, `local lang=${language || "auto"}`, JSON.stringify(subtitles).slice(0, 4000));
+    debitCredits(uid, "stt_min", "local dub"); // local fallback: STT cost only, post-success
     res.json({
       ok: true, job_id: id, engine: "local", transcript: text, subtitles,
       mix: { op: "replace_audio", note: "Render in sandbox: replace video audio track with the voiceover, then burn in subtitles" },
@@ -5175,6 +5573,7 @@ app.get("/creative-suite/lipsync/:jobId/status", requireAuth, limitNormal, async
       if (st === "completed") {
         const curl = `/videos/content/${hy[1].split(" ")[0]}`;
         db.prepare("UPDATE creative_jobs SET status = 'done', result_url = ? WHERE id = ?").run(curl, row.id);
+        chargeProviderJob(hy[1].split(" ")[0]); // completion billing (no-op if charged via /videos/*)
         return res.json({ ok: true, ...row, status: "done", result_url: curl });
       }
       if (st === "failed" || st === "cancelled" || st === "expired") {
@@ -5223,7 +5622,8 @@ app.post("/creative-suite/autopilot", requireAuth, limitCostly, async (req, res)
     const { script, per_shot_secs, aspect_ratio } = req.body || {};
     if (!script) return res.status(400).json({ error: "script required" });
     const uid = boundUser(req);
-    if (activeTier(uid) === "free") return res.status(402).json({ error: "Auto-Pilot needs Creator or Pro." });
+    const ent = checkEntitlement(uid, "video");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const shots = await cinema.aiDirect(script, 4);
     const perSecs = Math.min(4, Math.max(1, Number(per_shot_secs) || 2));
     const files = [];
@@ -5261,6 +5661,8 @@ app.post("/creative-suite/autopilot", requireAuth, limitCostly, async (req, res)
     if (!r.ok || !data?.base64) throw new Error(data?.error || `assemble HTTP ${r.status}`);
     const id = `film_${Date.now()}`;
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt) VALUES (?, ?, 'autofilm', 'done', ?)").run(id, uid, String(script).slice(0, 500));
+    // Slideshow of delivered frames: pay per frame, not clip rate (no provider video model runs here).
+    for (const f of files) debitCredits(uid, "image", "autopilot frame");
     res.json({ ok: true, job_id: id, shots: directedShots, film: { mime: "video/mp4", size: data.size, base64: data.base64 } });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -5301,8 +5703,8 @@ app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) =>
     const { template, headline, body, cta, palette, brandkit_id, logo_url, style_refs, craft, variations, aspect_ratio } = req.body || {};
     if (!headline && !template) return res.status(400).json({ error: "headline or template required" });
     const uid = boundUser(req);
-    const gate = checkCap(uid, "image");
-    if (!gate.ok) return res.status(402).json({ error: gate.message });
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const tpl = templateLibrary.getGraphicsTemplate(template || "") || null;
     let brand = null;
     if (brandkit_id) {
@@ -5349,6 +5751,8 @@ app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) =>
     const id = `gfx_${Date.now()}`;
     const firstUrl = designs.find(d => d.image_url)?.image_url || "";
     db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'design', 'done', ?, ?)").run(id, uid, `craft=${resolved} ${String(headline || template || "").slice(0, 300)}`, firstUrl.slice(0, 1000));
+    // Pay per delivered variation only — failed variations are not billed.
+    for (const d of designs) if (d.ok) debitCredits(uid, "image", "design variation");
     res.json({ ok: true, job_id: id, template: tpl?.id || null, zones: tpl?.zones || [], craft: resolved, brand_applied: !!brand, designs });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -5403,8 +5807,12 @@ app.post("/tools/search", requireAuth, limitNormal, async (req, res) => {
 app.post("/enhanced/analyze", requireAuth, async (req, res) => {
   const { symbol, interval = "1h", balance, riskPercent } = req.body || {};
   if (!symbol) return res.status(400).json({ error: "symbol required" });
+  const uid = boundUser(req);
+  const ent = checkEntitlement(uid, "trading");
+  if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
   try {
     const result = await mtfStrategy.analyze(symbol, { interval, balance, riskPercent });
+    debitCredits(uid, "trade_analysis", "enhanced analyze"); // post-success
     res.json(result);
   } catch (err) {
     console.error("[/enhanced/analyze]", err.message);
@@ -5415,8 +5823,12 @@ app.post("/enhanced/analyze", requireAuth, async (req, res) => {
 // Full multi-timeframe directional report — "build with directions".
 app.get("/market/strategy", requireAuth, async (req, res) => {
   try {
+    const uid = boundUser(req);
+    const ent = checkEntitlement(uid, "trading");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
     const result = await mtfStrategy.analyze(sym, {});
+    debitCredits(uid, "trade_analysis", "market strategy"); // post-success
     res.json(result);
   } catch (err) {
     console.error("[/market/strategy]", err.message);
@@ -5433,6 +5845,9 @@ app.get("/strategy/status", requireAuth, async (req, res) => {
 app.post("/tasks/trade-schedule", requireAuth, async (req, res) => {
   try {
     const { symbol, time, riskPercent, balance, action } = req.body || {};
+    const uid = boundUser(req);
+    const ent = checkEntitlement(uid, "trading");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     if (action === "stop") { tradeScheduler.stop(); return res.json({ ok: true, message: "Scheduler stopped" }); }
     if (action === "start") { tradeScheduler.start(); return res.json({ ok: true, message: "Scheduler started" }); }
     if (action === "remove") { return res.json({ ok: tradeScheduler.remove(symbol) }); }
@@ -5832,53 +6247,62 @@ app.get("/api/trading/portfolio", requireAuth, async (req, res) => {
     // Calculate metrics
     let unrealizedPnl = 0, realizedPnl = 0;
     const positions = [];
+    // Garbage in (null entry/lot, dead price feed) used to poison the whole
+    // summary with NaN, which the phone rendered literally. Sanitize here.
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
     
     for (const pos of openPositions) {
+      const entry = Number(pos.entry), lot = Number(pos.lot_size);
       const spot = await fetchSpotPrice(pos.symbol);
-      if (spot) {
-        const isLong = pos.action === "buy";
-        const pnl = isLong 
-          ? (spot.price - pos.entry) * pos.lot_size * (PIP_CONFIG[pos.symbol]?.pipValue || 10)
-          : (pos.entry - spot.price) * pos.lot_size * (PIP_CONFIG[pos.symbol]?.pipValue || 10);
-        unrealizedPnl += pnl;
-        positions.push({
-          id: pos.id, symbol: pos.symbol, side: pos.action.toUpperCase(),
-          entryPrice: pos.entry, currentPrice: spot.price, lotSize: pos.lot_size,
-          sl: pos.sl, tp: pos.tp, unrealizedPnl: pnl, realizedPnl: 0,
-          status: "OPEN", openedAt: new Date(pos.placed_at).getTime(), closedAt: null
-        });
+      const px = spot ? Number(spot.price) : NaN;
+      if (!spot || !Number.isFinite(entry) || !Number.isFinite(lot) || lot <= 0 || !Number.isFinite(px)) {
+        console.warn(`[portfolio] skipping ${pos.symbol} (bad price data)`);
+        continue;
       }
+      const isLong = pos.action === "buy";
+      const pipVal = num(PIP_CONFIG[pos.symbol]?.pipValue) || 10;
+      const pnl = (isLong ? (px - entry) : (entry - px)) * lot * pipVal;
+      unrealizedPnl += pnl;
+      positions.push({
+        id: pos.id, symbol: pos.symbol, side: pos.action.toUpperCase(),
+        entryPrice: entry, currentPrice: px, lotSize: lot,
+        sl: num(pos.sl), tp: num(pos.tp), unrealizedPnl: num(pnl.toFixed(2)), realizedPnl: 0,
+        status: "OPEN", openedAt: new Date(pos.placed_at).getTime() || 0, closedAt: null
+      });
     }
     
     for (const pos of resolvedPositions.slice(0, 50)) {
       const cfg = PIP_CONFIG[pos.symbol];
       const isLong = pos.action === "buy";
-      const pnl = cfg ? (isLong 
-        ? ((pos.close_price - pos.entry) / cfg.pipSize) * cfg.pipValue * pos.lot_size
-        : ((pos.entry - pos.close_price) / cfg.pipSize) * cfg.pipValue * pos.lot_size
+      const entry = Number(pos.entry), close = Number(pos.close_price), lot = Number(pos.lot_size);
+      const pnl = (cfg && Number.isFinite(entry) && Number.isFinite(close) && Number.isFinite(lot) && Number(cfg.pipSize) > 0) ? (isLong 
+        ? ((close - entry) / cfg.pipSize) * cfg.pipValue * lot
+        : ((entry - close) / cfg.pipSize) * cfg.pipValue * lot
       ) : 0;
       realizedPnl += pnl;
       positions.push({
         id: pos.id, symbol: pos.symbol, side: pos.action.toUpperCase(),
-        entryPrice: pos.entry, currentPrice: pos.close_price, lotSize: pos.lot_size,
-        sl: pos.sl, tp: pos.tp, unrealizedPnl: 0, realizedPnl: pnl,
+        entryPrice: num(entry), currentPrice: num(close), lotSize: num(lot),
+        sl: num(pos.sl), tp: num(pos.tp), unrealizedPnl: 0, realizedPnl: num(pnl.toFixed(2)),
         status: pos.outcome === "win" ? "CLOSED_WIN" : "CLOSED_LOSS",
-        openedAt: new Date(pos.placed_at).getTime(), closedAt: new Date(pos.resolved_at).getTime()
+        openedAt: new Date(pos.placed_at).getTime() || 0, closedAt: new Date(pos.resolved_at).getTime() || 0
       });
     }
     
     // Risk metrics from PortfolioRisk
     const riskStatus = portfolioRisk.status(balance);
+    const uPnl = num(unrealizedPnl.toFixed(2)), rPnl = num(realizedPnl.toFixed(2));
+    const tPnl = num((uPnl + rPnl).toFixed(2));
     
     res.json({
       positions,
       summary: {
-        totalPositions: openPositions.length,
-        unrealizedPnl: Number(unrealizedPnl.toFixed(2)),
-        realizedPnl: Number(realizedPnl.toFixed(2)),
-        totalPnl: Number((unrealizedPnl + realizedPnl).toFixed(2)),
+        totalPositions: positions.filter(p => p.status === "OPEN").length,
+        unrealizedPnl: uPnl,
+        realizedPnl: rPnl,
+        totalPnl: tPnl,
         balance,
-        equity: balance + unrealizedPnl + realizedPnl
+        equity: num((balance + uPnl + rPnl).toFixed(2))
       },
       risk: riskStatus
     });
@@ -6074,6 +6498,47 @@ app.post("/api/trading/feed/resync", requireAuth, async (_req, res) => {
     res.json({ ok: true, ...liveFeed.status() });
   } catch (err) {
     res.status(500).json({ error: "Feed resync failed", details: err.message });
+  }
+});
+
+// --- Pocket fixed-expiry signals (manual execution; paper-tracked) ---
+app.get("/api/trading/pocket/signal", requireAuth, async (req, res) => {
+  try {
+    const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
+    const expiryMin = Math.min(60, Math.max(1, Number(req.query.expiry) || POCKET_EXPIRY_MIN));
+    const signal = pocketScan(sym, expiryMin);
+    if (signal.reasons[0]?.startsWith("warming up")) {
+      // Kick off a background backfill so the next poll is warm (Finnhub free
+      // first, then budgeted REST — same path as the watchlist resync).
+      liveFeed._backfillPocket(sym).catch(() => {});
+    }
+    res.json({ signal, payoutAssumed: POCKET_PAYOUT, serverTime: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Pocket signal failed", details: err.message });
+  }
+});
+
+app.get("/api/trading/pocket/history", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbol, limit = 50 } = req.query;
+    let q = "SELECT * FROM pocket_paper WHERE (user_id = ? OR user_id = '__pocket__')";
+    const params = [user_id];
+    if (symbol) { q += " AND symbol = ?"; params.push(String(symbol).toUpperCase()); }
+    q += " ORDER BY entry_ts DESC LIMIT ?";
+    params.push(Math.min(200, Number(limit) || 50));
+    res.json({ trades: db.prepare(q).all(...params) });
+  } catch (err) {
+    res.status(500).json({ error: "Pocket history failed", details: err.message });
+  }
+});
+
+app.get("/api/trading/pocket/stats", requireAuth, async (req, res) => {
+  try {
+    const { symbol } = req.query;
+    res.json(pocketStats(db, { symbol: symbol || null, payout: POCKET_PAYOUT }));
+  } catch (err) {
+    res.status(500).json({ error: "Pocket stats failed", details: err.message });
   }
 });
 

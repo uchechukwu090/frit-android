@@ -54,7 +54,11 @@ export class LiveFeed {
     this.providerStatus = {};
     const onStatus = (name, s, d) => { this.providerStatus[name] = { status: s, detail: d, at: Date.now() }; };
 
-    this.binance = new BinanceFeed({ onKline: (s, iv, k) => this.store.ingestKline(s, iv, k), log: this.log, onStatus });
+    this.binance = new BinanceFeed({
+      onKline: (s, iv, k) => this.store.ingestKline(s, iv, k),
+      onTrade: (s, p, q, side, ts) => this.store.ingestTrade(s, p, q, ts, side),
+      log: this.log, onStatus,
+    });
     this.finnhub = this.finnhubKey
       ? new FinnhubFeed({ apiKey: this.finnhubKey, fetchImpl: this.fetchImpl, onTick: (s, p, v, t) => this.store.ingestTick(s, p, v, t), log: this.log, onStatus })
       : null;
@@ -63,6 +67,8 @@ export class LiveFeed {
     this.watched = new Map(); // symbol -> Set(user_id)
     this.scanning = new Set(); // symbols with an in-flight engine run
     this.binanceFallbackTimer = null;
+    this.onCandleClose = deps.onCandleClose || null; // pocket engine hook (every close)
+    this.pocketEnabled = deps.pocketEnabled !== false;
   }
 
   // ---- lifecycle ----
@@ -108,14 +114,14 @@ export class LiveFeed {
     }
     const added = [...next.keys()].filter(s => !this.watched.has(s));
     this.watched = next;
-    for (const s of added) await this._backfill(s);
+    for (const s of added) { await this._backfill(s); await this._backfillPocket(s); }
     this._routeAll();
     // REST-only safety net: symbols with no live provider (no Finnhub key and
     // Dukascopy bot-blocked from this host) refresh via budgeted REST when
     // their newest 30M candle goes stale — _needsBackfill + budget gate keep
     // this inside the daily credit cap.
     for (const s of [...this.watched.keys()]) {
-      if (!this._hasLiveProvider(s)) await this._backfill(s);
+      if (!this._hasLiveProvider(s)) { await this._backfill(s); await this._backfillPocket(s); }
     }
   }
 
@@ -197,6 +203,8 @@ export class LiveFeed {
     // 1. Finnhub free REST (forex/stock/crypto) — 0 TD credits.
     if (this.finnhub && FINNHUB_MAP[sym]) {
       try {
+        // NOTE: 4h via finnhub is aggregated from 4x1h inside FinnhubFeed.fetchCandles
+        // (it requests count*4 hourly candles), so 100 here yields ~100 4h candles.
         const [m30, h4] = await Promise.all([
           this.finnhub.fetchCandles(sym, "30m", 150),
           this.finnhub.fetchCandles(sym, "4h", 100),
@@ -229,24 +237,66 @@ export class LiveFeed {
     } catch (e) { this.log(`[livefeed] rest backfill ${sym} failed: ${e.message}`); }
   }
 
-  _seed(sym, m30, h4, source) {
+  _seedInterval(sym, interval, bucketMs, candles, source) {
     // Seed oldest->newest as closed candles (skip the live edge — ticks rebuild it).
-    for (const c of m30.slice(0, -1)) {
-      this.store._persist(sym, "30m", {
-        openTime: Math.floor(c.time / 1800000) * 1800000,
-        open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0,
-      }, source);
-    }
-    for (const c of h4.slice(0, -1)) {
-      this.store._persist(sym, "4h", {
-        openTime: Math.floor(c.time / 14400000) * 14400000,
+    for (const c of candles.slice(0, -1)) {
+      this.store._persist(sym, interval, {
+        openTime: Math.floor(c.time / bucketMs) * bucketMs,
         open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0,
       }, source);
     }
   }
 
+  _seed(sym, m30, h4, source) {
+    this._seedInterval(sym, "30m", 1800000, m30, source);
+    this._seedInterval(sym, "4h", 14400000, h4, source);
+  }
+
+  // Pocket backfill: 1m/5m/15m/1h for the multi-expiry engine v2.
+  // Free first (Finnhub REST), then Twelve Data inside the same budget.
+  async _backfillPocket(sym) {
+    if (!this.pocketEnabled) return;
+    const spec = [
+      ["1m", 60000, 80, "1min", 3], ["5m", 300000, 130, "5min", 8],
+      ["15m", 900000, 130, "15min", 8], ["1h", 3600000, 100, "1h", 40],
+    ];
+    const need = spec.filter(([iv, , , , min]) =>
+      this.store.candleCount(sym, iv) < min || this.store.stalenessSec(sym, iv) > 3600);
+    if (!need.length) return;
+    if (this.finnhub && FINNHUB_MAP[sym]) {
+      try {
+        const res = await Promise.all(need.map(([iv]) => this.finnhub.fetchCandles(sym, iv, 130)));
+        let ok = false;
+        res.forEach((candles, i) => {
+          const [iv, bucket, , , min] = need[i];
+          if (candles?.length >= min) {
+            this._seedInterval(sym, iv, bucket, candles, "finnhub-rest");
+            ok = true;
+          }
+        });
+        if (ok) { this.log(`[livefeed] pocket-backfilled ${sym} via finnhub (free)`); return; }
+      } catch (e) { this.log(`[livefeed] pocket finnhub backfill ${sym} failed: ${e.message}`); }
+    }
+    const cost = this.isCrypto(sym) ? 0 : 1; // crypto REST hits Binance (free)
+    if (this._budgetUsedToday() + cost > this.backfillBudget) return;
+    try {
+      const res = await Promise.all(need.map(([iv, , , tdIv]) => this.fetchCandles(sym, tdIv, 130)));
+      res.forEach((candles, i) => {
+        const [iv, bucket] = need[i];
+        if (candles?.length >= 10) this._seedInterval(sym, iv, bucket, candles, "rest");
+      });
+      this._budgetSpend(cost);
+      this.log(`[livefeed] pocket-backfilled ${sym} via rest (cost ${cost})`);
+    } catch (e) { this.log(`[livefeed] pocket rest backfill ${sym} failed: ${e.message}`); }
+  }
+
   // ---- scan on candle close ----
   async _onCandleClose(sym, interval, _candle) {
+    // Pocket hook fires for EVERY close (it listens to 5m/1m); MTF below only
+    // scans symbols the feed watches.
+    if (this.onCandleClose) {
+      try { this.onCandleClose(sym, interval); } catch (e) { this.log(`[livefeed] close-hook failed: ${e.message}`); }
+    }
     if (!this.watched.has(sym) || this.scanning.has(sym)) return;
     // Engine scans fire on 30M/4H closes only. Finer intervals (1m/5m/...) just
     // accumulate in the store for the bots UI and scalping freshness — a full

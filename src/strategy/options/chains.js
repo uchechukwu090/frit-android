@@ -65,7 +65,10 @@ export function tradierConfigured() {
 }
 
 async function tradierChain(symbol) {
-  const base = (process.env.TRADIER_BASE || "https://sandbox.tradier.com").replace(/\/$/, "");
+  const base = (process.env.TRADIER_BASE || "https://api.tradier.com").replace(/\/$/, "");
+  if (tradierToken().length > 10 && base.includes("sandbox")) {
+    console.warn("[chains] WARNING: TRADIER_TOKEN looks live but TRADIER_BASE points at sandbox — use https://api.tradier.com for live trading");
+  }
   const H = { Authorization: `Bearer ${tradierToken()}`, Accept: "application/json" };
   const expJ = await getJson(
     `${base}/v1/markets/options/expirations?symbol=${encodeURIComponent(symbol)}&includeAllRoots=false`, { headers: H }

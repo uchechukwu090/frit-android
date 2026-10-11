@@ -165,7 +165,7 @@ const REVERSAL_PROB_THRESHOLD = 55; // >= this -> treat as real reversal, trade 
 const SESSION_START_HOUR = 7;  // GMT, London/NY window
 const SESSION_END_HOUR = 17;
 const WEEKEND_DAYS = new Set([0, 6]);
-const CRYPTO_SET = new Set(["BTCUSD", "ETHUSD", "BTCUSDT", "ETHUSDT"]);
+const CRYPTO_SET = new Set(["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD", "ADAUSD", "BTCUSDT", "ETHUSDT"]);
 
 // ---------------------------------------------------------------------------
 // Pure Math & Indicator Helpers
@@ -622,6 +622,12 @@ export class MTFStrategyEngine {
   async analyze(symbol, options = {}) {
     const sym = String(symbol || "").toUpperCase();
     const t0 = Date.now();
+    // options.interval is a display label only: the model is 30m/4h. Any other
+    // requested interval warns and falls back to 30m/4h inputs.
+    const reqInterval = options.interval != null ? String(options.interval) : null;
+    if (reqInterval && reqInterval !== "30m" && reqInterval !== "4h") {
+      console.warn(`[engine] interval ${reqInterval} not separately modeled, using 30m/4h`);
+    }
 
     // Primary: 30m (120 candles = 60 hours) | Confirmation: 4h (80 candles = ~13 days)
     // LIVE-FEED SEAM: callers with locally-built candles (WebSocket/poll ticks
@@ -641,7 +647,8 @@ export class MTFStrategyEngine {
       return {
         symbol: sym, decision: "DATA_UNAVAILABLE",
         reason: "Insufficient candle data (need 30M + 4H history)",
-        strategy: "ma_rsi_30m_v2", timestamp: Date.now(), elapsed_ms: Date.now() - t0,
+        strategy: "ma_rsi_30m_v2", interval: reqInterval || "30m/4h",
+        timestamp: Date.now(), elapsed_ms: Date.now() - t0,
       };
     }
 
@@ -1068,6 +1075,7 @@ export class MTFStrategyEngine {
       symbol: sym,
       price: fmt(price),
       strategy: "ma_rsi_30m_v2",
+      interval: reqInterval || "30m/4h",
       decision,
       direction: macroTrend,
       confidence: Math.max(20, Math.min(95, conf)),

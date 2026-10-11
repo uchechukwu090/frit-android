@@ -31,11 +31,14 @@ setInterval(() => {
 }, 10 * 60 * 1000).unref?.();
 
 // Brave official API (free tier key, no funding needed). Skipped when unset.
-const BRAVE_API_KEY = process.env.BRAVE_API_KEY || "";
+// NOTE: read lazily at call time so dotenv/config loaded after import still applies.
+function braveKey() {
+  return process.env.BRAVE_API_KEY || "";
+}
 async function searchBraveApi(query) {
-  if (!BRAVE_API_KEY) throw new Error("BRAVE_API_KEY unset");
+  if (!braveKey()) throw new Error("BRAVE_API_KEY unset");
   const res = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=10&freshness=py`, {
-    headers: { "X-Subscription-Token": BRAVE_API_KEY, Accept: "application/json" },
+    headers: { "X-Subscription-Token": braveKey(), Accept: "application/json" },
     signal: AbortSignal.timeout(12_000),
   });
   if (!res.ok) throw new Error(`Brave API HTTP ${res.status}`);

@@ -1,11 +1,13 @@
 import fetch from "node-fetch";
 import { M } from "../model_config.js";
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+function orKey() {
+  return process.env.OPENROUTER_API_KEY || "";
+}
 
 function orHeaders() {
   return {
-    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    Authorization: `Bearer ${orKey()}`,
     "Content-Type": "application/json",
     "HTTP-Referer": "https://frit.local",
     "X-Title": "FRIT",
