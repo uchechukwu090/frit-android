@@ -581,7 +581,7 @@ const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.co
 // The sandbox service requires its own auth token. The AI never sees this —
 // the server attaches it when forwarding run_code calls.
 const SANDBOX_AUTH = process.env.SANDBOX_AUTH || process.env.SANDBOX_AUTH_TOKEN || "";
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
+const AUTH_TOKEN = process.env.AUTH_TOKEN || process.env.FRIT_AUTH_TOKEN || "";
 // Admin actions (approve/mint/refunds/ledger) use a DIFFERENT token so a
 // leaked app token can never mint tiers or credit wallets. Falls back to
 // AUTH_TOKEN only if unset (dev) — production must set ADMIN_TOKEN.
