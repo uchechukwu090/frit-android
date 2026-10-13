@@ -3106,6 +3106,25 @@ liveFeed.start().catch(e => console.warn("[livefeed] start failed:", e.message))
 // (broker OTC price may differ — stats are indicative, never P&L).
 ensurePocketTables(db);
 
+// Per-user Pocket bot switch. No row = ON (keeps existing behaviour); a row with
+// enabled=0 stops that user's paper fan-out and, when every watcher of a symbol
+// has it OFF, stops the shared Deriv auto-execution for that symbol too.
+db.exec(`CREATE TABLE IF NOT EXISTS pocket_settings (
+  user_id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER
+)`);
+function pocketUserEnabled(userId) {
+  try {
+    const r = db.prepare("SELECT enabled FROM pocket_settings WHERE user_id = ?").get(userId);
+    return r ? r.enabled !== 0 : true;
+  } catch { return true; }
+}
+function pocketSetEnabled(userId, on) {
+  db.prepare("INSERT INTO pocket_settings (user_id, enabled, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET enabled = ?, updated_at = ?")
+    .run(userId, on ? 1 : 0, Date.now(), on ? 1 : 0, Date.now());
+}
+
 function pocketClosed(sym, interval, n) {
   const arr = liveFeed.store.getCandles(sym, interval, n);
   // Drop the still-forming live edge — signals read closed candles only.
@@ -3141,10 +3160,14 @@ function pocketFanOut(sym, signal) {
     watchers = db.prepare("SELECT user_id FROM trading_watchlist WHERE symbol = ? AND is_enabled = 1").all(sym);
   } catch { /* ignore */ }
   for (const w of watchers) {
+    if (!pocketUserEnabled(w.user_id)) continue; // bot switched OFF for this user
     recordPaper(db, { userId: w.user_id, signal, payout: POCKET_PAYOUT });
   }
   // Live execution (Deriv demo by default; auto flag + caps enforced inside).
-  pocketDerivExecute(sym, signal).catch(() => {});
+  // Skipped when every watcher of this symbol has switched Pocket OFF.
+  if (!watchers.length || watchers.some(w => pocketUserEnabled(w.user_id))) {
+    pocketDerivExecute(sym, signal).catch(() => {});
+  }
   return true;
 }
 
@@ -7041,7 +7064,8 @@ app.get("/api/trading/pocket/signal", requireAuth, async (req, res) => {
   try {
     const user_id = requirePocket(req, res);
     if (!user_id) return;
-    const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
+    const sym = String(req.query.symbol || "").toUpperCase().replace(/[^A-Z0-9_.]/g, "");
+    if (!sym) return res.status(400).json({ error: "symbol required — pick or add a pair first" });
     const expiryMin = Math.min(60, Math.max(1, Number(req.query.expiry) || POCKET_EXPIRY_MIN));
     const signal = pocketScan(sym, expiryMin);
     const arm = getArm(db, sym, signal.expiryMin);
@@ -7050,9 +7074,27 @@ app.get("/api/trading/pocket/signal", requireAuth, async (req, res) => {
       // first, then budgeted REST — same path as the watchlist resync).
       liveFeed._backfillPocket(sym).catch(() => {});
     }
-    res.json({ signal, arm, payoutAssumed: POCKET_PAYOUT, serverTime: Date.now() });
+    res.json({ signal, arm, enabled: pocketUserEnabled(user_id), payoutAssumed: POCKET_PAYOUT, serverTime: Date.now() });
   } catch (err) {
     res.status(500).json({ error: "Pocket signal failed", details: err.message });
+  }
+});
+
+// Pocket bot ON/OFF switch (per user). GET reads, POST {enabled:bool} writes.
+app.get("/api/trading/pocket/toggle", requireAuth, (req, res) => {
+  const user_id = requirePocket(req, res);
+  if (!user_id) return;
+  res.json({ ok: true, enabled: pocketUserEnabled(user_id) });
+});
+app.post("/api/trading/pocket/toggle", requireAuth, (req, res) => {
+  try {
+    const user_id = requirePocket(req, res);
+    if (!user_id) return;
+    const on = req.body?.enabled === true || req.body?.enabled === 1 || req.body?.enabled === "true";
+    pocketSetEnabled(user_id, on);
+    res.json({ ok: true, enabled: on });
+  } catch (err) {
+    res.status(500).json({ error: "Pocket toggle failed", details: err.message });
   }
 });
 
