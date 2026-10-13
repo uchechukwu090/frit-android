@@ -33,6 +33,7 @@
 // ============================================================================
 
 import { applyCosts, NET_RR_BLOCK, NET_RR_WEAK } from "./costs.js";
+import { sessionClass } from "./rails/router.js";
 
 const CACHE_TTL_MS = { "4h": 40 * 60 * 1000, "30m": 10 * 60 * 1000 };
 const MAX_REQUESTS_PER_MINUTE = 6;
@@ -562,11 +563,24 @@ function detectRange({ swings, atr, emaFast, emaSlow, rsiNow, price }) {
   };
 }
 
-function sessionStatus(symbol) {
-  if (CRYPTO_SET.has(symbol)) return { ok: true, reason: "Crypto — 24/7 market" };
+export function sessionStatus(symbol) {
+  const cls = sessionClass(symbol);
+  // Crypto + Deriv synthetics trade 24/7/365 — no session may ever block them.
+  if (CRYPTO_SET.has(symbol) || cls === "always") {
+    return { ok: true, reason: cls === "always" ? "Synthetic — 24/7 market" : "Crypto — 24/7 market" };
+  }
   const d = new Date();
-  const day = d.getUTCDay(), hour = d.getUTCHours();
+  const day = d.getUTCDay(), hour = d.getUTCHours(), min = d.getUTCMinutes();
   if (WEEKEND_DAYS.has(day)) return { ok: false, reason: "Weekend (GMT)" };
+  if (cls === "nyse") {
+    // US stocks/ETFs: 13:30–20:00 GMT (9:30–16:00 ET). No pre-market signals —
+    // quotes are indicative and spreads are wide outside the session.
+    const mins = hour * 60 + min;
+    if (mins < 13 * 60 + 30 || mins >= 20 * 60) {
+      return { ok: false, reason: "Outside NYSE session (13:30-20:00 GMT)" };
+    }
+    return { ok: true, reason: "NYSE session active" };
+  }
   if (hour < SESSION_START_HOUR || hour >= SESSION_END_HOUR) {
     return { ok: false, reason: `Outside London/NY session (${SESSION_START_HOUR}:00-${SESSION_END_HOUR}:00 GMT)` };
   }

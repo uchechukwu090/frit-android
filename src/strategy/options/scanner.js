@@ -16,6 +16,7 @@
 
 import { greeks } from "./pricing.js";
 import { creditSpread, ironCondor, creditGate } from "./structures.js";
+import { analyzeVol } from "../volengine.js";
 
 export const SCAN_DEFAULTS = {
   minDte: 21, maxDte: 60, targetDte: 40,
@@ -58,6 +59,14 @@ export function recordIvSnapshot(db, symbol, atmIv, rv20) {
       "INSERT OR REPLACE INTO options_iv (symbol, day, atm_iv, rv20) VALUES (?,?,?,?)"
     ).run(symbol, day, atmIv, rv20);
   } catch { /* history is best-effort */ }
+}
+
+export function ivHistoryFor(db, symbol, limit = 252) {
+  try {
+    return db.prepare(
+      "SELECT atm_iv FROM options_iv WHERE symbol = ? ORDER BY day DESC LIMIT ?"
+    ).all(symbol, limit).map((r) => r.atm_iv).filter((v) => v > 0);
+  } catch { return []; }
 }
 
 export function ivRankFromDb(db, symbol, current) {
@@ -192,6 +201,28 @@ export function scanSymbol({ symbol, chain, closes, db = null, cfg = {} }) {
   const atmIv = atmIvOf(chain.contracts, S, expiration);
   if (!(atmIv > 0)) return { skip: true, why: "no clean ATM quotes for IV anchor" };
   if (db) recordIvSnapshot(db, symbol, atmIv, rv20);
+  // Volatility regime: term structure + stress + event selection. NONE vetoes
+  // (backwardation, fair premium); LONG_STRADDLE regimes skip honestly — no
+  // long-premium structure builder exists yet, and selling cheap premium loses.
+  const tenors = chain.expirations
+    .map((e) => ({
+      expiration: e,
+      dte: Math.round((new Date(e + "T16:00:00Z").getTime() - Date.now()) / 86400000),
+      atmIv: atmIvOf(chain.contracts, S, e),
+    }))
+    .filter((t) => t.dte >= 14 && t.dte <= 90 && t.atmIv > 0)
+    .slice(0, 4);
+  const vol = analyzeVol({
+    expiries: tenors,
+    ivHistory: db ? ivHistoryFor(db, symbol) : [],
+    rv20, eventDays: null, // no earnings/macro feed wired — noted, not assumed
+  });
+  if (vol.strategy === "NONE") {
+    return { skip: true, why: `vol engine veto (${vol.regime}): ${vol.reasons.join(" | ")}` };
+  }
+  if (vol.strategy === "LONG_STRADDLE") {
+    return { skip: true, why: `vol regime ${vol.regime} needs long premium — no long-premium builder yet (selling it would lose)` };
+  }
   const { rank: ivRank, n: ivN } = db
     ? ivRankFromDb(db, symbol, atmIv)
     : { rank: null, n: 0 };
@@ -255,6 +286,7 @@ export function scanSymbol({ symbol, chain, closes, db = null, cfg = {} }) {
     `Sell ${(credit).toFixed(2)} credit, risk ${(structure.maxLoss).toFixed(2)} (${(credit / structure.maxLoss * 100).toFixed(0)}% RoC)`,
     ivRank != null ? `IV rank ${ivRank.toFixed(0)} (n=${ivN}) — premium worth selling` : "IV rank unknown (no history yet) — size down",
     `RV20 ${(rv20 * 100).toFixed(1)}%${rv60 != null ? ` vs RV60 ${(rv60 * 100).toFixed(1)}% — no vol explosion` : ""}`,
+    `vol regime ${vol.regime} (${vol.strategy})${vol.termSlope != null ? `, term ${(vol.termSlope * 100).toFixed(1)}%/30d` : ""}${vol.skew25d != null ? `, 25Δ skew ${(vol.skew25d * 100).toFixed(1)}pts` : ""}`,
     driftZ != null ? `20d drift z=${driftZ.toFixed(2)}${blockCall ? " — call wing blocked (uptrend)" : blockPut ? " — put wing blocked (downtrend)" : " — no trend block"}` : "drift unknown (short history)",
     `Fills at touch (short @ bid, long @ ask); fees $${feeDollars.toFixed(2)} modeled`,
     `Exit at 50% credit, hard close by 21 DTE, stop at 2x credit`,
@@ -275,6 +307,8 @@ export function scanSymbol({ symbol, chain, closes, db = null, cfg = {} }) {
       shortDeltas: [putWing?.shortDelta ?? null, callWing?.shortDelta ?? null],
       ivRank: ivRank != null ? Number(ivRank.toFixed(1)) : null,
       ivHistoryN: ivN,
+      volRegime: vol.regime, volStrategy: vol.strategy,
+      volReasons: vol.reasons,
       atmIv: Number((atmIv * 100).toFixed(1)),
       rv20: Number((rv20 * 100).toFixed(1)),
       dte, expiration,

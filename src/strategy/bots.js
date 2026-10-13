@@ -89,8 +89,8 @@ export function saveBot(db, name, cfg = {}) {
   ensureBotsTables(db);
   const def = BOT_DEFS[name];
   if (!def) throw new Error(`unknown bot: ${name}`);
-  const pair = String(cfg.pair || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12);
-  if (!pair) throw new Error("pair required (e.g. XAUUSD, EURUSD, BTCUSD, SPY)");
+  const pair = String(cfg.pair || "").toUpperCase().replace(/[^A-Z0-9_.]/g, "").slice(0, 12);
+  if (!pair) throw new Error("pair required (e.g. XAUUSD, EURUSD, BTCUSD, SPY, R_100)");
   const timeframe = String(cfg.timeframe || def.defaultTimeframe);
   if (!def.timeframes.includes(timeframe)) {
     throw new Error(`${name} supports timeframes: ${def.timeframes.join(", ")}`);
@@ -131,10 +131,25 @@ function toWeekly(daily) {
   return out;
 }
 
+/** Adapt an analyzeSynth() result to the signal shape the runner executes. */
+export function synthToSignal(pair, r) {
+  return {
+    id: `sig_${pair}_${Date.now()}_sy`,
+    symbol: pair,
+    decision: ["BUY", "SELL"].includes(r.decision) ? r.decision : "WAIT",
+    confidence: r.confidence || 0,
+    entry: r.entry, sl: r.sl, tp1: r.tp, tp2: null,
+    rr: r.rr ?? null, scenario: "SYNTH",
+    reasoning: (r.reasons || []).join(" | ") + (r.maxHoldMin ? ` | time stop ${r.maxHoldMin}min` : ""),
+    timestamp: Date.now(),
+  };
+}
+
 /**
  * One runner tick. Deps injected from index.js:
- * { db, mtfAnalyze(symbol)->result, longtermAnalyze(symbol, closes)->result,
- *   fetchDaily(symbol)->closes[], getChain, scanSymbol, scanFx,
+ * { db, mtfAnalyze(symbol)->result, analyzeSynth(symbol, closes)->result,
+ *   longtermAnalyze(symbol, closes)->result, fetchDaily(symbol)->closes[],
+ *   fetchCloses(symbol, interval)->closes[], getChain, scanSymbol, scanFx,
  *   storeSignal(userId, signal), formatSignal(symbol, result),
  *   storeOptionsSignal(userId, signal), openPaper(userId, signal),
  *   executor({symbol, action, lotSize, entry, sl, tp, reason})->result,
@@ -154,8 +169,13 @@ export async function tickBots(deps) {
     db.prepare("UPDATE bots SET last_run = ? WHERE name = ?").run(now, bot.name);
     try {
       if (bot.name === "intraday") {
-        const result = await deps.mtfAnalyze(bot.pair, {});
-        const signal = deps.formatSignal(bot.pair, result);
+        // Deriv synthetics run the generator-aware engine, not the MTF trend
+        // engine — MA crossovers on RNG are coin flips minus costs.
+        const isSynth = /^R_|^1HZ|^BOOM|^CRASH|^STPRNG|^RDBULL|^RDBEAR|^JD|^GDA/.test(bot.pair);
+        const result = isSynth
+          ? synthToSignal(bot.pair, await deps.analyzeSynth(bot.pair, await deps.fetchCloses(bot.pair, "1m")))
+          : await deps.mtfAnalyze(bot.pair, {});
+        const signal = isSynth ? result : deps.formatSignal(bot.pair, result);
         const actionable = ["BUY", "SELL"].includes(signal.decision) && signal.confidence >= bot.min_confidence;
         if (actionable) {
           const exec = await deps.executor({
@@ -163,6 +183,7 @@ export async function tickBots(deps) {
             action: signal.decision === "BUY" ? "buy" : "sell",
             lotSize: 0.01, entry: signal.entry, sl: signal.sl, tp: signal.tp1,
             reason: `intraday bot ${bot.pair} ${bot.timeframe} conf=${signal.confidence}%`,
+            source: "bot:intraday",
           });
           deps.storeSignal("bot", signal);
           logRun(db, bot.name, bot.pair, bot.timeframe, signal.decision, signal.confidence, exec?.mode || "sent");
@@ -182,6 +203,7 @@ export async function tickBots(deps) {
             action: result.decision === "BUY" ? "buy" : "sell",
             lotSize: 0.01, entry: result.entry, sl: result.sl, tp: result.tp,
             reason: `longterm bot ${bot.pair} ${bot.timeframe} conf=${result.confidence}%`,
+            source: "bot:longterm",
           });
           deps.storeSignal("bot", {
             id: `sig_${bot.pair}_${Date.now()}_lt`, symbol: bot.pair, decision: result.decision,

@@ -23,6 +23,17 @@ export const FINNHUB_MAP = {
   ADAUSD: "BINANCE:ADAUSDT",
 };
 
+// US stock/ETF tickers stream under their own name (AAPL, SPY). Anything that
+// looks like a 1-5 letter ticker (plus BRK.B style) and is NOT a mapped symbol
+// resolves raw — this is what lets Alpaca-class symbols ride Finnhub when no
+// Alpaca key is set, instead of going dark.
+export function finnhubSymbol(fritSymbol) {
+  const s = String(fritSymbol || "").toUpperCase();
+  if (FINNHUB_MAP[s]) return FINNHUB_MAP[s];
+  if (/^[A-Z]{1,5}(\.[A-Z])?$/.test(s)) return s;
+  return null;
+}
+
 import { WsBase } from "./ws_base.js";
 
 export class FinnhubFeed extends WsBase {
@@ -41,8 +52,8 @@ export class FinnhubFeed extends WsBase {
 
   setSymbols(fritSymbols) {
     this.symbols = [...new Set(fritSymbols.map(s => String(s).toUpperCase()))]
-      .filter(s => FINNHUB_MAP[s]).slice(0, 45); // stay under the ~50 cap
-    this.reverse = new Map(this.symbols.map(s => [FINNHUB_MAP[s], s]));
+      .filter(s => finnhubSymbol(s)).slice(0, 45); // stay under the ~50 cap
+    this.reverse = new Map(this.symbols.map(s => [finnhubSymbol(s), s]));
     if (this.status() === "live") this._subscribeAll();
   }
 
@@ -50,7 +61,7 @@ export class FinnhubFeed extends WsBase {
 
   _subscribeAll() {
     for (const s of this.symbols) {
-      this.send({ type: "subscribe", symbol: FINNHUB_MAP[s] });
+      this.send({ type: "subscribe", symbol: finnhubSymbol(s) });
     }
     if (this.log) this.log(`[finnhub] subscribed ${this.symbols.join(",")}`);
   }
@@ -72,7 +83,7 @@ export class FinnhubFeed extends WsBase {
   // Supports every bot timeframe (1m..1w); unknown strings fall back to 30m.
   async fetchCandles(fritSymbol, interval = "30m", count = 150) {
     const sym = String(fritSymbol || "").toUpperCase();
-    const fh = FINNHUB_MAP[sym];
+    const fh = finnhubSymbol(sym);
     if (!fh || !this.fetchImpl) return null;
     const RES = {
       "1m": [60, "1"], "5m": [300, "5"], "15m": [900, "15"], "30m": [1800, "30"],

@@ -46,6 +46,26 @@ const DEFAULT_SYMBOL_COSTS = {
   XRPUSD: { spread: 0.0008, commission: 0, slippage: 0.0003 },
   DOGEUSD: { spread: 0.0004, commission: 0, slippage: 0.0002 },
   ADAUSD: { spread: 0.001, commission: 0, slippage: 0.0004 },
+  // Stock indices (MT5 CFDs). Typical retail numbers — index spreads widen
+  // fast in news/overnight; verify against YOUR broker and override via
+  // COST_OVERRIDES_JSON. Non-USD-denominated indices (GER40/EUR, UK100X/GBP,
+  // JPN225/JPY) carry FX-conversion slop the price model does not capture.
+  US30: { spread: 2.0, commission: 0, slippage: 0.5 },
+  NAS100: { spread: 1.8, commission: 0, slippage: 0.5 },
+  SPX500: { spread: 0.6, commission: 0, slippage: 0.15 },
+  GER40: { spread: 1.5, commission: 0, slippage: 0.4 },
+  UK100X: { spread: 1.8, commission: 0, slippage: 0.5 },
+  JPN225: { spread: 15, commission: 0, slippage: 4 },
+  AUS200: { spread: 2.0, commission: 0, slippage: 0.5 },
+  FRA40: { spread: 1.5, commission: 0, slippage: 0.4 },
+  EU50: { spread: 2.0, commission: 0, slippage: 0.5 },
+  US2000: { spread: 0.5, commission: 0, slippage: 0.15 },
+  USDX: { spread: 0.02, commission: 0, slippage: 0.005 },
+  // Energy CFDs. USOIL/UKOIL trade nearly 24h weekdays with a daily break;
+  // NATGAS spreads can triple in inventory news — size down Wednesdays.
+  USOIL: { spread: 0.04, commission: 0, slippage: 0.01 },
+  UKOIL: { spread: 0.05, commission: 0, slippage: 0.012 },
+  NATGAS: { spread: 0.004, commission: 0, slippage: 0.001 },
 };
 
 export const NET_RR_BLOCK = 1.0; // below this the setup is negative-expectancy by construction

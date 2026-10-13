@@ -18,8 +18,11 @@
 
 import { CandleStore } from "./candle_store.js";
 import { BinanceFeed, BINANCE_WS_MAP } from "./binance_ws.js";
-import { FinnhubFeed, FINNHUB_MAP } from "./finnhub_ws.js";
+import { FinnhubFeed, FINNHUB_MAP, finnhubSymbol } from "./finnhub_ws.js";
 import { DukascopyFeed } from "./dukascopy_poll.js";
+import { DerivFeed } from "./deriv_poll.js";
+import { AlpacaFeed } from "./alpaca_feed.js";
+import { isDerivSymbol, marketOf } from "../rails/router.js";
 
 const NEED_30M = 70;
 const NEED_4H = 40;
@@ -63,6 +66,12 @@ export class LiveFeed {
       ? new FinnhubFeed({ apiKey: this.finnhubKey, fetchImpl: this.fetchImpl, onTick: (s, p, v, t) => this.store.ingestTick(s, p, v, t), log: this.log, onStatus })
       : null;
     this.dukascopy = new DukascopyFeed({ fetchImpl: this.fetchImpl, onTick: (s, p, v, t) => this.store.ingestTick(s, p, v, t), log: this.log, onStatus });
+    // Rail clients are injected (index.js owns the shared Deriv/Alpaca
+    // instances) so feeds never construct their own connections.
+    this.makeDerivClient = deps.makeDerivClient || (() => { throw new Error("no deriv client"); });
+    this.makeAlpacaClient = deps.makeAlpacaClient || (() => { throw new Error("no alpaca client"); });
+    this.deriv = new DerivFeed({ makeClient: this.makeDerivClient, onKline: (s, iv, k) => this.store.ingestKline(s, iv, k), log: this.log, onStatus });
+    this.alpaca = new AlpacaFeed({ makeClient: this.makeAlpacaClient, onTick: (s, p, v, t) => this.store.ingestTick(s, p, v, t), log: this.log, onStatus });
 
     this.watched = new Map(); // symbol -> Set(user_id)
     this.scanning = new Set(); // symbols with an in-flight engine run
@@ -72,8 +81,7 @@ export class LiveFeed {
   }
 
   // ---- lifecycle ----
-  async start() {
-    if (!this.enabled) { this.log("[livefeed] disabled (FEED_ENABLED=0)"); return; }
+  async start() {    if (!this.enabled) { this.log("[livefeed] disabled (FEED_ENABLED=0)"); return; }
     this.log("[livefeed] starting — cache-first pricing active");
     await this.resync();
     this.binance.start();
@@ -99,6 +107,7 @@ export class LiveFeed {
     clearTimeout(this.binanceFallbackTimer);
     clearInterval(this._resyncTimer);
     this.binance.stop(); this.finnhub?.stop(); this.dukascopy.stop();
+    this.deriv.stop(); this.alpaca.stop();
   }
 
   // ---- watchlist routing ----
@@ -114,8 +123,8 @@ export class LiveFeed {
     }
     const added = [...next.keys()].filter(s => !this.watched.has(s));
     this.watched = next;
-    for (const s of added) { await this._backfill(s); await this._backfillPocket(s); }
-    this._routeAll();
+    for (const s of added) await this._backfill(s);
+    await this._routeAll();
     // REST-only safety net: symbols with no live provider (no Finnhub key and
     // Dukascopy bot-blocked from this host) refresh via budgeted REST when
     // their newest 30M candle goes stale — _needsBackfill + budget gate keep
@@ -125,28 +134,42 @@ export class LiveFeed {
     }
   }
 
-  _routeAll() {
+  async _routeAll() {
     const syms = [...this.watched.keys()];
     const binanceLive = this.binance.status() === "live";
     const finnhubLive = this.finnhub ? this.finnhub.status() === "live" : false;
+    const alpacaLive = this.alpaca.status() === "live";
+    const alpacaKeys = this.alpaca.hasKeys();
     // Dynamic failover (re-evaluated every resync, i.e. every 5 min):
     //   crypto       : Binance WS -> Finnhub WS -> REST net
     //   forex/metals : Finnhub WS -> Dukascopy poll -> REST net
+    //   synthetics   : Deriv poll (only source; keyless, free)
+    //   US stocks    : Alpaca WS (keys) -> Finnhub WS (raw tickers) ->
+    //                  Alpaca REST-delayed poll -> REST net
     // A provider that dies mid-session loses its symbols to the next tier
     // instead of leaving them dark; recovery routes them back up.
     const crypto = syms.filter(s => BINANCE_WS_MAP[s]);
+    const synth = syms.filter(s => isDerivSymbol(s));
+    const stocks = syms.filter(s => marketOf(s) === "alpaca");
+    // Alpaca feed serves stocks when live, or when nothing better exists and
+    // it can at least REST-poll (keys or not — start() picks WS vs delayed).
+    const toAlpaca = stocks.filter(s => alpacaLive || !finnhubLive);
     // Crypto prefers Binance; Finnhub takes only what Binance can't serve live.
     const fhSyms = this.finnhub
       ? [...new Set([
         ...crypto.filter(() => !binanceLive),
-        ...syms.filter(s => FINNHUB_MAP[s] && !BINANCE_WS_MAP[s] && finnhubLive),
+        ...syms.filter(s => FINNHUB_MAP[s] && !BINANCE_WS_MAP[s] && !isDerivSymbol(s) && finnhubLive),
+        ...stocks.filter(s => finnhubLive && !alpacaLive && !alpacaKeys),
       ])]
       : [];
     // Anything without a live WS tier falls to Dukascopy poll (it keeps only
-    // symbols it actually lists, via NAME_MAP).
-    const dukaSyms = syms.filter(s => !BINANCE_WS_MAP[s] && !(this.finnhub && FINNHUB_MAP[s] && finnhubLive));
+    // symbols it actually lists, via NAME_MAP). Synthetics never go here.
+    const dukaSyms = syms.filter(s => !BINANCE_WS_MAP[s] && !isDerivSymbol(s)
+      && !toAlpaca.includes(s) && !(this.finnhub && FINNHUB_MAP[s] && finnhubLive));
     this.binance.setSymbols(crypto);
     if (this.finnhub) this.finnhub.setSymbols(fhSyms);
+    this.deriv.setSymbols(synth);
+    this.alpaca.setSymbols(toAlpaca);
     const prevDuka = [...(this.dukascopy.symbols || [])].sort().join(",");
     this.dukascopy.setSymbols(dukaSyms);
     const nextDuka = [...(this.dukascopy.symbols || [])].sort().join(",");
@@ -161,11 +184,16 @@ export class LiveFeed {
     const routing = {};
     for (const s of syms) {
       routing[s] = BINANCE_WS_MAP[s] && binanceLive ? "binance-ws"
-        : (this.finnhub && FINNHUB_MAP[s] && finnhubLive) ? "finnhub-ws"
+        : isDerivSymbol(s) ? "deriv-poll"
+        : toAlpaca.includes(s) ? (this.alpaca.status() === "live" ? "alpaca-ws" : "alpaca-rest")
+        : (this.finnhub && finnhubSymbol(s) && finnhubLive) ? "finnhub-ws"
         : (this.dukascopy.symbols || []).includes(s) ? "dukascopy-poll"
         : "rest-only";
     }
     this.routing = routing;
+    // (Re)start late feeds when they gain symbols (early-return when running).
+    if (synth.length) await this.deriv.start().catch(() => {});
+    if (toAlpaca.length) { try { await this.alpaca.start(); } catch { /* ignore */ } }
   }
 
   // ---- backfill (free first, Twelve Data last, budget-guarded) ----
@@ -200,6 +228,57 @@ export class LiveFeed {
 
   async _backfill(sym) {
     if (!this._needsBackfill(sym)) return;
+    // 0. Deriv synthetics: free keyless candle history, no budget involved.
+    if (isDerivSymbol(sym)) {
+      try {
+        const client = this.makeDerivClient();
+        const [m30, h1] = await Promise.all([
+          client.candles(sym, "30m", 200).catch(() => []),
+          client.candles(sym, "1h", 200).catch(() => []),
+        ]);
+        try { client.close(); } catch { /* ignore */ }
+        if (m30?.length >= 10) {
+          // 4h history doesn't exist as native Deriv granularity — aggregate
+          // exact 4h buckets from 1h history (same OHLC math as live carving).
+          const h4 = [];
+          const byBucket = new Map();
+          for (const c of h1 || []) {
+            const b = Math.floor(c.time / 14400000) * 14400000;
+            if (!byBucket.has(b)) byBucket.set(b, []);
+            byBucket.get(b).push(c);
+          }
+          for (const [b, cs] of [...byBucket.entries()].sort((x, y) => x[0] - y[0])) {
+            cs.sort((x, y) => x.time - y.time);
+            h4.push({
+              time: b, open: cs[0].open,
+              high: Math.max(...cs.map((x) => x.high)),
+              low: Math.min(...cs.map((x) => x.low)),
+              close: cs[cs.length - 1].close, volume: 0,
+            });
+          }
+          this._seed(sym, m30, h4, "deriv");
+          this.log(`[livefeed] backfilled ${sym} via deriv (free, ${m30.length}/30m ${h4.length}/4h)`);
+          return;
+        }
+      } catch (e) { this.log(`[livefeed] deriv backfill ${sym} failed: ${e.message}`); }
+    }
+    // 0b. US stocks with Alpaca keys: IEX bars (delayed ok for seeding).
+    if (marketOf(sym) === "alpaca") {
+      try {
+        const ac = this.makeAlpacaClient();
+        if ((ac.keyId || "").length > 3) {
+          const [{ candles: m30 }, { candles: h4 }] = await Promise.all([
+            ac.bars(sym, "30m", 150).catch(() => ({ candles: [] })),
+            ac.bars(sym, "4h", 100).catch(() => ({ candles: [] })),
+          ]);
+          if (m30?.length >= 10 && h4?.length >= 10) {
+            this._seed(sym, m30, h4, "alpaca-rest-delayed");
+            this.log(`[livefeed] backfilled ${sym} via alpaca (delayed)`);
+            return;
+          }
+        }
+      } catch (e) { this.log(`[livefeed] alpaca backfill ${sym} failed: ${e.message}`); }
+    }
     // 1. Finnhub free REST (forex/stock/crypto) — 0 TD credits.
     if (this.finnhub && FINNHUB_MAP[sym]) {
       try {

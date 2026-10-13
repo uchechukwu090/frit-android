@@ -72,9 +72,10 @@ export function nextBoundaryMs(intervalSec, nowMs = Date.now()) {
 // trigger TF at/below it; all thresholds are ATR-normalized, which is what
 // makes the SAME rule adapt across timeframes instead of needing retuning.
 export const EXPIRY_PROFILES = {
-  1: { trendIv: "5m", trigIv: "1m", need: { trend: 40, trig: 5 } },
-  5: { trendIv: "15m", trigIv: "5m", need: { trend: 40, trig: 8 } },
-  15: { trendIv: "1h", trigIv: "15m", need: { trend: 40, trig: 8 } },
+  // trig need >= 23: the alignment gate reads EMA21 on the trigger TF.
+  1: { trendIv: "5m", trigIv: "1m", need: { trend: 40, trig: 25 } },
+  5: { trendIv: "15m", trigIv: "5m", need: { trend: 40, trig: 25 } },
+  15: { trendIv: "1h", trigIv: "15m", need: { trend: 40, trig: 25 } },
 };
 export function profileFor(expiryMin) {
   const keys = Object.keys(EXPIRY_PROFILES).map(Number).sort((a, b) => a - b);
@@ -91,6 +92,132 @@ function sessBucket(sym, cryptoSet) {
   if (h >= 7 && h < 12) return "london";
   if (h >= 12 && h < 17) return "ny";
   return "off";
+}
+
+// ---- pullback-vs-reversal machinery ----
+// Wilder ADX(14) + in-memory percentile ring per symbol: "strong trend" means
+// strong FOR THIS SYMBOL relative to its own recent range (a fixed ADX cutoff
+// means different things on XAUUSD vs a quiet FX pair).
+const ADX_PERIOD = 14;
+const _adxRings = new Map(); // sym -> [adx...] capped at 120
+function adxLast(candles, period = ADX_PERIOD) {
+  const n = candles.length;
+  if (n < period * 2 + 2) return null;
+  const tr = [], pdm = [], mdm = [];
+  for (let i = 1; i < n; i++) {
+    const c = candles[i], p = candles[i - 1];
+    tr.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
+    const up = c.high - p.high, dn = p.low - c.low;
+    pdm.push(up > dn && up > 0 ? up : 0);
+    mdm.push(dn > up && dn > 0 ? dn : 0);
+  }
+  const wilder = (arr) => {
+    let s = arr.slice(0, period).reduce((a, b) => a + b, 0);
+    const out = [s];
+    for (let i = period; i < arr.length; i++) { s = s - s / period + arr[i]; out.push(s); }
+    return out;
+  };
+  const trS = wilder(tr), pS = wilder(pdm), mS = wilder(mdm);
+  const dx = trS.map((t, i) => {
+    if (t === 0) return 0;
+    const dp = (pS[i] / t) * 100, dm = (mS[i] / t) * 100;
+    return dp + dm === 0 ? 0 : (Math.abs(dp - dm) / (dp + dm)) * 100;
+  });
+  if (dx.length < period) return null;
+  let a = dx.slice(0, period).reduce((x, y) => x + y, 0) / period;
+  for (let i = period; i < dx.length; i++) a = (a * (period - 1) + dx[i]) / period;
+  return a;
+}
+function adxPercentile(sym, adx) {
+  let ring = _adxRings.get(sym);
+  if (!ring) { ring = []; _adxRings.set(sym, ring); }
+  ring.push(adx);
+  if (ring.length > 120) ring.splice(0, ring.length - 120);
+  // No history yet: neutral prior (50), not weak (0) — a cold start must not
+  // masquerade as a weak trend.
+  if (ring.length < 5) return 50;
+  const below = ring.filter(v => v < adx).length;
+  return (below / ring.length) * 100;
+}
+
+// Swing pivots on the trend TF (price action, no indicator lag).
+function swingLast(candles, lookback = 3) {
+  let lastHigh = null, lastLow = null, prevLow = null, prevHigh = null;
+  let highs = 0, lows = 0;
+  for (let i = candles.length - lookback - 1; i >= lookback; i--) {
+    const c = candles[i];
+    let isH = true, isL = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      // Strict inequality: exact ties (common on smooth/low-vol prints) must
+      // not erase structure — only a strictly higher high invalidates.
+      if (candles[j].high > c.high) isH = false;
+      if (candles[j].low < c.low) isL = false;
+    }
+    if (isH && highs < 2) { if (highs === 0) lastHigh = c.high; else prevHigh = c.high; highs++; }
+    if (isL && lows < 2) { if (lows === 0) lastLow = c.low; else prevLow = c.low; lows++; }
+    if (highs >= 2 && lows >= 2) break;
+  }
+  return { lastHigh, lastLow, prevHigh, prevLow };
+}
+
+/**
+ * Healthy pullback vs real reversal, assessed on CLOSED candles at the moment
+ * the alignment gate fires (trend TF vs trigger TF disagree).
+ * @returns { verdict: "HEALTHY"|"REVERSAL"|"UNCERTAIN", retracePct, adxPct, reasons[] }
+ */
+export function assessPullback(symbol, trend, trig, trendDir /* +1 bull, -1 bear */, atr) {
+  const out = { verdict: "UNCERTAIN", retracePct: null, adxPct: null, trendDir, reasons: [] };
+  const sym = String(symbol).toUpperCase();
+  const sw = swingLast(trend);
+  const price = trig[trig.length - 1].close;
+  // Retrace depth of the last trend leg (ratio — symbol-agnostic).
+  let retrace = null;
+  if (trendDir > 0 && sw.prevLow != null && sw.lastHigh != null && sw.lastHigh !== sw.prevLow) {
+    retrace = ((sw.lastHigh - price) / (sw.lastHigh - sw.prevLow)) * 100;
+  } else if (trendDir < 0 && sw.prevHigh != null && sw.lastLow != null && sw.prevHigh !== sw.lastLow) {
+    retrace = ((price - sw.lastLow) / (sw.prevHigh - sw.lastLow)) * 100;
+  }
+  out.retracePct = retrace;
+  // Trend strength, self-relative.
+  const adx = adxLast(trend);
+  const adxPct = adx != null ? adxPercentile(sym, adx) : null;
+  out.adxPct = adxPct;
+  // Structure break: close beyond the leg extreme = the leg failed.
+  const broke = trendDir > 0
+    ? (sw.lastHigh != null && price > sw.lastHigh)
+    : (sw.lastLow != null && price < sw.lastLow);
+  const lastTrig = trig[trig.length - 1];
+  const counterBody = Math.abs(lastTrig.close - lastTrig.open) / (atr || 1);
+  const thrust = counterBody > 0.8; // violent counter-candle = reversal energy
+
+  if (broke) {
+    out.verdict = "REVERSAL";
+    out.reasons.push("structure break: price took out the trend-leg extreme — the leg failed, not a pullback");
+    return out;
+  }
+  if (retrace != null && retrace > 61.8) {
+    out.verdict = thrust ? "REVERSAL" : "UNCERTAIN";
+    out.reasons.push(`deep retrace ${retrace.toFixed(0)}% past 61.8% — ${thrust ? "with thrust: reversal likely" : "too deep to trust, too intact to call dead"}`);
+    return out;
+  }
+  let score = 0;
+  const notes = [];
+  if (adxPct != null && adxPct >= 55) { score += 2; notes.push(`trend strong for this pair (ADX pct ${adxPct.toFixed(0)})`); }
+  else if (adxPct != null && adxPct <= 35) { score -= 2; notes.push(`trend weak for this pair (ADX pct ${adxPct.toFixed(0)})`); }
+  if (retrace != null && retrace <= 50) { score += 2; notes.push(`shallow retrace ${retrace.toFixed(0)}% — profit-taking, not a turn`); }
+  else if (retrace == null) { notes.push("no clean swing leg to measure — cannot confirm health"); }
+  if (!thrust) { score += 1; notes.push("quiet counter-move (no thrust candle)"); }
+  else { score -= 2; notes.push("thrust counter-candle — reversal energy"); }
+  out.reasons.push(...notes);
+  out.verdict = score >= 3 ? "HEALTHY" : score <= -1 ? "REVERSAL" : "UNCERTAIN";
+  return out;
+}
+
+// Max trig-candles a pullback arm stays valid, per expiry.
+export const PB_MAX_WAIT = { 1: 6, 5: 4, 15: 3 };
+export function trigMinutes(trigIv) {
+  return { "1m": 1, "5m": 5, "15m": 15 }[trigIv] || 5;
 }
 
 /**
@@ -129,6 +256,31 @@ export function signalFromCandles(symbol, trend, trig, opts = {}) {
   const dir = bull ? "CALL" : "PUT";
   const sgn = bull ? 1 : -1;
 
+  // ALIGNMENT GATE (the counter-trend fix): the trigger timeframe's own
+  // EMA9/21 must point the same way as the trend timeframe. A with-trend
+  // candle body printed against a counter-trend trigger structure is a
+  // pullback bounce — fixed-expiry cannot survive it, so we stand down
+  // instead of trading it. Never flip, never chase.
+  const tCloses = trig.map(c => c.close);
+  const te9 = emaLast(tCloses, EMA_FAST);
+  const te21 = emaLast(tCloses, EMA_SLOW);
+  if (te9 != null && te21 != null && te9 !== te21) {
+    const trigBull = te9 > te21;
+    if ((bull && !trigBull) || (bear && trigBull)) {
+      // Counter-trend: don't just WAIT — diagnose pullback vs reversal so the
+      // caller can arm a completion entry or confirm the turn.
+      const pb = assessPullback(sym, trend, trig, sgn, atr);
+      out.pullback = pb;
+      out.reasons.push(
+        `counter-trend: ${prof.trendIv} ${bull ? "bullish" : "bearish"} but ${prof.trigIv} ${trigBull ? "bullish" : "bearish"} — pullback in progress, stand down (never trade the bounce)`,
+        `pullback read: ${pb.verdict}${pb.retracePct != null ? ` (retrace ${pb.retracePct.toFixed(0)}%)` : ""}${pb.adxPct != null ? `, trend ADX pct ${pb.adxPct.toFixed(0)}` : ""}`,
+        ...pb.reasons
+      );
+      return out;
+    }
+    out._aligned = true;
+  }
+
   const sess = sessionOk(sym, cryptoSet);
   if (!sess.ok) { out.reasons.push(sess.reason); return out; }
 
@@ -141,6 +293,7 @@ export function signalFromCandles(symbol, trend, trig, opts = {}) {
   let conf = 55;
   const reasons = [
     `${prof.trendIv} trend ${bull ? "bullish" : "bearish"} (EMA9 ${bull ? ">" : "<"} EMA21)`,
+    `${prof.trendIv}+${prof.trigIv} aligned — no counter-trend pullback overhead`,
     `last ${prof.trigIv} body ${(body / atr).toFixed(2)}x ATR with trend`,
     sess.reason,
   ];
@@ -194,6 +347,31 @@ export function signalFromCandles(symbol, trend, trig, opts = {}) {
   return out;
 }
 
+/** Pullback arms: HEALTHY-pullback completions waiting for re-alignment. */
+export function upsertArm(db, { symbol, expiryMin, direction, setupKey, expiresTs, note }) {
+  ensurePocketTables(db);
+  try {
+    db.prepare(`
+      INSERT INTO pocket_arms (symbol, expiry_min, direction, setup_key, armed_ts, expires_ts, note)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(symbol, expiry_min) DO UPDATE SET direction = ?, setup_key = ?, armed_ts = ?, expires_ts = ?, note = ?
+    `).run(symbol, expiryMin, direction, setupKey || null, Date.now(), expiresTs, note || null,
+      direction, setupKey || null, Date.now(), expiresTs, note || null);
+  } catch { /* ignore */ }
+}
+export function getArm(db, symbol, expiryMin) {
+  ensurePocketTables(db);
+  try {
+    const r = db.prepare("SELECT * FROM pocket_arms WHERE symbol = ? AND expiry_min = ?").get(symbol, expiryMin);
+    if (!r) return null;
+    if (r.expires_ts <= Date.now()) { clearArm(db, symbol, expiryMin); return null; }
+    return r;
+  } catch { return null; }
+}
+export function clearArm(db, symbol, expiryMin) {
+  try { db.prepare("DELETE FROM pocket_arms WHERE symbol = ? AND expiry_min = ?").run(symbol, expiryMin); } catch { /* ignore */ }
+}
+
 /** Read calibration for a setup bucket. */
 export function calibFor(db, setupKey) {
   try {
@@ -226,6 +404,16 @@ export function ensurePocketTables(db) {
       n INTEGER DEFAULT 0,
       wins INTEGER DEFAULT 0,
       updated_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS pocket_arms (
+      symbol TEXT NOT NULL,
+      expiry_min INTEGER NOT NULL,
+      direction TEXT NOT NULL,
+      setup_key TEXT,
+      armed_ts INTEGER NOT NULL,
+      expires_ts INTEGER NOT NULL,
+      note TEXT,
+      PRIMARY KEY (symbol, expiry_min)
     );
   `);
   // Migration for DBs created before setup_key / calib existed.

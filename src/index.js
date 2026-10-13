@@ -13,7 +13,9 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { MTFStrategyEngine } from "./strategy/engine.js";
 import { LiveFeed } from "./strategy/feed/live_feed.js";
-import { signalFromCandles, recordPaper, settleOpen, pocketStats, ensurePocketTables, nextBoundaryMs, profileFor, calibFor } from "./strategy/pocket/engine.js";
+import { signalFromCandles, recordPaper, settleOpen, pocketStats, ensurePocketTables, nextBoundaryMs, profileFor, calibFor, upsertArm, getArm, clearArm, trigMinutes, PB_MAX_WAIT } from "./strategy/pocket/engine.js";
+import { DerivClient, DerivExecutor } from "./strategy/deriv.js";
+import { AlpacaClient, AlpacaExecutor, qtyForRisk } from "./strategy/alpaca.js";
 import { TradeTaskScheduler } from "./strategy/scheduler.js";
 import { PositionMonitor } from "./strategy/position_monitor.js";
 import { PullbackJournal } from "./strategy/journal.js";
@@ -22,8 +24,11 @@ import { getSymbolCost, costToUsd } from "./strategy/costs.js";
 import { getChain, fetchDailyCloses } from "./strategy/options/chains.js";
 import { scanSymbol, ensureOptionsTables } from "./strategy/options/scanner.js";
 import { analyzeLongterm } from "./strategy/longterm.js";
+import { analyzeSynth } from "./strategy/synthetics.js";
 import { getBots, saveBot, tickBots, BOT_DEFS } from "./strategy/bots.js";
+import { marketOf, canonicalSymbol, isDerivSymbol } from "./strategy/rails/router.js";
 import { openPaperPosition, resolvePaperBook, ledgerSummary } from "./strategy/options/paper.js";
+import { maturitySummary } from "./strategy/ledger.js";
 import { runBacktest, walkForward } from "./strategy/options/backtest.js";
 import { scanFx } from "./strategy/options/fx.js";
 import { deepSearch } from "./deep_search.js";
@@ -577,6 +582,17 @@ const FEED_BACKFILL_BUDGET = Number(process.env.FEED_BACKFILL_BUDGET || 200);
 const POCKET_ENABLED = process.env.POCKET_ENABLED !== "0";
 const POCKET_EXPIRY_MIN = Number(process.env.POCKET_EXPIRY_MIN || 5);
 const POCKET_PAYOUT = Number(process.env.POCKET_PAYOUT || 0.8); // broker payout assumption for stats
+// Deriv execution (Rise/Fall). DEMO default: DERIV_DEMO_TOKEN active.
+// Real money requires BOTH DERIV_REAL_TOKEN and DERIV_LIVE=1 — otherwise a
+// real token is refused at the executor. Auto-execution itself needs
+// POCKET_DERIV_AUTO=1 (default 0 = signals + paper only).
+const DERIV_APP_ID = process.env.DERIV_APP_ID || "1089";
+const DERIV_LIVE = process.env.DERIV_LIVE === "1";
+const DERIV_DEMO_TOKEN = process.env.DERIV_DEMO_TOKEN || "";
+const DERIV_REAL_TOKEN = process.env.DERIV_REAL_TOKEN || "";
+const POCKET_DERIV_AUTO = process.env.POCKET_DERIV_AUTO !== "0"; // demo auto by default (virtual funds only — real needs DERIV_LIVE=1)
+const POCKET_DERIV_STAKE = Number(process.env.POCKET_DERIV_STAKE || 1);
+const POCKET_DERIV_MAX_DAY = Number(process.env.POCKET_DERIV_MAX_DAY || 20);
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
 // The sandbox service requires its own auth token. The AI never sees this —
 // the server attaches it when forwarding run_code calls.
@@ -1892,12 +1908,12 @@ const SUB_TIERS = {
   starter: { usd: 5.55, naira_kobo: 750000, days: 30, credits_mo: 800, features: ["chat", "automation", "agent", "market_data"] },
   creator: { usd: 12.22, naira_kobo: 1650000, days: 30, credits_mo: 1500, features: ["chat", "image", "video", "voice", "creative", "market_data"] },
   trader: { usd: 8.8, naira_kobo: 1200000, days: 30, credits_mo: 1200, features: ["chat", "trading", "market_data"] },
-  pro: { usd: 25.93, naira_kobo: 3500000, days: 30, credits_mo: 3500, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data"] },
+  pro: { usd: 25.93, naira_kobo: 3500000, days: 30, credits_mo: 3500, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data", "pocket"] },
   // Tester: full Pro-level caps for trial runs. NOT purchasable (subscribe
   // blocks it) — only via admin-minted codes (/billing/mint). Granted duration
   // comes from SUB_TIERS days at REDEEM time (see /billing/redeem).
-  tester: { usd: 0, naira_kobo: 0, days: 7, credits_mo: 3500, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data"] },
-  owner: { usd: 0, naira_kobo: 0, days: 365000, credits_mo: 999999, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data"] },
+  tester: { usd: 0, naira_kobo: 0, days: 7, credits_mo: 3500, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data", "pocket"] },
+  owner: { usd: 0, naira_kobo: 0, days: 365000, credits_mo: 999999, features: ["chat", "image", "video", "voice", "creative", "trading", "automation", "agent", "market_data", "pocket"] },
 };
 export const TIER_ORDER = ["free", "starter", "creator", "trader", "pro", "tester", "owner"];
 export const YEARLY_MULT = 10; // annual = 10x monthly (2 months free)
@@ -1934,7 +1950,7 @@ export const CREDIT_COSTS = {
 export const FEATURE_CHARGE = {
   chat: "turn", image: "image", video: "clip", voice: "avatar",
   creative: "creative", trading: "trade_analysis", automation: "turn",
-  agent: "agent_task", market_data: "market_data",
+  agent: "agent_task", market_data: "market_data", pocket: "market_data",
 };
 // Feature flags per plan (for UI display and server-side gating).
 export const FEATURE_LABELS = {
@@ -1947,6 +1963,7 @@ export const FEATURE_LABELS = {
   automation: "Phone automation",
   agent: "Advanced agent",
   market_data: "Market data",
+  pocket: "Pocket fixed-expiry signals",
 };
 // Live USD->NGN (keyless er-api, 6h cache, falls back to 1500).
 let _fxCache = { rate: 1500, exp: 0 };
@@ -2228,10 +2245,58 @@ async function fetchCandles(symbol, interval = "1h", outputsize = null) {
   const cached = cacheGet(ck);
   if (cached) return cached;
 
+  // Deriv synthetics: free keyless candle history (no budget, no key).
+  // Anonymous client (no token): tick() needs no auth.
+  if (isDerivSymbol(sym)) {
+    try {
+      const dc = new DerivClient({ token: "" });
+      // NOTE: iv arrives NORMALIZED (normalizeInterval: "1m"->"1min").
+      const tf = ({ "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m", "1h": "1h", "4h": "4h", "1day": "1d", "1week": "1w" })[iv] || "30m";
+      const candles = await dc.candles(sym, tf, Math.min(size, 500));
+      try { dc.close(); } catch { /* ignore */ }
+      if (candles.length >= 10) {
+        cacheSet(ck, candles, 60000);
+        return candles;
+      }
+    } catch (e) { console.error("[Deriv candles]", sym, e.message); }
+  }
+
+  // US stocks/ETFs: Alpaca bars when keyed, else Finnhub stock/candle.
+  if (marketOf(sym) === "alpaca") {
+    try {
+      const ac = new AlpacaClient({ keyId: ALPACA_PAPER_KEY, secret: ALPACA_PAPER_SECRET, paper: true, fetchImpl: fetch });
+      if (ac.configured) {
+        const tf = ({ "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m", "1h": "1H", "4h": "4H", "1day": "1D", "1week": "1W" })[iv] || "30m";
+        const r = await ac.bars(sym, tf, Math.min(size, 300));
+        if (!r.error && r.candles?.length >= 10) {
+          cacheSet(ck, r.candles, 60000);
+          return r.candles;
+        }
+      }
+    } catch (e) { console.error("[Alpaca candles]", sym, e.message); }
+    if (FINNHUB_KEY) {
+      try {
+        const res = ({ "1min": "1", "5min": "5", "15min": "15", "30min": "30", "1h": "60", "4h": "240", "1day": "D", "1week": "W" })[iv] || "30";
+        const to = Math.floor(Date.now() / 1000);
+        const from = to - 86400 * 400;
+        const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(sym)}&resolution=${res}&from=${from}&to=${to}&token=${FINNHUB_KEY}`;
+        const r2 = await fetch(url);
+        const d = await r2.json();
+        if (d.s === "ok" && Array.isArray(d.c) && d.c.length >= 10) {
+          const candles = d.c.map((c, i) => ({
+            time: d.t[i] * 1000, open: d.o[i], high: d.h[i], low: d.l[i],
+            close: c, volume: (d.v && d.v[i]) || 0,
+          }));
+          cacheSet(ck, candles, 60000);
+          return candles;
+        }
+      } catch (e) { console.error("[Finnhub stock candles]", sym, e.message); }
+    }
+  }
+
   // Crypto goes to Binance FIRST (free, no key, ~1200 req/min) so it never
   // touches the TwelveData quota, which forex/XAU/XAG rely on exclusively.
-  if (CRYPTO_SET.has(sym) && BINANCE_SYM[sym]) {
-    try {
+  if (CRYPTO_SET.has(sym) && BINANCE_SYM[sym]) {    try {
       const url = `https://api.binance.com/api/v3/klines?symbol=${BINANCE_SYM[sym]}&interval=${toBinanceInterval(iv)}&limit=${Math.min(size, 1000)}`;
       const res = await fetch(url);
       const arr = await res.json();
@@ -2286,6 +2351,38 @@ async function fetchSpotPrice(symbol) {
     }
   } catch { /* fall through to REST */ }
   let result = null;
+
+  // Deriv synthetics tick (keyless) — also feeds the position monitor.
+  // Anonymous client (no token): tick() needs no auth.
+  if (!result && isDerivSymbol(sym)) {
+    try {
+      const dc = new DerivClient({ token: "" });
+      const px = await dc.tick(sym);
+      try { dc.close(); } catch { /* ignore */ }
+      if (px > 0) result = { price: px, source: "deriv" };
+    } catch (e) { console.error("[Deriv spot]", sym, e.message); }
+  }
+
+  // US stocks: Alpaca quote when keyed, else Finnhub quote.
+  if (!result && marketOf(sym) === "alpaca") {
+    try {
+      const ac = new AlpacaClient({ keyId: ALPACA_PAPER_KEY, secret: ALPACA_PAPER_SECRET, paper: true, fetchImpl: fetch });
+      if (ac.configured) {
+        const q = await ac.quote(sym);
+        if (!q.error) {
+          const mid = q.bid > 0 && q.ask > 0 ? (q.bid + q.ask) / 2 : 0;
+          if (mid > 0) result = { price: mid, source: "alpaca-delayed" };
+        }
+      }
+    } catch (e) { console.error("[Alpaca spot]", sym, e.message); }
+    if (!result && FINNHUB_KEY) {
+      try {
+        const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`);
+        const data = await res.json();
+        if (data.c > 0) result = { price: data.c, source: "finnhub" };
+      } catch (e) { console.error("[Finnhub spot]", sym, e.message); }
+    }
+  }
 
   // Crypto: CoinGecko first (free, no key) so crypto spot checks never touch
   // the TwelveData quota either — same reasoning as fetchCandles above.
@@ -2471,7 +2568,46 @@ const PIP_CONFIG = {
   XRPUSD: { pipSize: 0.0001, pipValue: 1, isCrypto: true },
   DOGEUSD: { pipSize: 0.00001, pipValue: 1, isCrypto: true },
   ADAUSD: { pipSize: 0.00001, pipValue: 1, isCrypto: true },
+  // Stock indices: $1 per point per 1.0 lot is the common retail MT5 contract
+  // (size 1). Non-USD indices (GER40/EUR, UK100X/GBP, JPN225/JPY) are quoted
+  // here in USD terms — a documented approximation; fix YOUR broker's exact
+  // values with PIP_OVERRIDES_JSON (same shape, e.g. {"US30":{"pipValue":2}}).
+  US30: { pipSize: 1, pipValue: 1 },
+  NAS100: { pipSize: 1, pipValue: 1 },
+  SPX500: { pipSize: 1, pipValue: 1 },
+  GER40: { pipSize: 1, pipValue: 1 },
+  UK100X: { pipSize: 1, pipValue: 1 },
+  JPN225: { pipSize: 1, pipValue: 1 },
+  AUS200: { pipSize: 1, pipValue: 1 },
+  FRA40: { pipSize: 1, pipValue: 1 },
+  EU50: { pipSize: 1, pipValue: 1 },
+  US2000: { pipSize: 1, pipValue: 1 },
+  USDX: { pipSize: 0.01, pipValue: 10 },
+  // Energy: assumes 1000-bbl USOIL/UKOIL lots ($1000 per $1 move) and 10k-mmBtu
+  // NATGAS ($10 per 0.001). Many retail brokers sell 100-bbl minis instead —
+  // verify YOUR contract size before live size, override with PIP_OVERRIDES_JSON.
+  USOIL: { pipSize: 0.01, pipValue: 10 },
+  UKOIL: { pipSize: 0.01, pipValue: 10 },
+  NATGAS: { pipSize: 0.001, pipValue: 10 },
 };
+
+// Broker-specific corrections without editing code:
+//   PIP_OVERRIDES_JSON='{"US30":{"pipSize":1,"pipValue":2},"GER40":{"pipValue":1.1}}'
+try {
+  const raw = process.env.PIP_OVERRIDES_JSON;
+  if (raw) {
+    const parsed = JSON.parse(raw);
+    for (const [k, v] of Object.entries(parsed)) {
+      const sym = String(k).toUpperCase();
+      if (v && typeof v === "object" && PIP_CONFIG[sym]) {
+        PIP_CONFIG[sym] = { ...PIP_CONFIG[sym], ...v };
+        console.log(`[PIP] override ${sym}:`, JSON.stringify(PIP_CONFIG[sym]));
+      }
+    }
+  }
+} catch (e) {
+  console.warn("[PIP] PIP_OVERRIDES_JSON parse failed:", e.message);
+}
 
 function calculateLotSize({ symbol, balance, riskPercent = 1, entry, stopLoss }) {
   const sym = String(symbol || "").toUpperCase();
@@ -2952,6 +3088,9 @@ const liveFeed = new LiveFeed({
   enabled: FEED_ENABLED,
   backfillBudget: FEED_BACKFILL_BUDGET,
   pocketEnabled: POCKET_ENABLED,
+  // Shared rail clients (defined below; arrows resolve at call time, post-boot).
+  makeDerivClient: () => derivClient,
+  makeAlpacaClient: () => alpacaPaper,
   log: (...a) => console.log(...a),
   onCandleClose: (sym, interval) => { try { pocketOnClose(sym, interval); } catch (e) { console.warn("[pocket] close hook:", e.message); } },
 });
@@ -2987,6 +3126,28 @@ function pocketScan(sym, expiryMin = POCKET_EXPIRY_MIN) {
   return signalFromCandles(sym, trend, trig, { ...base, calib });
 }
 
+function pocketFanOut(sym, signal) {
+  // Dedupe: one paper per symbol+expiry per expiry window (system row gates
+  // the per-user fan-out).
+  try {
+    const last = db.prepare(
+      "SELECT entry_ts FROM pocket_paper WHERE user_id = '__pocket__' AND symbol = ? AND expiry_min = ? ORDER BY entry_ts DESC LIMIT 1"
+    ).get(sym, signal.expiryMin);
+    if (last && Date.now() - last.entry_ts < signal.expiryMin * 60_000) return false;
+  } catch { /* ignore */ }
+  recordPaper(db, { userId: "__pocket__", signal, payout: POCKET_PAYOUT });
+  let watchers = [];
+  try {
+    watchers = db.prepare("SELECT user_id FROM trading_watchlist WHERE symbol = ? AND is_enabled = 1").all(sym);
+  } catch { /* ignore */ }
+  for (const w of watchers) {
+    recordPaper(db, { userId: w.user_id, signal, payout: POCKET_PAYOUT });
+  }
+  // Live execution (Deriv demo by default; auto flag + caps enforced inside).
+  pocketDerivExecute(sym, signal).catch(() => {});
+  return true;
+}
+
 function pocketOnClose(sym, interval) {
   if (!POCKET_ENABLED) return;
   // Scan on trigger-TF closes (1m/5m/15m are the v2 trigger timeframes).
@@ -2995,24 +3156,44 @@ function pocketOnClose(sym, interval) {
     const prof = profileFor(expiryMin);
     if (prof.trigIv !== interval) continue;
     const signal = pocketScan(sym, expiryMin);
-    if (signal.decision !== "CALL" && signal.decision !== "PUT") continue;
-    // Dedupe: one paper per symbol+expiry per expiry window (system row gates
-    // the per-user fan-out).
-    try {
-      const last = db.prepare(
-        "SELECT entry_ts FROM pocket_paper WHERE user_id = '__pocket__' AND symbol = ? AND expiry_min = ? ORDER BY entry_ts DESC LIMIT 1"
-      ).get(sym, signal.expiryMin);
-      if (last && Date.now() - last.entry_ts < signal.expiryMin * 60_000) continue;
-    } catch { /* ignore */ }
-    recordPaper(db, { userId: "__pocket__", signal, payout: POCKET_PAYOUT });
-    let watchers = [];
-    try {
-      watchers = db.prepare("SELECT user_id FROM trading_watchlist WHERE symbol = ? AND is_enabled = 1").all(sym);
-    } catch { /* ignore */ }
-    for (const w of watchers) {
-      recordPaper(db, { userId: w.user_id, signal, payout: POCKET_PAYOUT });
+    const arm = getArm(db, sym, signal.expiryMin);
+
+    // 1. PULLBACK COMPLETION: an armed healthy pullback just re-aligned —
+    //    this is the highest-quality entry (trend + completed pullback).
+    if (arm && (signal.decision === "CALL" || signal.decision === "PUT") && signal.decision === arm.direction) {
+      const pb = { ...signal, setupKey: `${signal.setupKey || `${sym}|${signal.expiryMin}m`}|pb` };
+      pb.reasons = [...signal.reasons, `pullback COMPLETED: armed ${new Date(arm.armed_ts).toISOString().slice(11, 16)}GMT, trigger re-aligned with trend`];
+      if (pocketFanOut(sym, pb)) {
+        clearArm(db, sym, signal.expiryMin);
+        console.log(`[pocket] ${pb.decision} ${sym} conf=${pb.confidence} expiry=${pb.expiryMin}m PULLBACK-COMPLETION`);
+      }
+      continue;
     }
-    console.log(`[pocket] ${signal.decision} ${sym} conf=${signal.confidence} expiry=${signal.expiryMin}m`);
+    // Stale/opposite arm dies silently — never traded against.
+    if (arm && signal.decision !== "WAIT" && signal.decision !== arm.direction) {
+      clearArm(db, sym, signal.expiryMin);
+    }
+
+    // 2. IMMEDIATE aligned entries.
+    if (signal.decision === "CALL" || signal.decision === "PUT") {
+      if (pocketFanOut(sym, signal)) {
+        clearArm(db, sym, signal.expiryMin);
+        console.log(`[pocket] ${signal.decision} ${sym} conf=${signal.confidence} expiry=${signal.expiryMin}m`);
+      }
+      continue;
+    }
+
+    // 3. ARM on healthy pullbacks (no trade now — wait for re-alignment).
+    if (signal.pullback?.verdict === "HEALTHY") {
+      const dir = signal.pullback.trendDir > 0 ? "CALL" : "PUT";
+      const waitN = PB_MAX_WAIT[signal.expiryMin] || 4;
+      upsertArm(db, {
+        symbol: sym, expiryMin: signal.expiryMin, direction: dir,
+        setupKey: signal.setupKey || null,
+        expiresTs: Date.now() + waitN * trigMinutes(prof.trigIv) * 60_000,
+        note: `healthy pullback (retrace ${signal.pullback.retracePct?.toFixed(0) ?? "?"}%) — awaiting ${prof.trigIv} re-alignment`,
+      });
+    }
   }
 }
 
@@ -3023,6 +3204,79 @@ setInterval(() => {
     if (r.settled) console.log(`[pocket] settled ${r.settled}`);
   } catch (e) { console.warn("[pocket] settle failed:", e.message); }
 }, 20_000).unref?.();
+
+// ==================== DERIV EXECUTION (demo default, real locked) ====================
+const _derivToken = DERIV_LIVE && DERIV_REAL_TOKEN ? DERIV_REAL_TOKEN : DERIV_DEMO_TOKEN;
+const derivClient = new DerivClient({
+  token: _derivToken, appId: DERIV_APP_ID,
+  log: (...a) => console.log(...a),
+});
+const derivExecutor = new DerivExecutor({
+  db, client: derivClient,
+  liveAllowed: DERIV_LIVE, stake: POCKET_DERIV_STAKE, maxPerDay: POCKET_DERIV_MAX_DAY,
+  log: (...a) => console.log(...a),
+});
+if (DERIV_REAL_TOKEN && !DERIV_LIVE) {
+  console.log("[deriv] REAL token present but DERIV_LIVE!=1 — demo mode active, real refused");
+}
+if (!DERIV_DEMO_TOKEN && !DERIV_REAL_TOKEN) {
+  console.log("[deriv] no token — signals + paper only. Paste DERIV_DEMO_TOKEN from your Deriv demo account to enable execution.");
+}
+if (POCKET_DERIV_AUTO) console.log("[deriv] AUTO-EXECUTION ENABLED — pocket signals will buy Rise/Fall contracts");
+
+// ==================== ALPACA (stocks + crypto spot, paper default) ====================
+const ALPACA_PAPER_KEY = process.env.ALPACA_PAPER_KEY || "";
+const ALPACA_PAPER_SECRET = process.env.ALPACA_PAPER_SECRET || "";
+const ALPACA_LIVE_KEY = process.env.ALPACA_LIVE_KEY || "";
+const ALPACA_LIVE_SECRET = process.env.ALPACA_LIVE_SECRET || "";
+const ALPACA_LIVE = process.env.ALPACA_LIVE === "1";
+const ALPACA_AUTO = process.env.ALPACA_AUTO !== "0"; // paper auto by default (virtual); live needs flag
+const ALPACA_NOTIONAL = Number(process.env.ALPACA_NOTIONAL || 50);
+const ALPACA_MAX_DAY = Number(process.env.ALPACA_MAX_DAY || 20);
+const alpacaPaper = new AlpacaClient({ keyId: ALPACA_PAPER_KEY, secret: ALPACA_PAPER_SECRET, paper: true, fetchImpl: fetch });
+const alpacaLive = new AlpacaClient({ keyId: ALPACA_LIVE_KEY, secret: ALPACA_LIVE_SECRET, paper: false, fetchImpl: fetch });
+const alpacaExecutor = new AlpacaExecutor({
+  db, paperClient: alpacaPaper, liveClient: alpacaLive,
+  liveAllowed: ALPACA_LIVE, notional: ALPACA_NOTIONAL, maxPerDay: ALPACA_MAX_DAY,
+  log: (...a) => console.log(...a),
+});
+if (ALPACA_LIVE_KEY && !ALPACA_LIVE) console.log("[alpaca] LIVE keys present but ALPACA_LIVE!=1 — paper mode");
+if (!ALPACA_PAPER_KEY) console.log("[alpaca] no paper keys — stock signals stay paper-ledged. Add ALPACA_PAPER_KEY/SECRET (free, email signup).");
+
+// Deriv fills + broker-truth settlement into the shared monitor.
+async function pocketDerivExecute(sym, signal) {
+  if (!POCKET_DERIV_AUTO) return;
+  try {
+    const openN = derivExecutor.status().openContracts;
+    if (openN >= 5) { console.log(`[deriv] ${openN} open — skipping ${sym} (concurrency cap)`); return; }
+    const action = signal.decision === "CALL" ? "buy" : "sell";
+    const pos = positionMonitor.register({
+      symbol: sym, action, lotSize: derivExecutor.stake,
+      entry: signal.entryRef ?? null, sl: null, tp: null,
+      source: "pocket-deriv", reason: `pocket ${signal.decision} ${sym} ${signal.expiryMin}m conf=${signal.confidence}`,
+    });
+    const r = await derivExecutor.execute({
+      symbol: sym, direction: signal.decision,
+      durationMin: signal.expiryMin, positionId: pos?.id || null,
+    });
+    if (!r.ok && pos?.id) {
+      try { positionMonitor.resolve(pos.id, "cancelled", null, `deriv refused: ${r.why}`); } catch { /* ignore */ }
+    }
+  } catch (e) { console.warn("[deriv] execute failed:", e.message); }
+}
+
+setInterval(async () => {
+  try {
+    const r = await derivExecutor.settleOpen(async (pid, outcome, px, note) => {
+      try { positionMonitor.resolve(pid, outcome, px, note); } catch { /* ignore */ }
+    });
+    if (r.settled) console.log(`[deriv] settled ${r.settled} contract(s) on broker outcome`);
+  } catch (e) { console.warn("[deriv] settle failed:", e.message); }
+  try {
+    const s = await alpacaExecutor.syncFills();
+    if (s.synced) console.log(`[alpaca] synced ${s.synced} fill(s)`);
+  } catch (e) { console.warn("[alpaca] sync failed:", e.message); }
+}, 15_000).unref?.();
 
 // Every 30 min, replay 30M candles and resolve journaled setups (win/loss/
 // expired). Only symbols with pending rows cost API calls; engine + fetch
@@ -3044,20 +3298,104 @@ function riskGate({ symbol, action, lotSize, entry, sl, balance }) {
 
 // Recurring "everyday analyze XAUUSD" tasks — paper-first by design.
 // Shared trade executor: every auto path (/trade, scheduler, bots) funnels
-// through the risk gate + bridge + position monitor. No bypasses.
-async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual" }) {
-  const gate = riskGate({ symbol, action, lotSize, entry, sl, balance: 1000 });
+// through rail routing + risk gate + execution + position monitor. No bypasses.
+//
+// Rails: deriv synthetics -> Deriv MULT (stake = max loss by construction);
+// US stocks/ETFs -> Alpaca bracket (native TP/SL, clock-gated, dollar-sized);
+// everything else -> MT5 bridge (existing behavior, paper while unset).
+// riskUsdOverride is ALWAYS set for deriv/alpaca so the per-trade cap can
+// never be silently skipped for lack of a PIP row.
+async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual", balance = 1000, riskPercent = 1 }) {
+  const sym = canonicalSymbol(symbol);
+  const rail = marketOf(sym);
+  const riskBudget = Math.max(0.5, (Number(balance) || 1000) * (Number(riskPercent) || 1) / 100);
+  if (rail === "deriv") return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget });
+  if (rail === "alpaca") return executeAlpacaTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget });
+  const gate = riskGate({ symbol: sym, action, lotSize, entry, sl, balance });
   if (!gate.allowed) {
-    console.log(`[executor] RISK-BLOCKED ${symbol}: ${gate.reasons.join(" | ")}`);
+    console.log(`[executor] RISK-BLOCKED ${sym}: ${gate.reasons.join(" | ")}`);
     return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
   }
-  const result = await sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason });
+  // No MT5 bridge (no VPS yet): Deriv MULT covers whatever it lists — the
+  // executor verifies MULT availability per symbol, so the only trades that
+  // stay paper are ones no connected broker supports. MT5 bridge wins back
+  // automatically the moment MT5_BRIDGE_URL is set.
+  if (!MT5_BRIDGE_URL) {
+    return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget });
+  }
+  const result = await sendToMT5Bridge({ symbol: sym, action, lotSize, entry, sl, tp, reason });
   if (result.status !== "failed" && sl && tp) {
     try {
-      positionMonitor.register({ symbol, action, lotSize, entry, sl, tp, source, reason });
+      positionMonitor.register({ symbol: sym, action, lotSize, entry, sl, tp, source, reason });
     } catch (e) { console.warn("[PositionMonitor] register failed:", e.message); }
   }
   return result;
+}
+
+/** Deriv MULT execution. take_profit/stop_loss are dollar approximations
+ *  (moveRatio x multiplier x stake at the default x100); Deriv prices the
+ *  proposal exactly and the native contract levels enforce the exit. */
+async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget }) {
+  const stake = Math.max(0.5, Math.min(1000, Number(riskBudget) || 5));
+  const direction = String(action).toLowerCase() === "sell" ? "sell" : "buy";
+  const e = Number(entry);
+  const mult = Number(process.env.DERIV_MULTIPLIER) || 100;
+  const takeProfit = e > 0 && tp != null ? +((Math.abs(tp - e) / e) * mult * stake).toFixed(2) : null;
+  const stopLoss = e > 0 && sl != null ? +Math.min((Math.abs(e - sl) / e) * mult * stake, stake).toFixed(2) : null;
+  const gate = riskGate({ symbol, action: direction, lotSize: 0, entry, sl, balance: 1000, riskUsdOverride: stake });
+  if (!gate.allowed) {
+    return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
+  }
+  let result;
+  try {
+    const r = await derivExecutor.executeMult
+      ? await derivExecutor.executeMult({ symbol, direction, stake, multiplier: mult, takeProfit, stopLoss })
+      : { ok: false, why: "mult path unavailable" };
+    if (!r.ok) throw new Error(r.why || "deriv refused");
+    result = { mode: r.mode === "REAL" ? "deriv-live" : "deriv-demo", status: "sent", symbol, action: direction, stake, contract_id: r.contract_id, tp, sl, reason };
+    try {
+      const pos = positionMonitor.register({ symbol, action: direction, lotSize: stake, entry, sl, tp, source: `${source}:${result.mode}`, reason });
+      r.positionId = pos?.id;
+    } catch (e) { console.warn("[PositionMonitor] deriv register failed:", e.message); }
+  } catch (err) {
+    console.log(`[Deriv] paper fallback ${symbol}: ${err.message}`);
+    result = { mode: "paper", status: "simulated", symbol, action: direction, stake, tp, sl, reason, message: `Deriv unavailable (${err.message}) — paper mode` };
+    try {
+      positionMonitor.register({ symbol, action: direction, lotSize: stake, entry, sl, tp, source: `${source}:deriv-paper`, reason });
+    } catch (e) { console.warn("[PositionMonitor] deriv-paper register failed:", e.message); }
+  }
+  return result;
+}
+
+/** Alpaca bracket execution: dollar-risk share qty, native TP/SL, clock gate. */
+async function executeAlpacaTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget }) {
+  const direction = String(action).toLowerCase() === "sell" ? "sell" : "buy";
+  const stopDist = Math.abs(Number(entry) - Number(sl));
+  const qty = qtyForRisk({ price: entry, stopDist, riskUsd: riskBudget });
+  if (qty == null) {
+    return { mode: "blocked", status: "blocked", blocked_by: "sizing", reasons: [`qty math failed (entry=${entry} sl=${sl} risk=$${riskBudget}) — no order`] };
+  }
+  const gate = riskGate({ symbol, action: direction, lotSize: 0, entry, sl, balance: 1000, riskUsdOverride: stopDist * qty });
+  if (!gate.allowed) {
+    return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
+  }
+  const r = await alpacaExecutor.place({ symbol, action: direction, qty, takeProfit: tp, stopLoss: sl });
+  if (!r.ok) {
+    // Refused (no keys / closed market / cap) -> paper-tracked, still watched.
+    console.log(`[executor] alpaca refused ${symbol} (${r.why}) — paper-tracked`);
+    try {
+      positionMonitor.register({ symbol, action: direction, lotSize: qty, entry, sl, tp, source: `${source}:alpaca-paper`, reason: `${reason || ""} [alpaca refused: ${r.why}]` });
+    } catch (e) { console.warn("[PositionMonitor] alpaca-paper register failed:", e.message); }
+    return { mode: "paper", status: "simulated", symbol, action: direction, qty, entry, sl, tp, reason, message: `Alpaca refused (${r.why}) — paper mode` };
+  }
+  try {
+    positionMonitor.register({
+      symbol, action: direction, lotSize: qty, entry, sl, tp,
+      source: r.mode === "live" ? "alpaca-live" : "alpaca",
+      reason: `${reason || ""} [alpaca ${r.mode} order ${r.order?.id || "?"}]`,
+    });
+  } catch (e) { console.warn("[PositionMonitor] alpaca register failed:", e.message); }
+  return { mode: r.mode === "live" ? "alpaca-live" : "alpaca-paper", status: "sent", order: r.order, qty };
 }
 const tradeScheduler = new TradeTaskScheduler({
   engine: mtfStrategy,
@@ -3700,12 +4038,39 @@ app.post("/trade", requireAuth, limitNormal, async (req, res) => {
   if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
 
   try {
-    const result = await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
+    // Deriv synthetics run the generator-aware engine, never the MTF trend
+    // engine — its output shape matches what the flow below consumes.
+    let result;
+    if (isDerivSymbol(symbol)) {
+      const candles = await fetchCandles(symbol, "1min", 200);
+      const closes = (candles || []).map((c) => c.close).filter((c) => c > 0);
+      const s = analyzeSynth(symbol, closes);
+      result = {
+        decision: s.decision, confidence: s.confidence || 0,
+        entry: s.entry, sl: s.sl, tp: s.tp, tp2: null, rr: s.rr,
+        reasons: s.reasons, regime: { macro_trend: `SYNTH_${s.family}` },
+        structure_30m: null, entry_ctx: { type: "synth", zone: null },
+        costs: null, guards: null, lot_size: null,
+        synth: { family: s.family, maxHoldMin: s.maxHoldMin ?? null, details: s.details ?? null },
+      };
+    } else {
+      result = await mtfStrategy.run(symbol, { interval, balance: balance || 1000, riskPercent: risk_percent });
+    }
     console.log(`[/trade] ${symbol} ${result.decision} — reasons: ${JSON.stringify(result.reasons || [])}`);
     debitCredits(uid, "trade_analysis", "trade engine"); // engine ran — post-success
 
     if (["NO_TRADE", "WAIT", "WAIT_PULLBACK", "WAIT_RANGE", "COOLDOWN", "DATA_UNAVAILABLE", "DATA_RATE_LIMITED", "ERROR"].includes(result.decision)) {
       return res.status(200).json({ status: "blocked", ...withoutEngineReasons(result) });
+    }
+    // Non-MT5 rails share the venue executor (own sizing, brackets, gates).
+    if (marketOf(symbol) !== "mt5") {
+      const routed = await executeTradeSignal({
+        symbol, action: result.decision === "BUY" ? "buy" : "sell",
+        lotSize: result.lot_size, entry: result.entry, sl: result.sl, tp: result.tp,
+        reason: reason || `engine.js: conf=${result.confidence}%`,
+        source: "trade", balance: balance || 1000, riskPercent: risk_percent,
+      });
+      return res.status(200).json({ status: routed.status || "submitted", pipeline: "engine_js", rail: marketOf(symbol), ...withoutEngineReasons(result), execution: routed });
     }
     // Portfolio risk layer: account-level guards BEFORE anything reaches the bridge.
     const gate = riskGate({
@@ -5910,6 +6275,12 @@ setInterval(async () => {
     await tickBots({
       db,
       mtfAnalyze: (symbol, opts) => mtfStrategy.analyze(symbol, opts),
+      analyzeSynth: (symbol, closes) => analyzeSynth(symbol, closes),
+      fetchCloses: async (symbol, interval) => {
+        const candles = await fetchCandles(symbol, interval === "1m" ? "1min" : interval, 200);
+        if (!candles?.length) throw new Error(`no ${interval} candles for ${symbol}`);
+        return candles.map((c) => c.close).filter((c) => c > 0);
+      },
       longtermAnalyze: (symbol, closes) => analyzeLongterm(symbol, closes),
       fetchDaily: async (symbol) => {
         const candles = await fetchCandles(symbol, "1day", 300);
@@ -5923,7 +6294,7 @@ setInterval(async () => {
       formatSignal: (symbol, result) => formatTradingSignal(symbol, result),
       storeOptionsSignal: (userId, signal) => storeOptionsSignal(userId, signal),
       openPaper: (userId, signal) => openPaperPosition(db, userId, signal),
-      executor: (args) => executeTradeSignal({ ...args, source: "bots" }),
+      executor: (args) => executeTradeSignal({ ...args, source: args.source || "bots" }),
       log: (...a) => console.log("[bots]", ...a),
     });
   } catch (e) {
@@ -6209,6 +6580,30 @@ app.post("/options/paper/resolve", requireAuth, async (req, res) => {
   }
 });
 
+// --- Ledger maturity: which track records are old enough to sell ---------
+app.get("/ledger/maturity", requireAuth, async (req, res) => {
+  try {
+    res.json(maturitySummary(db, boundUser(req)));
+  } catch (err) {
+    res.status(500).json({ error: "Maturity check failed", details: err.message });
+  }
+});
+
+// Hands-free aging: resolve open options paper every 30 min so the books
+// mature without anyone opening the app. Failures never crash the server.
+setInterval(async () => {
+  try {
+    ensureOptionsTables(db);
+    const owners = db.prepare("SELECT DISTINCT user_id AS u FROM options_paper WHERE status = 'OPEN'").all();
+    for (const { u } of owners) {
+      try {
+        const r = await resolvePaperBook(db, u, (sym) => getChain(sym));
+        if (r.length) console.log(`[options-paper] auto-resolve ${u}: ${r.filter((x) => x.closed).length} closed`);
+      } catch (e) { console.warn("[options-paper] auto-resolve failed:", e.message); }
+    }
+  } catch (e) { console.warn("[options-paper] auto-resolve failed:", e.message); }
+}, 30 * 60 * 1000).unref?.();
+
 // --- Options backtest: modeled chains, bid/ask fills, full costs -------------
 app.post("/options/backtest", requireAuth, limitCostly, async (req, res) => {
   try {
@@ -6308,6 +6703,135 @@ app.get("/api/trading/portfolio", requireAuth, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: "Portfolio fetch failed", details: err.message });
+  }
+});
+
+// --- Unified paper portfolio: every bot's executions in one ledger ---
+// Each trade carries its bot identifier so P&L is attributable:
+// intraday / longterm (positions.source bot:*), scheduler, manual,
+// options (options_paper), pocket (pocket_paper, P&L in payout units).
+// NOTE: this is a PAPER ledger (bridge unset = paper; MT5 live fills are
+// tracked by the same monitor when the bridge is set).
+function spotPnlUsd(symbol, side, entry, exitPrice, lotSize) {
+  const cfg = PIP_CONFIG[String(symbol || "").toUpperCase()];
+  const isLong = String(side || "").toUpperCase().startsWith("BUY") || String(side).toLowerCase() === "buy" || String(side).toUpperCase() === "CALL";
+  const diff = isLong ? exitPrice - entry : entry - exitPrice;
+  if (!Number.isFinite(diff) || !Number.isFinite(entry)) return 0;
+  if (!cfg) return diff * (lotSize || 0.01) * 10;
+  if (cfg.isCrypto) return diff * (lotSize || 0.01) * cfg.pipValue;
+  return (diff / cfg.pipSize) * cfg.pipValue * (lotSize || 0.01);
+}
+
+app.get("/api/trading/paper-portfolio", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const trades = [];
+    const byBot = {};
+
+    const add = (t) => {
+      trades.push(t);
+      const b = (byBot[t.bot] = byBot[t.bot] || { bot: t.bot, trades: 0, wins: 0, losses: 0, pnlUsd: 0, pnlUnits: 0 });
+      b.trades++;
+      if (t.status === "WIN" || t.status === "CLOSED_WIN") b.wins++;
+      if (t.status === "LOSS" || t.status === "CLOSED_LOSS") b.losses++;
+      if (t.pnlKind === "usd") b.pnlUsd += t.pnl || 0;
+      else b.pnlUnits += t.pnl || 0;
+    };
+    const botOfSource = (s) => {
+      const v = String(s || "");
+      if (v === "bot:intraday") return "intraday";
+      if (v === "bot:longterm") return "longterm";
+      if (v === "scheduler") return "scheduler";
+      if (v === "bots") return "intraday/longterm";
+      if (v === "pocket-deriv") return "pocket-deriv";
+      return "manual";
+    };
+
+    // 1. Spot/CFD positions (intraday, longterm, scheduler, manual).
+    try {
+      const all = positionMonitor.list(500);
+      for (const p of all) {
+        const open = p.status === "MONITORING";
+        let exit = p.close_price ?? null;
+        if (open) {
+          const spot = await fetchSpotPrice(p.symbol);
+          if (spot) exit = spot.price;
+        }
+        const pnl = exit != null && p.entry != null ? spotPnlUsd(p.symbol, p.action, p.entry, exit, p.lot_size) : 0;
+        add({
+          bot: botOfSource(p.source), source: p.source || "manual",
+          symbol: p.symbol, side: String(p.action || "").toUpperCase(),
+          entry: p.entry, exit, pnl, pnlKind: "usd",
+          status: open ? "OPEN" : (p.outcome === "win" ? "CLOSED_WIN" : "CLOSED_LOSS"),
+          openedAt: p.placed_at ? new Date(p.placed_at).getTime() : null,
+          closedAt: p.resolved_at ? new Date(p.resolved_at).getTime() : null,
+          note: p.note || p.reason || "",
+        });
+      }
+    } catch (e) { console.warn("[paper-portfolio] positions:", e.message); }
+
+    // 2. Options paper book.
+    try {
+      const rows = db.prepare("SELECT * FROM options_paper WHERE user_id IN (?, 'bot') ORDER BY opened_at DESC LIMIT 200").all(user_id);
+      for (const r of rows) {
+        const closed = r.status !== "OPEN";
+        add({
+          bot: "options", source: "options-paper",
+          symbol: r.symbol, side: r.kind || "SPREAD",
+          entry: r.credit, exit: closed ? (r.pnl != null ? r.credit + r.pnl / 100 / (r.contracts || 1) : null) : null,
+          pnl: closed ? (r.pnl || 0) : (r.unrealized || 0), pnlKind: "usd",
+          status: closed ? (r.pnl >= 0 ? "CLOSED_WIN" : "CLOSED_LOSS") : "OPEN",
+          openedAt: r.opened_at, closedAt: r.exit_time,
+          note: closed ? (r.exit_why || "") : `max loss $${r.max_loss ?? "?"}`,
+        });
+      }
+    } catch (e) { console.warn("[paper-portfolio] options:", e.message); }
+
+    // 3. Pocket paper book (units of payout: WIN=+$payout, LOSS=-$1).
+    try {
+      const rows = db.prepare("SELECT * FROM pocket_paper WHERE user_id = ? AND result != 'OPEN' ORDER BY entry_ts DESC LIMIT 200").all(user_id);
+      for (const r of rows) {
+        add({
+          bot: "pocket", source: "pocket-paper",
+          symbol: r.symbol, side: r.direction,
+          entry: r.entry_price, exit: r.settle_price,
+          pnl: r.result === "WIN" ? r.payout : r.result === "LOSS" ? -1 : 0, pnlKind: "units",
+          status: r.result,
+          openedAt: r.entry_ts, closedAt: r.expiry_ts,
+          note: `${r.expiry_min}m expiry`,
+        });
+      }
+      const openN = db.prepare("SELECT COUNT(*) AS c FROM pocket_paper WHERE user_id = ? AND result = 'OPEN'").get(user_id)?.c || 0;
+      if (openN) {
+        const b = (byBot.pocket = byBot.pocket || { bot: "pocket", trades: 0, wins: 0, losses: 0, pnlUsd: 0, pnlUnits: 0 });
+        b.openTrades = openN;
+      }
+    } catch (e) { console.warn("[paper-portfolio] pocket:", e.message); }
+
+    // 4. Alpaca fills + live positions (broker truth, both modes).
+    try {
+      const [pp, lp] = await Promise.all([
+        alpacaPaper.positions().catch(() => []),
+        (ALPACA_LIVE ? alpacaLive.positions().catch(() => []) : Promise.resolve([])),
+      ]);
+      for (const [arr, mode] of [[pp, "paper"], [lp, "live"]]) {
+        for (const p of arr) {
+          add({
+            bot: mode === "live" ? "alpaca-live" : "alpaca", source: `alpaca-${mode}`,
+            symbol: p.symbol, side: Number(p.qty) >= 0 ? "BUY" : "SELL",
+            entry: Number(p.avg_entry_price) || 0, exit: Number(p.current_price) || 0,
+            pnl: Number(p.unrealized_pl) || 0, pnlKind: "usd",
+            status: "OPEN", openedAt: null, closedAt: null,
+            note: `qty ${p.qty} · ${mode}`,
+          });
+        }
+      }
+    } catch (e) { console.warn("[paper-portfolio] alpaca:", e.message); }
+
+    trades.sort((a, b) => (b.openedAt || 0) - (a.openedAt || 0));
+    res.json({ trades: trades.slice(0, 300), byBot, serverTime: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Paper portfolio failed", details: err.message });
   }
 });
 
@@ -6502,17 +7026,31 @@ app.post("/api/trading/feed/resync", requireAuth, async (_req, res) => {
 });
 
 // --- Pocket fixed-expiry signals (manual execution; paper-tracked) ---
+// PRO-GATED: pocket is the flagship — trader/pro/tester/owner only.
+// Free/starter/creator get 402 + upgrade message (no silent failure).
+function requirePocket(req, res) {
+  const user_id = boundUser(req);
+  const ent = checkEntitlement(user_id, "pocket");
+  if (!ent.ok) {
+    res.status(402).json({ error: ent.message, code: ent.code || "feature_locked", feature: "pocket" });
+    return null;
+  }
+  return user_id;
+}
 app.get("/api/trading/pocket/signal", requireAuth, async (req, res) => {
   try {
+    const user_id = requirePocket(req, res);
+    if (!user_id) return;
     const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
     const expiryMin = Math.min(60, Math.max(1, Number(req.query.expiry) || POCKET_EXPIRY_MIN));
     const signal = pocketScan(sym, expiryMin);
+    const arm = getArm(db, sym, signal.expiryMin);
     if (signal.reasons[0]?.startsWith("warming up")) {
       // Kick off a background backfill so the next poll is warm (Finnhub free
       // first, then budgeted REST — same path as the watchlist resync).
       liveFeed._backfillPocket(sym).catch(() => {});
     }
-    res.json({ signal, payoutAssumed: POCKET_PAYOUT, serverTime: Date.now() });
+    res.json({ signal, arm, payoutAssumed: POCKET_PAYOUT, serverTime: Date.now() });
   } catch (err) {
     res.status(500).json({ error: "Pocket signal failed", details: err.message });
   }
@@ -6520,7 +7058,8 @@ app.get("/api/trading/pocket/signal", requireAuth, async (req, res) => {
 
 app.get("/api/trading/pocket/history", requireAuth, async (req, res) => {
   try {
-    const user_id = boundUser(req);
+    const user_id = requirePocket(req, res);
+    if (!user_id) return;
     const { symbol, limit = 50 } = req.query;
     let q = "SELECT * FROM pocket_paper WHERE (user_id = ? OR user_id = '__pocket__')";
     const params = [user_id];
@@ -6533,8 +7072,27 @@ app.get("/api/trading/pocket/history", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/api/trading/alpaca/status", requireAuth, async (_req, res) => {
+  try {
+    res.json({ ...(await alpacaExecutor.status()), serverTime: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Alpaca status failed", details: err.message });
+  }
+});
+
+app.get("/api/trading/deriv/status", requireAuth, async (req, res) => {
+  try {
+    if (!requirePocket(req, res)) return;
+    const bal = await derivClient.balance().catch(() => null);
+    res.json({ ...derivExecutor.status(), balance: bal, serverTime: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: "Deriv status failed", details: err.message });
+  }
+});
+
 app.get("/api/trading/pocket/stats", requireAuth, async (req, res) => {
   try {
+    if (!requirePocket(req, res)) return;
     const { symbol } = req.query;
     res.json(pocketStats(db, { symbol: symbol || null, payout: POCKET_PAYOUT }));
   } catch (err) {

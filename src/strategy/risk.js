@@ -42,6 +42,8 @@ const CORR_GROUPS = {
   JPY_CROSS: ["USDJPY", "GBPJPY", "EURJPY"],
   METALS: ["XAUUSD", "XAGUSD"],
   CRYPTO: ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD", "ADAUSD"],
+  INDICES: ["US30", "NAS100", "SPX500", "GER40", "UK100X", "JPN225", "AUS200", "FRA40", "EU50", "US2000"],
+  ENERGY: ["USOIL", "UKOIL", "NATGAS"],
 };
 
 /**
@@ -116,9 +118,12 @@ export class PortfolioRisk {
 
   /**
    * Pre-trade check. Returns { allowed, reasons[], exposure }.
+   * riskUsdOverride: when the caller already knows the dollar risk (Alpaca
+   * share qty, Deriv stake), it is used instead of the pip-table math — so
+   * rails without PIP rows can never silently skip the per-trade cap.
    * Never throws — a risk layer that crashes open is worse than none.
    */
-  check({ symbol, action, lotSize, entry, sl, balance = 1000 } = {}) {
+  check({ symbol, action, lotSize, entry, sl, balance = 1000, riskUsdOverride = null } = {}) {
     const limits = riskLimits();
     const reasons = [];
     const sym = String(symbol || "").toUpperCase();
@@ -135,7 +140,7 @@ export class PortfolioRisk {
       }
 
       // 2. Per-trade risk cap
-      const rUsd = this.riskUsd({ symbol: sym, lotSize, entry, sl });
+      const rUsd = riskUsdOverride ?? this.riskUsd({ symbol: sym, lotSize, entry, sl });
       if (rUsd != null) {
         exposure.newRiskUsd = Number(rUsd.toFixed(2));
         exposure.newRiskPct = Number(((rUsd / bal) * 100).toFixed(2));
