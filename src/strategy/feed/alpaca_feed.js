@@ -27,6 +27,10 @@ export class AlpacaFeed {
     this.timer = null;
     this.polling = false;
     this._status = "idle";
+    // FIX (F-22): WS reconnect with backoff — a dropped socket used to stay
+    // down until the next 5-min LiveFeed resync restarted it.
+    this._wsRetry = null;
+    this._wsRetryMs = 1000;
   }
 
   setStatus(s, d = "") {
@@ -63,6 +67,7 @@ export class AlpacaFeed {
     try { this.ws?.close(); } catch { /* ignore */ }
     this.ws = null;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this._wsRetry) { clearTimeout(this._wsRetry); this._wsRetry = null; } // FIX (F-22): no zombie reconnects after stop
     this.polling = false;
     this.setStatus("stopped");
   }
@@ -90,6 +95,7 @@ export class AlpacaFeed {
           if (m.msg === "connected") continue;
           if (m.msg === "authenticated") {
             this.setStatus("live", `ws ${this.symbols.join(",")}`);
+            this._wsRetryMs = 1000; // reset backoff on success
             ws.send(JSON.stringify({ action: "subscribe", bars: this.symbols }));
           }
           continue;
@@ -107,6 +113,15 @@ export class AlpacaFeed {
     ws.on("close", () => {
       if (this.ws === ws) this.ws = null;
       this.setStatus("down", "ws closed");
+      // FIX (F-22): schedule a fast exponential-backoff reconnect (1s→60s)
+      // instead of staying dark for up to 5 minutes.
+      if (this._wsRetry) clearTimeout(this._wsRetry);
+      const wait = this._wsRetryMs;
+      this._wsRetryMs = Math.min(this._wsRetryMs * 2, 60_000);
+      this._wsRetry = setTimeout(() => {
+        try { this.start(); } catch { /* start re-checks symbols/keys itself */ }
+      }, wait);
+      if (this._wsRetry.unref) this._wsRetry.unref();
     });
     ws.on("error", () => { /* close handler reports */ });
   }

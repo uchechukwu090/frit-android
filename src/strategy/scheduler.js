@@ -22,6 +22,73 @@ export class TradeTaskScheduler {
     this._tickMs = deps.tickMs || 30_000;
     this._timer = null;
     this.lastTickAt = null;
+    // FIX (F-05): tasks lived in a memory Map only — every user's scheduled
+    // trade task was wiped by any server restart/deploy. When a db is passed
+    // (index.js owns the SQLite handle), tasks are persisted and restored.
+    this.db = deps.db || null;
+    if (this.db) this._loadTasks();
+  }
+
+  _ensureTable() {
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS trade_tasks (
+          id TEXT PRIMARY KEY,
+          symbol TEXT NOT NULL,
+          time TEXT NOT NULL,
+          hh INTEGER NOT NULL,
+          mm INTEGER NOT NULL,
+          risk_percent REAL NOT NULL,
+          balance REAL NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          last_fired_day TEXT,
+          created_at INTEGER NOT NULL
+        );
+      `);
+      return true;
+    } catch { return false; }
+  }
+
+  /** Restore all persisted tasks into the memory Map (memory stays authoritative at runtime). */
+  _loadTasks() {
+    if (!this.db || !this._ensureTable()) return;
+    let rows = [];
+    try { rows = this.db.prepare("SELECT * FROM trade_tasks").all(); } catch { return; }
+    let restored = 0;
+    for (const r of rows) {
+      try {
+        this.tasks.set(r.id, {
+          id: r.id, symbol: r.symbol, time: r.time, hh: r.hh, mm: r.mm,
+          riskPercent: r.risk_percent, balance: r.balance,
+          enabled: r.enabled === 1, lastFiredDay: r.last_fired_day || null,
+          created_at: r.created_at || Date.now(),
+        });
+        restored++;
+      } catch { /* skip corrupt row — never block boot over one task */ }
+    }
+    if (restored) console.log(`[TradeTaskScheduler] restored ${restored} task(s) from DB`);
+  }
+
+  _persist(id) {
+    if (!this.db) return;
+    const t = this.tasks.get(id);
+    if (!t) return;
+    try {
+      this.db.prepare(`
+        INSERT INTO trade_tasks (id, symbol, time, hh, mm, risk_percent, balance, enabled, last_fired_day, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+          symbol=excluded.symbol, time=excluded.time, hh=excluded.hh, mm=excluded.mm,
+          risk_percent=excluded.risk_percent, balance=excluded.balance, enabled=excluded.enabled,
+          last_fired_day=excluded.last_fired_day, created_at=excluded.created_at
+      `).run(t.id, t.symbol, t.time, t.hh, t.mm, t.riskPercent, t.balance,
+        t.enabled ? 1 : 0, t.lastFiredDay, t.created_at);
+    } catch { /* persistence is best-effort; runtime state is authoritative */ }
+  }
+
+  _unpersist(id) {
+    if (!this.db) return;
+    try { this.db.prepare("DELETE FROM trade_tasks WHERE id = ?").run(id); } catch { /* best-effort */ }
   }
 
   /**
@@ -49,11 +116,14 @@ export class TradeTaskScheduler {
       created_at: Date.now(),
     };
     this.tasks.set(id, entry);
+    this._persist(id);
     return { ok: true, id, ...entry };
   }
 
   remove(id) {
-    return this.tasks.delete(id);
+    const removed = this.tasks.delete(id);
+    if (removed) this._unpersist(id);
+    return removed;
   }
 
   start() {
@@ -83,6 +153,7 @@ export class TradeTaskScheduler {
       if (mm < task.mm) continue;
 
       task.lastFiredDay = dayKey;
+      this._persist(task.id); // fired-day guard survives restarts (no double-fires / no refires)
       await this._evaluate(task);
     }
   }

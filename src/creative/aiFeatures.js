@@ -1,5 +1,6 @@
 import fetch from "node-fetch";
 import { M } from "../model_config.js";
+import { buildCues } from "./subtitles.js";
 
 function orKey() {
   return process.env.OPENROUTER_API_KEY || "";
@@ -119,43 +120,115 @@ export async function upscaleImage(imageBuffer, scale = 2) {
   });
 }
 
-export async function generateSubtitles(audioBuffer, language = "auto") {
+// F-13: request REAL timestamps. The STT endpoint supports
+// response_format=verbose_json + timestamp_granularities=["word","segment"],
+// which returns the provider's own word/segment boundaries and the true audio
+// duration. Not every provider supports it, so the request degrades: a 400
+// falls back to the plain transcript and we fall back to a duration-weighted
+// estimate instead of the old fixed "0.4s per word" guess.
+export async function generateSubtitles(audioBuffer, language = "auto", opts = {}) {
   const b64 = audioBuffer.toString("base64");
-  const res = await fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
+  const model = M("OR_STT_MODEL");
+  const baseBody = {
+    model,
+    input_audio: { data: b64, format: opts.format || "wav" },
+    ...(language && language !== "auto" ? { language } : {}),
+  };
+  const body = { ...baseBody, response_format: "verbose_json", timestamp_granularities: ["word", "segment"] };
+
+  let res = await fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
     method: "POST",
     headers: orHeaders(),
-    body: JSON.stringify({ model: M("OR_STT_MODEL"), input_audio: { data: b64, format: "wav" }, language: language === "auto" ? undefined : language }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(120_000),
   });
-  if (!res.ok) return { subtitles: [], text: "" };
-  const data = await res.json().catch(() => ({}));
-  const text = data.text || "";
-  if (!text) return { subtitles: [], text: "" };
-  const words = text.split(" ");
-  const subtitles = [];
-  const wordsPerChunk = 5;
-  const secondsPerWord = 0.4;
-  for (let i = 0; i < words.length; i += wordsPerChunk) {
-    const chunk = words.slice(i, i + wordsPerChunk).join(" ");
-    subtitles.push({ start: i * secondsPerWord, end: (i + wordsPerChunk) * secondsPerWord, text: chunk });
+
+  // Provider rejected verbose_json (or the model can't do timestamps) — retry
+  // with the plain transcript so the user still gets captions.
+  let verbose = true;
+  if (!res.ok && (res.status === 400 || res.status === 422)) {
+    res = await fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
+      method: "POST",
+      headers: orHeaders(),
+      body: JSON.stringify(baseBody),
+      signal: AbortSignal.timeout(120_000),
+    });
+    verbose = false;
   }
-  return { subtitles, text };
+  if (!res.ok) return { subtitles: [], text: "", timing: "none" };
+
+  const data = await res.json().catch(() => ({}));
+  const text = String(data.text || "").trim();
+  if (!text) return { subtitles: [], text: "", timing: "none" };
+
+  const duration = Number(data.duration) || Number(data?.usage?.seconds) || 0;
+  const { cues, timing } = buildCues({
+    words: verbose ? data.words : null,
+    segments: verbose ? data.segments : null,
+    text,
+    duration,
+  });
+  return {
+    subtitles: cues,
+    text,
+    timing,
+    duration: duration || (cues.length ? cues[cues.length - 1].end : 0),
+    language: data.language || (language === "auto" ? null : language),
+  };
 }
 
+// F-13: translate each cue individually so the ORIGINAL timings stay valid.
+// The old implementation translated the whole transcript as one blob and then
+// re-chunked the translated words by count, which silently shifted every cue
+// after the first and produced mismatched subtitles.
 export async function translateSubtitles(subtitles, targetLanguage) {
-  const text = subtitles.map(s => s.text).join(" ");
+  const list = Array.isArray(subtitles) ? subtitles : [];
+  if (!list.length) return [];
+
+  const numbered = list.map((s, i) => `${i + 1}. ${String(s.text || "").trim()}`).join("\n");
   const out = await callOpenRouterChat([
-    { role: "system", content: `Translate the following text to ${targetLanguage}. Return ONLY the translated text, no explanations.` },
-    { role: "user", content: text },
-  ], 500);
-  const translated = out.choices?.[0]?.message?.content || text;
-  const translatedWords = translated.split(" ");
-  const wordsPerChunk = Math.ceil(translatedWords.length / subtitles.length);
-  return subtitles.map((s, i) => ({
-    start: s.start,
-    end: s.end,
-    text: translatedWords.slice(i * wordsPerChunk, (i + 1) * wordsPerChunk).join(" "),
-  }));
+    {
+      role: "system",
+      content:
+        `Translate each numbered line into ${targetLanguage}. Keep every line on its own line, keep the "N. " prefix, and keep the same number of lines. ` +
+        `Return ONLY the translated lines, no commentary.`,
+    },
+    { role: "user", content: numbered },
+  ], 2000);
+  const raw = String(out.choices?.[0]?.message?.content || "");
+  const parsed = parseNumberedLines(raw, list.length);
+
+  return list.map((s, i) => {
+    const t = parsed[i];
+    return { start: s.start, end: s.end, text: t || String(s.text || "") };
+  });
+}
+
+// Pull "N. text" lines out of a model reply, tolerating markdown fences,
+// blank lines and a missing/renumbered prefix.
+function parseNumberedLines(raw, expected) {
+  const lines = String(raw || "")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/^\s*```[a-z]*\s*/i, "").trim())
+    .filter(Boolean);
+  const picked = [];
+  for (const line of lines) {
+    const m = line.match(/^(\d+)\s*[.)]\s*(.*)$/);
+    if (m) picked.push({ n: Number(m[1]), text: m[2].trim() });
+    else if (picked.length) picked[picked.length - 1].text += " " + line;
+    else picked.push({ n: picked.length + 1, text: line });
+  }
+  if (!picked.length) return [];
+  const out = new Array(expected).fill("");
+  for (const p of picked) {
+    const idx = p.n - 1;
+    if (idx >= 0 && idx < expected && !out[idx]) out[idx] = p.text;
+  }
+  // If numbering was lost, keep the reply order.
+  if (out.every((t) => !t)) {
+    picked.forEach((p, i) => { if (i < expected) out[i] = p.text; });
+  }
+  return out;
 }
 
 export async function storyboard(script, style = "", numFrames = 6) {

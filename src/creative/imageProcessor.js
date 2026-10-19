@@ -55,6 +55,10 @@ export async function applyFilter(imageBuffer, filterType) {
     case "blur": pipeline = pipeline.blur(5); break;
     case "sharpen": pipeline = pipeline.sharpen(); break;
     case "negate": pipeline = pipeline.negate(); break;
+    case "vintage":
+      // Warm, faded film-stock look: slight desaturation + cream tint.
+      pipeline = pipeline.modulate({ saturation: 0.78 }).tint({ r: 255, g: 238, b: 210 });
+      break;
     case "vignette": {
       const meta = await requireSharp()(imageBuffer).metadata();
       const svg = `<svg width="${meta.width}" height="${meta.height}">
@@ -151,4 +155,39 @@ export async function applyOperations(imageBuffer, operations) {
     }
   }
   return buffer;
+}
+
+// Render a template layout: place each asset into its percentage zone on a
+// canvas sized to the template's aspect ratio. Zones are {x,y,w,h} in 0-100.
+export async function renderZones(width, height, zones) {
+  const s = requireSharp();
+  const composites = [];
+  for (const z of zones) {
+    if (!z || z.type !== "image") continue;
+    const asset = z.asset;
+    if (!asset) continue;
+    const b64 = typeof asset === "string"
+      ? asset.replace(/^data:[\w/;-]+;base64,/, "")
+      : (asset?.image_b64 || asset?.url || "");
+    if (!b64) continue;
+    const left = Math.round(((z.x || 0) / 100) * width);
+    const top = Math.round(((z.y || 0) / 100) * height);
+    const w = Math.max(1, Math.round(((z.w || 100) / 100) * width));
+    const h = Math.max(1, Math.round(((z.h || 100) / 100) * height));
+    const resized = await s(Buffer.from(String(b64), "base64"))
+      .resize(w, h, { fit: "cover" })
+      .png()
+      .toBuffer();
+    composites.push({ input: resized, left, top });
+  }
+  const base = s({ create: { width, height, channels: 4, background: { r: 20, g: 20, b: 20, alpha: 1 } } });
+  return composites.length ? base.composite(composites).png().toBuffer() : base.png().toBuffer();
+}
+
+// Aspect "9:16" -> [width, height] sized for social.
+export function dimsForAspect(aspectRatio, width = 1080) {
+  const m = /^(\d+)\s*:\s*(\d+)$/.exec(String(aspectRatio || "1:1").trim());
+  if (!m) return [width, width];
+  const r = Number(m[2]) / Number(m[1]);
+  return [width, Math.max(1, Math.round(width * r))];
 }

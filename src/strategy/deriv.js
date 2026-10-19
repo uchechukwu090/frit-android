@@ -21,19 +21,25 @@ import WebSocket from "ws";
 
 const WS_URL = "wss://ws.derivws.com/websockets/v3";
 
-// Our symbol -> Deriv symbol candidates (first live one wins).
-// Synthetics trade under their own codes (R_100, 1HZ100V, ...) — no mapping
-// needed, just verification that MULT contracts exist for them.
+// Our symbol -> Deriv symbol candidates, ORDERED real-first.
+// CRITICAL (fixed Oct 2026): "frx*" symbols are Deriv's DERIVED (simulated)
+// indices — NOT real spot gold/forex. Our engine reads real prices from
+// Binance/Finnhub, so settling on a synthetic feed is a different instrument.
+// Real OTC pairs (real quotes) come FIRST; frx* is last-resort fallback only.
+// Pure synthetics (R_100, 1HZ100V, BOOM/CRASH) are NEVER routed to execution —
+// no edge can exist on a random stream.
 export const DERIV_MAP = {
-  XAUUSD: ["frxXAUUSD"], XAGUSD: ["frxXAGUSD"],
-  EURUSD: ["frxEURUSD"], GBPUSD: ["frxGBPUSD"], USDJPY: ["frxUSDJPY"],
-  AUDUSD: ["frxAUDUSD"], USDCHF: ["frxUSDCHF"], USDCAD: ["frxUSDCAD"],
-  NZDUSD: ["frxNZDUSD"], GBPJPY: ["frxGBPJPY"], EURJPY: ["frxEURJPY"],
-  EURGBP: ["frxEURGBP"],
+  XAUUSD: ["XAUUSD", "frxXAUUSD"], XAGUSD: ["XAGUSD", "frxXAGUSD"],
+  EURUSD: ["EURUSD", "frxEURUSD"], GBPUSD: ["GBPUSD", "frxGBPUSD"],
+  USDJPY: ["USDJPY", "frxUSDJPY"], AUDUSD: ["AUDUSD", "frxAUDUSD"],
+  USDCHF: ["USDCHF", "frxUSDCHF"], USDCAD: ["USDCAD", "frxUSDCAD"],
+  NZDUSD: ["NZDUSD", "frxNZDUSD"], GBPJPY: ["GBPJPY", "frxGBPJPY"],
+  EURJPY: ["EURJPY", "frxEURJPY"], EURGBP: ["EURGBP", "frxEURGBP"],
   BTCUSD: ["BTCUSD", "cryBTCUSD"], ETHUSD: ["ETHUSD", "cryETHUSD"],
   SOLUSD: ["SOLUSD"], BNBUSD: ["BNBUSD"], XRPUSD: ["XRPUSD"],
   DOGEUSD: ["DOGEUSD"], ADAUSD: ["ADAUSD"],
 };
+export const SYNTHETIC_ONLY = /^(R_\d+|1HZ\d+V?|BOOM\d+N|CRASH\d+N|STPRNG\d*|RDBULL\d*|RDBEAR\d*|JD\d+|GDA\d+|XPT\d+)$/;
 
 export function buildProposal(symbol, direction, stake, durationMin, currency = "USD") {
   return {
@@ -348,6 +354,13 @@ export class DerivExecutor {
         mode TEXT DEFAULT 'demo',
         placed_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS deriv_refusals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        why TEXT NOT NULL,
+        at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_deriv_refusals ON deriv_refusals(at DESC);
     `);
     // Migration: ledgers created before profit tracking existed.
     try {
@@ -362,6 +375,23 @@ export class DerivExecutor {
         "SELECT COUNT(*) AS c FROM deriv_contracts WHERE placed_at > ?"
       ).get(Date.now() - 24 * 3600 * 1000)?.c || 0;
     } catch { return 0; }
+  }
+
+  // Refusal audit trail: every skipped execution is recorded with WHY, so
+  // "nothing appeared on Deriv" is always explainable (never silent).
+  _refuse(symbol, why) {
+    try {
+      this.db.prepare("INSERT INTO deriv_refusals (symbol, why, at) VALUES (?, ?, ?)")
+        .run(String(symbol).toUpperCase(), String(why).slice(0, 300), Date.now());
+    } catch { /* best-effort */ }
+    this.log(`[deriv] REFUSED ${symbol}: ${why}`);
+    return { ok: false, why };
+  }
+
+  refusals(limit = 20) {
+    try {
+      return this.db.prepare("SELECT symbol, why, at FROM deriv_refusals ORDER BY at DESC LIMIT ?").all(limit);
+    } catch { return []; }
   }
 
   async resolveSymbol(ours) {    const sym = String(ours).toUpperCase();
@@ -442,25 +472,27 @@ export class DerivExecutor {
   }
 
   async execute({ symbol, direction, durationMin, positionId }) {
-    if (!this.client.token) return { ok: false, why: "no token" };
-    if (direction !== "CALL" && direction !== "PUT") return { ok: false, why: "not directional" };
+    if (!this.client.token) return this._refuse(symbol, "NO_TOKEN — paste DERIV_DEMO_TOKEN in server/.env");
+    if (direction !== "CALL" && direction !== "PUT") return this._refuse(symbol, "not directional");
     if (this.tradesToday() >= this.maxPerDay) {
-      return { ok: false, why: `daily cap reached (${this.maxPerDay})` };
+      return this._refuse(symbol, `daily cap reached (${this.maxPerDay})`);
     }
     // NOTE: cap is checked before any network so a capped day costs nothing.
     const ok = await this.client.connect();
-    if (!ok) return { ok: false, why: "deriv unavailable" };
+    if (!ok) return this._refuse(symbol, `deriv unavailable: ${this.client.status()}`);
     if (!this.client.account?.isDemo && !this.liveAllowed) {
-      return { ok: false, why: "REAL-money token refused — DERIV_LIVE=1 required" };
+      return this._refuse(symbol, "REAL-money token refused — set DERIV_LIVE=1 (demo token expected)");
+    }
+    if (SYNTHETIC_ONLY.test(String(symbol).toUpperCase())) {
+      return this._refuse(symbol, "synthetic index — never traded (RNG stream, no edge possible)");
     }
     const dSym = await this.resolveSymbol(symbol);
-    if (!dSym) return { ok: false, why: `no Rise/Fall market for ${symbol}` };
+    if (!dSym) return this._refuse(symbol, `no Rise/Fall market for ${symbol} on this account`);
     const r = await this.client.buyRiseFall({
       symbol: dSym, direction, stake: this.stake, durationMin, currency: this.currency,
     });
     if (r.error) {
-      this.log(`[deriv] buy failed ${symbol}: ${r.error}`);
-      return { ok: false, why: r.error };
+      return this._refuse(symbol, `buy failed: ${r.error}`);
     }
     const mode = this.client.account?.isDemo ? "demo" : "REAL";
     try {

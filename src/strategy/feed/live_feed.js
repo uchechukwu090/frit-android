@@ -38,6 +38,7 @@ export class LiveFeed {
     this.formatSignal = deps.formatSignal;   // index.js formatTradingSignal
     this.storeSignal = deps.storeSignal;     // (userId, signal) => void
     this.getWatchlist = deps.getWatchlist;   // () => [{user_id, symbol}]
+    this.getPocketWatchlist = deps.getPocketWatchlist || null; // separate pocket list
     this.isCrypto = deps.isCrypto || (() => false);
     this.finnhubKey = deps.finnhubKey || "";
     this.enabled = deps.enabled !== false;
@@ -121,17 +122,38 @@ export class LiveFeed {
       if (!next.has(sym)) next.set(sym, new Set());
       next.get(sym).add(r.user_id);
     }
+    // Pocket-only pairs are fed (candles + backfill) but are NOT engine-scanned:
+    // they only run through the fixed-expiry pocket path.
+    let pRows = [];
+    try { pRows = this.getPocketWatchlist ? this.getPocketWatchlist() || [] : []; } catch { pRows = []; }
+    this.pocketWatched = new Map();
+    for (const r of pRows) {
+      const sym = String(r.symbol || "").toUpperCase();
+      if (!sym) continue;
+      if (!this.pocketWatched.has(sym)) this.pocketWatched.set(sym, new Set());
+      this.pocketWatched.get(sym).add(r.user_id);
+      if (!next.has(sym)) next.set(sym, new Set()); // feed it, don't scan it
+    }
     const added = [...next.keys()].filter(s => !this.watched.has(s));
     this.watched = next;
-    for (const s of added) await this._backfill(s);
+    for (const s of added) { await this._backfill(s); await this._backfillPocket(s); }
     await this._routeAll();
     // REST-only safety net: symbols with no live provider (no Finnhub key and
     // Dukascopy bot-blocked from this host) refresh via budgeted REST when
     // their newest 30M candle goes stale — _needsBackfill + budget gate keep
     // this inside the daily credit cap.
-    for (const s of [...this.watched.keys()]) {
+    for (const s of [...next.keys()]) {
       if (!this._hasLiveProvider(s)) { await this._backfill(s); await this._backfillPocket(s); }
     }
+  }
+
+  /** Drop a pocket-only pair from the feed (user removed it). */
+  async unwatchPocket(symbol) {
+    const sym = String(symbol || "").toUpperCase();
+    this.pocketWatched?.delete(sym);
+    const stillMain = (this.watched?.get(sym)?.size || 0) > 0;
+    if (!stillMain) this.watched?.delete(sym);
+    try { this._routeAll(); } catch { /* ignore */ }
   }
 
   async _routeAll() {

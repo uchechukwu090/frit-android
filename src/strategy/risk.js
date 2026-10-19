@@ -73,22 +73,23 @@ export class PortfolioRisk {
     this.pipConfig = pipConfig;
   }
 
-  _openPositions() {
+  // Read the risk state ONCE, reporting any failure.
+  // F-42 (Week 5): these two helpers used to swallow a DB error and return
+  // [], which silently switched OFF the max-open guard and the daily-loss
+  // kill-switch (fail-open) while the layer still answered "allowed". The
+  // F-04 fix only covered the outer try/catch. An unreadable risk state must
+  // BLOCK, exactly like an unreadable risk layer.
+  _readState() {
+    let open = [], today = [], error = null;
     try {
-      return this.db.prepare("SELECT * FROM positions WHERE status='MONITORING'").all();
-    } catch {
-      return [];
-    }
-  }
-
-  _realizedToday() {
+      open = this.db.prepare("SELECT * FROM positions WHERE status='MONITORING'").all();
+    } catch (e) { error = e.message; }
     try {
-      return this.db.prepare(
+      today = this.db.prepare(
         "SELECT * FROM positions WHERE status='RESOLVED' AND date(resolved_at) = date('now')"
       ).all();
-    } catch {
-      return [];
-    }
+    } catch (e) { error = error || e.message; }
+    return { open, today, error };
   }
 
   /** Signed USD P&L of a closed position (USD-quoted approximation). */
@@ -131,7 +132,10 @@ export class PortfolioRisk {
     const exposure = { openPositions: 0, newRiskUsd: null, newRiskPct: null, usdNetPct: null, groupCounts: {} };
 
     try {
-      const open = this._openPositions();
+      const { open, today, error } = this._readState();
+      if (error) {
+        reasons.push(`Risk state unreadable (${error}) — trade blocked until positions can be read`);
+      }
       exposure.openPositions = open.length;
 
       // 1. Max open positions
@@ -175,7 +179,6 @@ export class PortfolioRisk {
       }
 
       // 4. Daily loss kill-switch
-      const today = this._realizedToday();
       let realized = 0;
       let counted = 0;
       for (const p of today) {
@@ -189,7 +192,13 @@ export class PortfolioRisk {
         reasons.push(`KILL-SWITCH: down ${exposure.realizedTodayPct}% today (limit ${limits.maxDailyLossPct}%) — no new trades until tomorrow. No revenge trading.`);
       }
     } catch (e) {
-      console.warn("[PortfolioRisk] check failed open:", e.message);
+      // FIX (F-04): this catch was fail-open — any internal error returned
+      // reasons=[] and therefore allowed=true, silently bypassing all four
+      // guards (a DB hiccup = no risk gate at all). A risk layer that cannot
+      // run must BLOCK, not admit. Pushing the error into `reasons` makes
+      // allowed=false; the message flows to the caller's logs/UI.
+      console.error("[PortfolioRisk] check fail-closed:", e.message);
+      reasons.push(`Risk layer internal error: ${e.message} — trade blocked until the risk state is readable`);
     }
 
     return { allowed: reasons.length === 0, reasons, exposure, limits };
@@ -197,8 +206,7 @@ export class PortfolioRisk {
 
   /** Read-only status for GET /risk/status. */
   status(balance = 1000) {
-    const open = this._openPositions();
-    const today = this._realizedToday();
+    const { open, today, error } = this._readState();
     let realized = 0;
     for (const p of today) {
       if (p.outcome !== "win" && p.outcome !== "loss") continue;
@@ -209,6 +217,7 @@ export class PortfolioRisk {
       limits: riskLimits(),
       open: open.map(p => ({ id: p.id, symbol: p.symbol, action: p.action, lot_size: p.lot_size, entry: p.entry, sl: p.sl, tp: p.tp, source: p.source })),
       openCount: open.length,
+      riskStateError: error || null,
       realizedTodayUsd: Number(realized.toFixed(2)),
       killSwitchTripped: realized < 0 && Math.abs(realized) / Number(balance || 1000) * 100 >= riskLimits().maxDailyLossPct,
     };

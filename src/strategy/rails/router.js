@@ -69,9 +69,15 @@ export function isDerivSymbol(symbol) {
 }
 
 /** Session class for engine gating: 24/7 (crypto+synthetics), stocks (NYSE), else FX window. */
+// FIX (F-32): the doc always promised crypto = 24/7, but the code returned
+// "fx" for crypto — a latent trap for the next consumer. (The engine itself
+// is unaffected: sessionStatus double-covers via CRYPTO_SET.) Now matches the
+// documented contract. Pairs mirror live_feed/Binance's crypto universe.
+const CRYPTO_RE = /^(BTC|ETH|SOL|BNB|XRP|DOGE|ADA)(USD|USDT)$|^(BTC|ETH|SOL|BNB|XRP|DOGE|ADA)$/;
 export function sessionClass(symbol) {
   const s = canonicalSymbol(symbol);
   if (isDerivSymbol(s)) return "always";
+  if (CRYPTO_RE.test(s)) return "always";
   if (marketOf(s) === "alpaca") return "nyse";
   return "fx";
 }

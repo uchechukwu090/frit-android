@@ -115,17 +115,27 @@ export class FinnhubFeed extends WsBase {
         volume: (d.v && d.v[i]) || 0,
       }));
       if (interval !== "4h") return hourly;
-      // Aggregate 4x1h into 4h candles (4h bucket = 14400s).
+      // FIX (F-21): aggregate by TRUE 4h bucket boundaries — grouping "every
+      // 4 consecutive rows" from array start produced misaligned candles
+      // whenever `from` isn't 4h-aligned. Bucket keys match CandleStore's live
+      // carving (Math.floor(ts / 14400e3)), so backfilled and live candles
+      // share the same open times.
       const out = [];
-      for (let i = 0; i + 3 < hourly.length; i += 4) {
-        const g = hourly.slice(i, i + 4);
-        out.push({
-          time: g[0].time,
-          open: g[0].open, high: Math.max(...g.map(c => c.high)),
-          low: Math.min(...g.map(c => c.low)), close: g[3].close,
-          volume: g.reduce((a, c) => a + (c.volume || 0), 0),
-        });
+      let bucket = null, buckKey = NaN;
+      for (const c of hourly) {
+        const key = Math.floor(c.time / 14400000);
+        if (key !== buckKey) {
+          if (bucket) out.push(bucket);
+          buckKey = key;
+          bucket = { time: key * 14400000, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 };
+        } else {
+          bucket.high = Math.max(bucket.high, c.high);
+          bucket.low = Math.min(bucket.low, c.low);
+          bucket.close = c.close;
+          bucket.volume += c.volume || 0;
+        }
       }
+      if (bucket) out.push(bucket);
       return out.length >= 10 ? out : null;
     } catch (e) {
       if (this.log) this.log(`[finnhub] candle fetch failed ${sym}: ${e.message}`);
