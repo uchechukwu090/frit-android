@@ -1,0 +1,141 @@
+// ============================================================================
+// Type layer tests — real typography set from the brief
+// ============================================================================
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  planTypeLayout, briefToTextSpecs, applyTypeLayer, pickTypeColor,
+  contrastRatio, luminance, applyCase, wrapText, fontStack, escapeXml,
+} from "../src/creative/typeLayer.js";
+
+const brief = {
+  canvas: { aspect_ratio: "4:5" },
+  layout: { grid: "rule-of-thirds", margins_pct: 10, alignment: "left", focal: "left third" },
+  palette: [
+    { hex: "#0E3B2E", role: "dominant", share_pct: 60 },
+    { hex: "#F4EFE4", role: "secondary", share_pct: 30 },
+    { hex: "#D4A574", role: "accent", share_pct: 10 },
+  ],
+  typography: [
+    { role: "headline", font: "grotesk sans", size_px: 96, weight: 800, tracking: -1, case: "UPPER" },
+    { role: "subhead", font: "humanist sans", size_px: 30, weight: 500, tracking: 0, case: "SENTENCE" },
+    { role: "body", font: "humanist sans", size_px: 16, weight: 400, tracking: 0, case: "SENTENCE" },
+    { role: "cta", font: "semibold sans", size_px: 22, weight: 700, tracking: 1, case: "UPPER" },
+  ],
+  copy: { headline: "COLD BREW", subhead: "now pouring", body: "small batch, brewed daily", cta: "Order now" },
+  background: { description: "cream paper", color_hex: "#F4EFE4" },
+};
+
+test("luminance / contrastRatio: readable maths", () => {
+  assert.ok(luminance("#FFFFFF") > 0.9);
+  assert.ok(luminance("#000000") < 0.05);
+  assert.ok(contrastRatio("#000000", "#FFFFFF") > 15);
+});
+
+test("pickTypeColor: picks the palette colour with the best contrast on the background", () => {
+  assert.equal(pickTypeColor([{ hex: "#000000" }, { hex: "#FFFFFF" }], "#FFFFFF"), "#000000");
+  assert.equal(pickTypeColor([{ hex: "#FFFFFF" }, { hex: "#000000" }], "#000000"), "#FFFFFF");
+});
+
+test("pickTypeColor: falls back to black/white when nothing in the palette is readable", () => {
+  assert.equal(pickTypeColor([{ hex: "#EEEEEE" }], "#F0F0F0"), "#111111");
+  assert.equal(pickTypeColor([{ hex: "#222222" }], "#111111"), "#FFFFFF");
+});
+
+test("applyCase: UPPER / LOWER / TITLE / SENTENCE", () => {
+  assert.equal(applyCase("cold brew", "UPPER"), "COLD BREW");
+  assert.equal(applyCase("COLD BREW", "LOWER"), "cold brew");
+  assert.equal(applyCase("cold brew", "TITLE"), "Cold Brew");
+  assert.equal(applyCase("cold brew", "SENTENCE"), "cold brew");
+});
+
+test("wrapText: wraps on width and caps the line count", () => {
+  const lines = wrapText("one two three four five six seven eight nine ten", 40, 200, 700, 3);
+  assert.ok(lines.length <= 3);
+  assert.ok(lines[0].includes("one"));
+});
+
+test("fontStack: maps a font name onto a real stack", () => {
+  assert.ok(/DejaVu Serif/.test(fontStack("Playfair Display")));
+  assert.ok(/DejaVu Sans Mono/.test(fontStack("Roboto Mono")));
+  assert.ok(/DejaVu Sans/.test(fontStack("Inter")));
+});
+
+test("escapeXml: neutralises the characters that break an SVG", () => {
+  assert.equal(escapeXml(`a&b<c>"d"`), "a&amp;b&lt;c&gt;&quot;d&quot;");
+});
+
+test("planTypeLayout: orders the type, honours the margins and the alignment", () => {
+  const plan = planTypeLayout(brief, { width: 1000, height: 1250 });
+  assert.equal(plan.margin, 100);
+  assert.equal(plan.anchor, "start");
+  const roles = plan.items.map((i) => i.role);
+  assert.equal(roles[0], "headline");
+  assert.ok(roles.includes("cta"));
+  const headline = plan.items[0];
+  assert.ok(headline.size > plan.items[1].size, "the headline must be the largest");
+  assert.equal(headline.x, 100);
+  const cta = plan.cta;
+  assert.ok(cta.box, "the CTA must get a badge box");
+  assert.ok(cta.box.w > 0 && cta.box.h > 0);
+});
+
+test("planTypeLayout: centre alignment moves the anchor and the x", () => {
+  const plan = planTypeLayout({ ...brief, layout: { ...brief.layout, alignment: "center" } }, { width: 1000, height: 1250 });
+  assert.equal(plan.anchor, "middle");
+  assert.equal(plan.items[0].x, 500);
+});
+
+test("planTypeLayout: right alignment anchors to the right edge", () => {
+  const plan = planTypeLayout({ ...brief, layout: { ...brief.layout, alignment: "right" } }, { width: 1000, height: 1250 });
+  assert.equal(plan.anchor, "end");
+  assert.equal(plan.items[0].x, 900);
+});
+
+test("briefToTextSpecs: produces Recraft-shaped type payloads", () => {
+  const specs = briefToTextSpecs(brief, { size: { width: 1024, height: 1280 } });
+  assert.ok(specs.length >= 3);
+  const headline = specs.find((s) => s.text.includes("COLD BREW"));
+  assert.ok(headline, "the headline must be typeset");
+  // The brief's px are relative to a 1080 canvas; the Recraft canvas is 1024.
+  assert.ok(headline.font_size > 85 && headline.font_size < 100, `scaled headline size: ${headline.font_size}`);
+  assert.equal(headline.font_weight, "800");
+  assert.ok(headline.x >= 0 && headline.x <= 100);
+  assert.ok(headline.y >= 0 && headline.y <= 100);
+  assert.ok(specs.every((s) => typeof s.text_color === "string" && s.text_color.startsWith("#")));
+});
+
+test("briefToTextSpecs: no copy means no specs", () => {
+  const specs = briefToTextSpecs({ ...brief, copy: {} }, { size: { width: 1024, height: 1024 } });
+  assert.equal(specs.length, 0);
+});
+
+test("applyTypeLayer: composites real glyphs over the artwork (or says why not)", async () => {
+  const sharp = (await import("sharp")).default;
+  const artwork = await sharp({
+    create: { width: 1000, height: 1250, channels: 3, background: { r: 244, g: 239, b: 228 } },
+  }).png().toBuffer();
+
+  const out = await applyTypeLayer(artwork, brief);
+  assert.ok(typeof out.applied === "boolean");
+  if (out.applied) {
+    assert.ok(out.buffer.length > 0);
+    const { data, info } = await sharp(out.buffer).raw().toBuffer({ resolveWithObject: true });
+    let dark = 0;
+    for (let i = 0; i < data.length; i += info.channels) {
+      if (data[i] < 120 && data[i + 1] < 120 && data[i + 2] < 120) dark++;
+    }
+    assert.ok(dark > 200, `type must actually be drawn (dark pixels: ${dark})`);
+  } else {
+    assert.ok(out.reason && out.reason.length > 5, "a skipped type layer must explain itself");
+  }
+});
+
+test("applyTypeLayer: a brief with no copy leaves the artwork untouched", async () => {
+  const sharp = (await import("sharp")).default;
+  const artwork = await sharp({ create: { width: 400, height: 400, channels: 3, background: { r: 10, g: 20, b: 30 } } }).png().toBuffer();
+  const out = await applyTypeLayer(artwork, { ...brief, copy: {} });
+  assert.equal(out.applied, false);
+  assert.equal(out.buffer, artwork);
+});

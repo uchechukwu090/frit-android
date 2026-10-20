@@ -439,9 +439,18 @@ export class LiveFeed {
     const cooldown = isAlert ? NOTIFY_COOLDOWN_MS : WAIT_STORE_COOLDOWN_MS;
     const changed = !last || last.decision !== signal.decision;
     const expired = !last || (now - last.ts) > cooldown;
-    if (!changed && !expired) return; // same signal, still fresh — stay quiet
+    const shouldPush = isAlert && (changed || expired);
+    // FIXED BUG (signals never appeared in the Signals tab): the push-dedupe
+    // used to `return` BEFORE storing, so a signal whose decision had not
+    // changed was never written to trading_signals at all. Storage and
+    // notification are now decoupled — every actionable signal is PERSISTED
+    // (that is the history the user reads), while the PUSH is still deduped
+    // so the phone is not buzzed for the same call every candle.
     try {
-      this.storeSignal(userId, { ...signal, _livePush: isAlert && (changed || expired) });
+      this.storeSignal(userId, { ...signal, _livePush: shouldPush });
+    } catch (e) { this.log(`[livefeed] fanout store failed: ${e.message}`); }
+    if (!shouldPush && !changed) return; // quiet, but the signal is recorded
+    try {
       this.db.prepare(
         "INSERT OR REPLACE INTO feed_last_signal (user_id, symbol, decision, entry, ts) VALUES (?, ?, ?, ?, ?)"
       ).run(userId, signal.symbol, signal.decision, signal.entry ?? null, now);

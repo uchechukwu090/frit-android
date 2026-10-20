@@ -36,10 +36,19 @@ export function volumeProfile(candles, { levels = 40, bucketSize = null } = {}) 
   let totalVol = 0;
   for (const c of candles) {
     if (!(c.volume > 0)) continue;
+    // F-45: the bucket COUNT and the bucket WALK must agree. They used to be
+    // computed two different ways — `n` from ceil((high-low)/step) and the
+    // walk as `for (p = c.low; p < c.high; p += step)`. Floating-point
+    // accumulation made the walk visit 11 buckets where n said 10, so
+    // totalVolume reported 110 for a candle that traded 100 and the top
+    // bucket got double volume — which then skewed the 70% value-area walk
+    // and mislocated the POC anchor. Walking by INTEGER INDEX makes the two
+    // agree by construction and conserves volume exactly.
     const n = Math.max(1, Math.ceil((c.high - c.low) / step));
     const per = c.volume / n;
-    for (let p = c.low; p < c.high; p += step) {
-      const key = Math.floor(p / step) * step;
+    const firstIdx = Math.floor(c.low / step);
+    for (let i = 0; i < n; i++) {
+      const key = (firstIdx + i) * step;
       const prev = buckets.get(key) || 0;
       buckets.set(key, +(prev + per).toFixed(4));
       totalVol += per;

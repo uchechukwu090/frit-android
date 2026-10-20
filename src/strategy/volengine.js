@@ -79,7 +79,12 @@ export function analyzeVol({ expiries = [], ivHistory = [], rv20 = null, eventDa
 
   // ---- selection ----
   const highIv = rank != null ? rank >= 40 : (rv20 != null && front.atmIv > rv20 * 1.1);
-  const lowIv = rank != null ? rank <= 25 : false;
+  // F-45: the cheap side had NO fallback for a thin IV history. With `rank`
+  // null (fewer than 20 IV points) `lowIv` was hard-coded false, so a 50%
+  // discount to realized vol was reported as "fair premium, no edge shape"
+  // and LONG_STRADDLE was unreachable — even though the module header says
+  // "buy when low". Mirrors the `highIv` fallback right above.
+  const lowIv = rank != null ? rank <= 25 : (rv20 != null && rv20 > 0 && front.atmIv < rv20 * 0.9);
   const stressed = slope != null && slope < -0.02;
   let strategy = "NONE", regime = "NORMAL";
   if (stressed) {

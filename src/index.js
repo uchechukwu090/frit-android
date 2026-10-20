@@ -30,7 +30,9 @@ import { analyzeVolumeMatrix } from "./strategy/volumematrix.js";
 import { createBilling } from "./billing.js";
 import { readProviderStream, sseDone, sseError, sseDelta } from "./streamProvider.js";
 import { classifyStreamRoute, stripConversationPrefix, ROUTE_TASK, ROUTE_CONVERSATION } from "./streaming.js";
-import { getBots, saveBot, tickBots, BOT_DEFS, scalpingAnalyze, ensureBotPairTables, getBotPairs, saveBotPair, removeBotPair } from "./strategy/bots.js";
+import { getBots, saveBot, tickBots, BOT_DEFS, scalpingAnalyze, ensureBotPairTables, getBotPairs, saveBotPair, removeBotPair, botCooldown } from "./strategy/bots.js";
+import { recommendLotSize, kellyFraction, normalizeRiskProfile, riskProfileInfo, RISK_PROFILES, DEFAULT_RISK_PROFILE } from "./strategy/sizing.js";
+const RISK_PROFILE_INFO = RISK_PROFILES;
 import { marketOf, canonicalSymbol, isDerivSymbol } from "./strategy/rails/router.js";
 import { openPaperPosition, resolvePaperBook, ledgerSummary } from "./strategy/options/paper.js";
 import { maturitySummary } from "./strategy/ledger.js";
@@ -44,6 +46,11 @@ import * as templateLibrary from "./creative/templateLibrary.js";
 import * as cinema from "./creative/cinema.js";
 import * as designStudio from "./creative/design.js";
 import * as brandKit from "./creative/brand.js";
+import * as designAgent from "./creative/designAgent.js";
+import * as imageProviders from "./creative/imageProviders.js";
+import * as typeLayer from "./creative/typeLayer.js";
+import * as refCache from "./creative/refCache.js";
+import * as directorAgent from "./creative/directorAgent.js";
 import { runBounded } from "./concurrency.js";
 import { setModelDb, MODEL_DEFAULTS, MODEL_KEYS, MODEL_META, overrideOf, M } from "./model_config.js";
 
@@ -459,6 +466,23 @@ db.exec(`
     symbol TEXT NOT NULL,
     removed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, list, symbol)
+  );
+
+  -- Per-user trading account: the balance the user actually trades on, their
+  -- declared risk profile (drives the Kelly fraction), and their own broker
+  -- credentials (Deriv token / MT5 account) for users who want the bot to
+  -- trade THEIR account instead of the platform's.
+  CREATE TABLE IF NOT EXISTS trading_account (
+    user_id TEXT PRIMARY KEY,
+    balance REAL DEFAULT 1000,
+    risk_profile TEXT DEFAULT 'MODERATE',
+    deriv_token TEXT,
+    deriv_token_mode TEXT DEFAULT 'platform',
+    mt5_server TEXT,
+    mt5_login TEXT,
+    mt5_password TEXT,
+    mt5_broker TEXT,
+    updated_at INTEGER
   );
 `);
 
@@ -1112,6 +1136,9 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
       return data;
     } catch (err) {
       lastError = err;
+      // F-08: the final error IS rethrown below, but an intermediate failure
+      // was invisible — a provider that is down looked like a clean 503.
+      console.warn(`[mistralChat] ${provider} attempt ${attempt}/${retries} failed: ${err.message}`);
       if (attempt < retries) await new Promise(r => setTimeout(r, attempt * 1000));
     }
   }
@@ -1649,8 +1676,11 @@ app.post("/agent/start", requireAuth, limitNormal, async (req, res) => {
       debitCredits(uid, "turn", "chat reply"); // post-success
       return res.json({ done: true, assistant_text: routed.reply });
     }
-  } catch (_) {
+  } catch (e) {
     // Router failed — fall through to the agent loop rather than erroring out.
+    // F-08: log it, because a broken router silently pushes EVERY message
+    // down the expensive agent path instead of the cheap chat path.
+    console.warn(`[agent/start] chat router failed, falling through to the agent loop: ${e.message}`);
   }
 
   // Market questions go to the agent loop like everything else. The brain
@@ -1987,8 +2017,17 @@ async function mistralTranscribe(audio_base64, mime_type = "audio/webm") {
   return "";
 }
 
-// Image generation via OpenRouter Images API (default: Seedream 5.0 Flash).
+// Image generation. Three providers, one normalised return shape:
+//   OpenRouter (default) — the /images gateway.
+//   Ideogram             — model slug "ideogram/..." (typography specialist).
+//   Recraft              — model slug "recraft/..." (real fonts via `texts[]`).
+// The provider is chosen by the model slug, so the existing craft routing
+// (OR_TYPE_MODEL / OR_VECTOR_MODEL) lights up with no extra plumbing.
 async function generateImage(prompt, opts = {}) {
+  const provider = imageProviders.providerFor(opts.model, opts);
+  if (provider !== imageProviders.PROVIDER_OPENROUTER) {
+    return imageProviders.generateWithProvider(provider, prompt, opts);
+  }
   if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY missing");
   const model = opts.model || OR_IMAGE_MODEL;
   const isMing = model.startsWith("inclusionai/ming");
@@ -2877,6 +2916,10 @@ async function getWeather(city = "Lagos") {
     const cw = wx.current_weather;
     return `${loc.name}: ${cw.temperature}°C, wind ${cw.windspeed} km/h, ${cw.weathercode <= 1 ? "Clear" : cw.weathercode <= 3 ? "Cloudy" : "Rainy"}`;
   } catch (e) {
+    // F-08: the real reason the weather lookup failed (rate limit, DNS, bad
+    // city) used to vanish behind a generic string, so a broken upstream was
+    // indistinguishable from a missing city.
+    console.warn(`[weather] lookup failed for "${city}": ${e.message}`);
     return "Weather unavailable";
   }
 }
@@ -3109,6 +3152,12 @@ function ensureSignalColumns() {
     if (!cols.includes("tp_basis")) db.exec("ALTER TABLE trading_signals ADD COLUMN tp_basis TEXT");
     if (!cols.includes("regime")) db.exec("ALTER TABLE trading_signals ADD COLUMN regime TEXT");
     if (!cols.includes("entry_ctx")) db.exec("ALTER TABLE trading_signals ADD COLUMN entry_ctx TEXT");
+    // Which engine/bot produced this signal — the notification bar tags by it.
+    if (!cols.includes("bot_source")) db.exec("ALTER TABLE trading_signals ADD COLUMN bot_source TEXT");
+    // Lot size recommendation (Kelly-based) attached to every signal.
+    if (!cols.includes("lot_size")) db.exec("ALTER TABLE trading_signals ADD COLUMN lot_size REAL");
+    if (!cols.includes("lot_reason")) db.exec("ALTER TABLE trading_signals ADD COLUMN lot_reason TEXT");
+    if (!cols.includes("risk_usd")) db.exec("ALTER TABLE trading_signals ADD COLUMN risk_usd REAL");
   } catch (e) { console.warn("[signals] migration failed:", e.message); }
 }
 ensureSignalColumns();
@@ -3117,9 +3166,9 @@ function storeSignalHistory(user_id, signal) {
   try {
     ensureSignalColumns();
     db.prepare(`
-      INSERT INTO trading_signals
-      (id, user_id, symbol, decision, confidence, entry, sl, tp1, tp2, rr, scenario, reasoning, pullback_health, range_info, costs, tp_basis, regime, entry_ctx, timestamp, is_favorite, is_read)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO trading_signals
+      (id, user_id, symbol, decision, confidence, entry, sl, tp1, tp2, rr, scenario, reasoning, pullback_health, range_info, costs, tp_basis, regime, entry_ctx, bot_source, lot_size, lot_reason, risk_usd, timestamp, is_favorite, is_read)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       signal.id, user_id, signal.symbol, signal.decision, signal.confidence,
       signal.entry, signal.sl, signal.tp1, signal.tp2, signal.rr,
@@ -3129,6 +3178,8 @@ function storeSignalHistory(user_id, signal) {
       signal.costs ? JSON.stringify(signal.costs) : null,
       signal.tpBasis || null, signal.regime || null,
       signal.entryCtx ? JSON.stringify(signal.entryCtx) : null,
+      signal.botSource || signal.bot_source || null,
+      signal.lotSize ?? null, signal.lotReason || null, signal.riskUsd ?? null,
       signal.timestamp, 0, 0
     );
   } catch (e) {
@@ -3146,6 +3197,10 @@ function hydrateSignal(row) {
     costs: row.costs ? j(row.costs) : null,
     entryCtx: row.entry_ctx ? j(row.entry_ctx) : null,
     tpBasis: row.tp_basis || null,
+    botSource: row.bot_source || "engine",
+    lotSize: row.lot_size != null ? Number(row.lot_size) : null,
+    lotReason: row.lot_reason || null,
+    riskUsd: row.risk_usd != null ? Number(row.risk_usd) : null,
     isFavorite: row.is_favorite === 1,
     isRead: row.is_read === 1,
   };
@@ -3673,11 +3728,16 @@ function riskGate({ symbol, action, lotSize, entry, sl, balance }) {
 // everything else -> MT5 bridge (existing behavior, paper while unset).
 // riskUsdOverride is ALWAYS set for deriv/alpaca so the per-trade cap can
 // never be silently skipped for lack of a PIP row.
-async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual", balance = 1000, riskPercent = 1 }) {
+async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual", balance = 1000, riskPercent = 1, userId = null, botName = null }) {
   const sym = canonicalSymbol(symbol);
   const rail = marketOf(sym);
   const riskBudget = Math.max(0.5, (Number(balance) || 1000) * (Number(riskPercent) || 1) / 100);
-  if (rail === "deriv") return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget });
+  // The user's OWN balance is the sizing base when we know who is trading.
+  if (userId) {
+    const acct = getTradingAccount(userId);
+    if (acct?.balance > 0) balance = acct.balance;
+  }
+  if (rail === "deriv") return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName });
   if (rail === "alpaca") return executeAlpacaTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget });
   // F-06: bots pass a placeholder 0.01 lot. Size MT5-bridge trades from the
   // risk budget (balance x riskPercent, capped by calculateLotSize) instead;
@@ -3695,8 +3755,12 @@ async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reas
   // executor verifies MULT availability per symbol, so the only trades that
   // stay paper are ones no connected broker supports. MT5 bridge wins back
   // automatically the moment MT5_BRIDGE_URL is set.
+  //
+  // This is the path FX and metals take (they are "mt5" rail by symbol class
+  // but Deriv lists them as real OTC pairs), so bot orders for EURUSD/XAUUSD
+  // reach Deriv through here.
   if (!MT5_BRIDGE_URL) {
-    return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget });
+    return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName });
   }
   const result = await sendToMT5Bridge({ symbol: sym, action, lotSize, entry, sl, tp, reason });
   if (result.status !== "failed" && sl && tp) {
@@ -3710,11 +3774,31 @@ async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reas
 /** Deriv MULT execution. take_profit/stop_loss are dollar approximations
  *  (moveRatio x multiplier x stake at the default x100); Deriv prices the
  *  proposal exactly and the native contract levels enforce the exit. */
-async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget }) {
+async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget, userId = null, botName = null }) {
   const stake = Math.max(0.5, Math.min(1000, Number(riskBudget) || 5));
   const direction = String(action).toLowerCase() === "sell" ? "sell" : "buy";
   const e = Number(entry);
   const mult = Number(process.env.DERIV_MULTIPLIER) || 100;
+  // A user who supplied their OWN Deriv token gets their OWN account traded.
+  // The platform token (from Render env) is the default for everyone else.
+  let executor = derivExecutor;
+  let ownExecutor = null;
+  if (userId) {
+    try {
+      const acct = getTradingAccount(userId);
+      if (acct?.derivTokenMode === "own" && acct.hasDerivToken) {
+        const raw = db.prepare("SELECT deriv_token FROM trading_account WHERE user_id = ?").get(userId)?.deriv_token;
+        if (raw && String(raw).length > 4) {
+          const client = new DerivClient({ token: String(raw).trim(), appId: DERIV_APP_ID, log: (...a) => console.log(...a) });
+          ownExecutor = new DerivExecutor({
+            db, client, liveAllowed: DERIV_LIVE, stake, maxPerDay: POCKET_DERIV_MAX_DAY,
+            log: (...a) => console.log(...a),
+          });
+          executor = ownExecutor;
+        }
+      }
+    } catch (e) { console.warn("[deriv] own-token executor failed:", e.message); }
+  }
   const takeProfit = e > 0 && tp != null ? +((Math.abs(tp - e) / e) * mult * stake).toFixed(2) : null;
   const stopLoss = e > 0 && sl != null ? +Math.min((Math.abs(e - sl) / e) * mult * stake, stake).toFixed(2) : null;
   const gate = riskGate({ symbol, action: direction, lotSize: 0, entry, sl, balance: 1000, riskUsdOverride: stake });
@@ -4213,7 +4297,7 @@ app.get("/", (_req, res) => {
       video: ["/videos/submit", "/videos/status/:jobId", "/videos/content/:jobId"],
       creative: ["/creative/compose", "/creative/revise", "/creative/assemble", "/creative/ground", "/creative/jobs"],
       agent: ["/agent/start", "/agent/resume", "/agent/status", "/agent/chat/stream"],
-      creativeSuite: ["/creative-suite/images/generate", "/creative-suite/images/edit", "/creative-suite/images/remove-background", "/creative-suite/images/retouch", "/creative-suite/images/style-transfer", "/creative-suite/images/upscale", "/creative-suite/images/generative-fill", "/creative-suite/images/batch", "/creative-suite/images/batch/:id/status", "/creative-suite/videos/generate", "/creative-suite/videos/edit", "/creative-suite/videos/subtitles", "/creative-suite/videos/translate-subtitles", "/creative-suite/storyboard", "/creative-suite/templates", "/creative-suite/style-presets", "/creative-suite/prompt-suggest", "/creative-suite/prompt-enhance", "/creative-suite/recommend", "/creative-suite/projects", "/creative-suite/export", "/creative-suite/cinema/options", "/creative-suite/cinema/direct", "/creative-suite/cinema/generate", "/creative-suite/katana", "/creative-suite/genjutsu", "/creative-suite/elements", "/creative-suite/influencer", "/creative-suite/ads", "/creative-suite/lipsync", "/creative-suite/lipsync/:jobId/status", "/creative-suite/videos/models", "/creative-suite/cinema/recipes", "/creative-suite/autopilot", "/creative-suite/brandkit", "/creative-suite/design", "/creative-suite/design/templates", "/creative-suite/director", "/webhooks/lipsync"],
+      creativeSuite: ["/creative-suite/images/generate", "/creative-suite/images/edit", "/creative-suite/images/remove-background", "/creative-suite/images/retouch", "/creative-suite/images/style-transfer", "/creative-suite/images/upscale", "/creative-suite/images/generative-fill", "/creative-suite/images/batch", "/creative-suite/images/batch/:id/status", "/creative-suite/videos/generate", "/creative-suite/videos/edit", "/creative-suite/videos/subtitles", "/creative-suite/videos/translate-subtitles", "/creative-suite/storyboard", "/creative-suite/templates", "/creative-suite/style-presets", "/creative-suite/prompt-suggest", "/creative-suite/prompt-enhance", "/creative-suite/recommend", "/creative-suite/projects", "/creative-suite/export", "/creative-suite/cinema/options", "/creative-suite/cinema/direct", "/creative-suite/cinema/generate", "/creative-suite/katana", "/creative-suite/genjutsu", "/creative-suite/elements", "/creative-suite/influencer", "/creative-suite/ads", "/creative-suite/lipsync", "/creative-suite/lipsync/:jobId/status", "/creative-suite/videos/models", "/creative-suite/cinema/recipes", "/creative-suite/autopilot", "/creative-suite/brandkit", "/creative-suite/design", "/creative-suite/design/templates", "/creative-suite/design/agent", "/creative-suite/refs/:id", "/creative-suite/director", "/webhooks/lipsync"],
       billing: ["/billing/tiers", "/billing/pay-info", "/billing/subscribe", "/billing/submit-reference", "/billing/pending", "/billing/approve", "/billing/mint", "/billing/redeem", "/billing/status"],
       wallet: ["/wallet/balance", "/wallet/topup", "/wallet/spend", "/wallet/withdraw", "/wallet/withdrawals"],
       admin: ["/admin/inbox", "/admin/keys", "/admin/snapshot", "/admin/ledger/verify", "/admin/backup", "/admin/withdrawals/approve"],
@@ -6761,9 +6845,125 @@ app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) =>
   }
 });
 
-// AI Director: brief (+ optional reference video) -> shot plan -> per-shot
-// generation with observe-and-correct -> assembled MP4. The user just says
-// "make a video of X" and gets a finished, edited film back.
+// ==================== REFERENCE PROXY ====================
+// Pinterest / Behance CDNs hotlink-protect a lot of their images. When the
+// VISION PROVIDER (not our server) fetches a CDN URL it gets a 403 and the
+// agent silently loses a reference. This route serves the bytes WE already
+// fetched, under an unguessable id, so the provider always gets the image.
+// It is also what the Android client uses to SHOW which references the
+// agent actually studied.
+app.get("/creative-suite/refs/:id", limitNormal, (req, res) => {
+  const entry = refCache.refStore().get(req.params.id);
+  if (!entry) return res.status(404).json({ error: "reference expired" });
+  res.set("Content-Type", entry.mime || "image/jpeg");
+  res.set("Cache-Control", "private, max-age=1800");
+  res.set("X-Content-Type-Options", "nosniff");
+  res.send(entry.buf);
+});
+
+// ==================== DESIGN AGENT (Week 6) ====================
+// Three stages the Design Studio was missing: research the web for visual
+// references, turn them into ONE detailed brief (layout, alignment, palette,
+// fonts, sizes, elements, background, exact copy), then render and VERIFY the
+// render against that brief (one corrective retry). The whole trail comes back
+// so the app can show the reasoning, not just an image.
+// Week 7 hardening:
+//   * the reference is split into STRUCTURE / CONTENT and only structure is
+//     allowed into the brief (creative/designDNA.js),
+//   * references are picked for maximum structural SPREAD, not top-of-search,
+//   * every run carries a seed: query style token, reference order and art
+//     direction all derive from it, so the same request never produces the
+//     same design twice,
+//   * the brief is pushed AWAY from the references it studied,
+//   * a TYPE LAYER sets the real typography over the rendered artwork.
+const designAgentDeps = {
+  chat: async (messages, opts = {}) => {
+    const out = await chatWithFallback("vision", {
+      messages,
+      max_tokens: opts.max_tokens ?? 900,
+      temperature: opts.temperature ?? 0.2,
+    });
+    return String(out?.choices?.[0]?.message?.content || "");
+  },
+  // Model CHAIN, not a single slug: an unserved/retired graphics model must
+  // never kill a finished brief (that is exactly what Week 6 found — the old
+  // design default was retired upstream). Explicit caller model wins.
+  // The chain also carries the TYPE model (Ideogram-class) because a
+  // type-heavy brief is exactly what Ideogram is good at.
+  generate: async (prompt, opts = {}) => {
+    const chain = [...new Set([opts.model, OR_GRAPHICS_MODEL, OR_TYPE_MODEL, OR_IMAGE_MODEL].filter(Boolean))];
+    let lastErr = null;
+    for (const model of chain) {
+      try {
+        return await generateImage(prompt, {
+          model,
+          output_format: opts.output_format || "png",
+          ...(opts.aspect_ratio ? { aspect_ratio: opts.aspect_ratio } : {}),
+          ...(opts.brief ? { brief: opts.brief } : {}),
+          ...(opts.seed != null ? { seed: opts.seed } : {}),
+          ...(opts.negative_prompt ? { negative_prompt: opts.negative_prompt } : {}),
+        });
+      } catch (e) {
+        lastErr = e;
+        console.warn(`[design-agent] ${model} failed: ${e.message}`);
+      }
+    }
+    throw lastErr || new Error("no image model configured");
+  },
+  // Reference bytes are fetched ONCE by us and served from our own host, so
+  // the vision provider never has to hotlink a protected CDN.
+  proxyReference: async (url) => {
+    try {
+      const entry = await refCache.refStore().fetchAndStore(url, { fetchImpl: fetch });
+      const base = PUBLIC_BASE_URL || "";
+      if (!base) return null; // no public base URL -> the inline path is used
+      return `${base}${refCache.REFERENCE_PATH_PREFIX}${entry.id}`;
+    } catch (e) {
+      console.warn(`[design-agent] reference proxy failed for ${String(url).slice(0, 80)}: ${e.message}`);
+      return null;
+    }
+  },
+  // The type layer: real glyphs, real sizes, set from the brief.
+  applyType: async (buffer, brief) => typeLayer.applyTypeLayer(buffer, brief),
+  fetchImpl: fetch,
+};
+
+app.post("/creative-suite/design/agent", requireAuth, limitCostly, async (req, res) => {
+  try {
+    const input = req.body || {};
+    const goal = String(input.goal || input.headline || "").trim();
+    if (!goal) return res.status(400).json({ error: "goal required" });
+    const uid = boundUser(req);
+    const ent = checkEntitlement(uid, "image");
+    if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
+    // F-13: brand kit resolved server-side (ownership checked in SQL).
+    const { brand } = applyBrand(uid, input.brandkit_id, "");
+    const out = await designAgent.runDesignAgent({ ...input, goal, brand, uid }, designAgentDeps);
+    const id = `dsg_${Date.now()}`;
+    const firstUrl = out.render?.image_url || out.render?.image_b64 || "";
+    try {
+      db.prepare("INSERT INTO creative_jobs (id, user_id, kind, status, prompt, result_url) VALUES (?, ?, 'design_agent', ?, ?, ?)")
+        .run(id, uid, out.ok ? "done" : "failed", goal.slice(0, 400), String(firstUrl).slice(0, 1000));
+    } catch (e) { console.warn("[design-agent] job row failed:", e.message); }
+    if (!out.ok) return res.status(502).json({ ok: false, error: "all render attempts failed", job_id: id, ...out });
+    // Charge once per DELIVERED design (image rate), never before the work.
+    debitCredits(uid, "image", "design agent");
+    db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+    res.json({ ok: true, job_id: id, brand_applied: !!brand, ...out });
+  } catch (err) {
+    console.error("[/creative-suite/design/agent]", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// AI Director: brief (+ optional reference video) -> LOOK research -> shot
+// plan -> per-shot generation -> FRAME VERIFICATION (real observe-and-
+// correct) -> assembled MP4.
+//
+// Week 7: "auto_correct" used to mean "retry when the provider threw". It
+// now means what it says — the rendered clip is sampled into frames, a
+// vision model checks each frame against the shot it was supposed to be, and
+// a failed shot is re-rendered with the reviewer's own complaints.
 app.post("/creative-suite/director", requireAuth, limitCostly, async (req, res) => {
   try {
     const { brief, reference_video, num_shots, auto_correct, aspect_ratio } = req.body || {};
@@ -6772,11 +6972,7 @@ app.post("/creative-suite/director", requireAuth, limitCostly, async (req, res) 
     const ent = checkEntitlement(uid, "video");
     if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
 
-    // 1. Plan the film
-    const shots = await cinema.aiDirect(brief, Math.min(8, Math.max(2, Number(num_shots) || 4)));
-    if (!shots.length) throw new Error("AI Director could not plan the film — try a more specific brief");
-
-    // 2. Generate each shot (parallel, with optional observe-and-correct)
+    // Reference video (user supplied) — passed to the renderer as-is.
     const refUrls = [];
     if (reference_video) {
       const s = String(reference_video);
@@ -6790,20 +6986,38 @@ app.post("/creative-suite/director", requireAuth, limitCostly, async (req, res) 
       }
     }
 
-    const generated = await Promise.all(shots.map(async (shot, idx) => {
-      const directed = cinema.buildDirectorPrompt({
-        prompt: shot.prompt, genre: shot.genre, camera: shot.camera, lens: shot.lens,
-        aperture: shot.aperture, move: shot.move, angle: shot.angle, lighting: shot.lighting,
-        palette: shot.palette, emotion: shot.emotion, tempo: "Single Shot",
-      });
-      const isVideo = shot.kind === "video";
-      const refs = refUrls.map(u => ({ type: "image_url", image_url: { url: u } }));
-
-      let url = null;
-      let attempts = 0;
-      const maxAttempts = auto_correct ? 2 : 1;
-      while (!url && attempts < maxAttempts) {
-        attempts++;
+    const deps = {
+      chat: async (messages, opts = {}) => {
+        const out = await chatWithFallback("vision", {
+          messages,
+          max_tokens: opts.max_tokens ?? 1200,
+          temperature: opts.temperature ?? 0.4,
+        });
+        return String(out?.choices?.[0]?.message?.content || "");
+      },
+      // Look research: cinematography vocabulary, not layout vocabulary.
+      research: async (goal, { seed }) => {
+        const queries = directorAgent.planLookQueries(goal, { seed });
+        const refs = [];
+        for (const q of queries) {
+          try {
+            const urls = await designAgent.bingImageSearch(q, { fetchImpl: fetch, limit: 8 });
+            refs.push(...urls);
+          } catch { /* keep going */ }
+          if (refs.length >= 3) break;
+        }
+        return { refs: designAgent.rankInspirationUrls(refs, { max: 4, seed }) };
+      },
+      readLook: (ref, goal) => directorAgent.readLookReference(ref, goal, { chat: deps.chat, fetchImpl: fetch }),
+      planFilm: (goal, n, looks) => directorAgent.synthesizeShotPlan(goal, n, looks, { chat: deps.chat }),
+      renderShot: async (shot, { attempt, correction }) => {
+        const directed = cinema.buildDirectorPrompt({
+          prompt: shot.prompt, genre: shot.genre, camera: shot.camera, lens: shot.lens,
+          aperture: shot.aperture, move: shot.move, angle: shot.angle, lighting: shot.lighting,
+          palette: shot.palette, emotion: shot.emotion, tempo: "Single Shot",
+        }) + (correction ? ` CORRECTIONS FROM REVIEW: ${correction}.` : "");
+        const isVideo = shot.kind !== "image";
+        const refs = refUrls.map(u => ({ type: "image_url", image_url: { url: u } }));
         try {
           if (isVideo) {
             const job = await submitVideo(directed, {
@@ -6814,30 +7028,66 @@ app.post("/creative-suite/director", requireAuth, limitCostly, async (req, res) 
             const vid = await pollVideo(job.id || job.job_id);
             if (vid?.data?.status === "completed" || vid?.status === "completed") {
               const content = await downloadVideo(job.id || job.job_id, 0);
-              url = `data:video/mp4;base64,${content.toString("base64")}`;
+              db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+              return {
+                ok: true, kind: "video",
+                url: `data:video/mp4;base64,${content.toString("base64")}`,
+                base64: content.toString("base64"),
+              };
             }
-          } else {
-            const img = await generateImage(directed, {
-              aspect_ratio: aspect_ratio || "16:9",
-              ...(refs.length ? { input_references: refs } : {}),
-            });
-            url = img.image_url || (img.image_b64 ? `data:image/png;base64,${img.image_b64}` : null);
-            if (!url) throw new Error("no image returned");
+            throw new Error(`clip not ready (${vid?.data?.status || vid?.status || "unknown"})`);
           }
+          const img = await generateImage(directed, {
+            aspect_ratio: aspect_ratio || "16:9",
+            ...(refs.length ? { input_references: refs } : {}),
+          });
+          const url = img.image_url || (img.image_b64 ? `data:image/png;base64,${img.image_b64}` : null);
+          if (!url) throw new Error("no image returned");
           db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
+          return { ok: true, kind: "image", url, base64: img.image_b64 || null };
         } catch (e) {
-          if (attempts >= maxAttempts) return { ...shot, ok: false, error: e.message };
+          // F-08: an intermediate attempt's failure was dropped, so a flaky
+          // provider looked like a clean success on the retry.
+          console.warn(`[director] shot ${shot.index} attempt ${attempt} failed: ${e.message}`);
+          return { ok: false, error: e.message };
         }
-      }
-      return { ...shot, ok: true, url, kind: isVideo ? "video" : "image" };
-    }));
+      },
+      // Sample frames out of the rendered clip so it can actually be LOOKED
+      // at. Still shots are their own frame.
+      framesOf: async (r) => {
+        if (r.kind !== "video") return r.url ? [r.url] : [];
+        if (!r.base64 || !SANDBOX_URL) return [];
+        try {
+          const res = await fetch(`${SANDBOX_URL}/media/frames`, {
+            method: "POST",
+            headers: sandboxAuthHeaders(),
+            body: JSON.stringify({ video_base64: r.base64, timestamps: [0.5, 2.0], width: 768 }),
+            signal: AbortSignal.timeout(90_000),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data?.frames?.length) return [];
+          return data.frames.map((f) => `data:${f.mime || "image/jpeg"};base64,${f.base64}`);
+        } catch (e) {
+          console.warn(`[director] frame extraction failed: ${e.message}`);
+          return [];
+        }
+      },
+      verifyFrame: (frame, shot) => directorAgent.verifyShotFrame(frame, shot, { chat: deps.chat }),
+    };
+
+    const agentOut = await directorAgent.runDirectorAgent(
+      { brief, num_shots: num_shots, auto_correct, uid },
+      deps
+    );
+    const generated = agentOut.shots;
+    if (!generated.length) throw new Error("AI Director could not plan the film — try a more specific brief");
 
     const succeeded = generated.filter(g => g.ok && g.url);
     if (!succeeded.length) {
-      return res.status(500).json({ ok: false, error: "all shots failed to generate", shots: generated });
+      return res.status(500).json({ ok: false, error: "all shots failed to generate", shots: generated, warnings: agentOut.warnings });
     }
 
-    // 3. Assemble into a film
+    // Assemble into a film
     const files = succeeded.map(g => ({ base64: g.url.replace(/^data:[\w/;-]+;base64,/, "") }));
     const isMixed = succeeded.some(g => g.kind === "video");
     const assembleOp = isMixed ? "concat" : "slideshow";
@@ -6861,6 +7111,9 @@ app.post("/creative-suite/director", requireAuth, limitCostly, async (req, res) 
     res.json({
       ok: true, job_id: id,
       shots: generated,
+      looks: agentOut.looks,
+      verification: generated.map((g) => ({ index: g.index, ...(g.verification || {}) })),
+      warnings: agentOut.warnings,
       film: { mime: "video/mp4", size: data.size, base64: data.base64 },
     });
   } catch (err) {
@@ -7192,6 +7445,45 @@ setInterval(async () => {
       analyzeSynth: (symbol, closes) => analyzeSynth(symbol, closes),
       scalpingAnalyze: (symbol, closes, timeframe) => scalpingAnalyze(symbol, closes, timeframe),
       pocketScan: (symbol, expiryMin) => pocketScan(symbol, expiryMin),
+      botCooldown: (db, key, intervalMin) => botCooldown(db, key, intervalMin),
+      // Kelly lot size against the USER's own balance + risk profile (item 9).
+      // The legacy "bot" pseudo-user has no account, so it gets the default.
+      sizeFor: (userId, signal) => {
+        if (!userId || userId === "bot") {
+          return {
+            lotSize: 0.01,
+            riskUsd: 0,
+            reason: "platform default 0.01 lot (no user account attached)",
+          };
+        }
+        const acct = getTradingAccount(userId);
+        if (!acct) return { lotSize: 0.01, riskUsd: 0, reason: "no account — 0.01 lot default" };
+        const m = measuredWinRate(signal.symbol);
+        const sizing = recommendLotSize({
+          symbol: signal.symbol,
+          balance: acct.balance,
+          entry: signal.entry,
+          sl: signal.sl,
+          tp: signal.tp1,
+          rr: signal.rr,
+          winRate: m.wr,
+          profile: acct.riskProfile,
+          pipConfig: PIP_CONFIG,
+          confidence: signal.confidence,
+        });
+        return {
+          lotSize: sizing.lotSize || 0.01,
+          riskUsd: sizing.riskUsd,
+          reason: sizing.reason + (m.reliable
+            ? ` (win rate ${(m.wr * 100).toFixed(0)}% over ${m.n} resolved setups)`
+            : ` (default 45% win rate — only ${m.n} resolved setups)`),
+        };
+      },
+      fetchCandles: async (symbol, interval) => {
+        const iv = interval === "1m" ? "1min" : interval === "5m" ? "5min" : interval === "15m" ? "15min" : interval;
+        const candles = await fetchCandles(symbol, iv, 200);
+        return candles || null;
+      },
       fetchCloses: async (symbol, interval) => {
         const candles = await fetchCandles(symbol, interval === "1m" ? "1min" : interval, 200);
         if (!candles?.length) throw new Error(`no ${interval} candles for ${symbol}`);
@@ -7217,6 +7509,77 @@ setInterval(async () => {
     console.warn("[bots] tick failed:", e.message);
   }
 }, 60_000).unref?.();
+
+// ==================== TRADING ACCOUNT (balance / risk / broker creds) ======
+// The balance here is the user's REAL account balance — the base for Kelly
+// sizing, the portfolio equity, and every paper + external execution.
+// It is per-user and persisted, so it survives restarts and device reboots.
+function ensureAccountRow(user_id) {
+  try {
+    db.prepare("INSERT OR IGNORE INTO trading_account (user_id, balance, risk_profile, updated_at) VALUES (?, 1000, 'MODERATE', ?)")
+      .run(user_id, Date.now());
+  } catch { /* ignore */ }
+}
+
+function getTradingAccount(user_id) {
+  ensureAccountRow(user_id);
+  try {
+    const r = db.prepare("SELECT * FROM trading_account WHERE user_id = ?").get(user_id);
+    if (!r) return null;
+    return {
+      userId: user_id,
+      balance: Number(r.balance) > 0 ? Number(r.balance) : 1000,
+      riskProfile: r.risk_profile || "MODERATE",
+      // Credentials are NEVER echoed back in full — only whether they exist.
+      hasDerivToken: !!(r.deriv_token && String(r.deriv_token).length > 4),
+      derivTokenMode: r.deriv_token_mode || "platform",
+      hasMt5: !!(r.mt5_server && r.mt5_login),
+      mt5Server: r.mt5_server || null,
+      mt5Login: r.mt5_login ? maskSecret(r.mt5_login) : null,
+      mt5Broker: r.mt5_broker || null,
+      updatedAt: r.updated_at || null,
+    };
+  } catch { return null; }
+}
+
+function maskSecret(s) {
+  const str = String(s || "");
+  if (str.length <= 4) return "****";
+  return str.slice(0, 2) + "*".repeat(Math.max(3, str.length - 4)) + str.slice(-2);
+}
+
+function saveTradingAccount(user_id, patch = {}) {
+  ensureAccountRow(user_id);
+  const cur = db.prepare("SELECT * FROM trading_account WHERE user_id = ?").get(user_id) || {};
+  const balance = patch.balance != null ? Number(patch.balance) : Number(cur.balance);
+  if (!Number.isFinite(balance) || balance <= 0) throw new Error("balance must be a positive number");
+  if (balance > 100_000_000) throw new Error("balance is unrealistically large");
+  const riskProfile = patch.riskProfile != null
+    ? normalizeRiskProfile(patch.riskProfile)
+    : (cur.risk_profile || "MODERATE");
+  const derivToken = patch.derivToken != null
+    ? (String(patch.derivToken).trim() || null)
+    : (cur.deriv_token || null);
+  const derivTokenMode = patch.derivTokenMode != null
+    ? (String(patch.derivTokenMode) === "own" ? "own" : "platform")
+    : (cur.deriv_token_mode || "platform");
+  // Only overwrite MT5 fields when the caller actually supplies them, so a
+  // partial update never wipes a stored broker login.
+  const mt5Server = patch.mt5Server != null ? String(patch.mt5Server).trim() : (cur.mt5_server || null);
+  const mt5Login = patch.mt5Login != null ? String(patch.mt5Login).trim() : (cur.mt5_login || null);
+  const mt5Password = patch.mt5Password != null ? String(patch.mt5Password).trim() : (cur.mt5_password || null);
+  const mt5Broker = patch.mt5Broker != null ? String(patch.mt5Broker).trim() : (cur.mt5_broker || null);
+  db.prepare(`
+    INSERT INTO trading_account
+      (user_id, balance, risk_profile, deriv_token, deriv_token_mode, mt5_server, mt5_login, mt5_password, mt5_broker, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      balance = ?, risk_profile = ?, deriv_token = ?, deriv_token_mode = ?,
+      mt5_server = ?, mt5_login = ?, mt5_password = ?, mt5_broker = ?, updated_at = ?
+  `).run(user_id, balance, riskProfile, derivToken, derivTokenMode, mt5Server, mt5Login, mt5Password, mt5Broker, Date.now(),
+    balance, riskProfile, derivToken, derivTokenMode, mt5Server, mt5Login, mt5Password, mt5Broker, Date.now());
+  return getTradingAccount(user_id);
+}
 
 // ==================== TRADING SUITE API ====================
 // Comprehensive AI-powered trading endpoints for mobile app
@@ -7319,6 +7682,53 @@ app.patch("/api/trading/watchlist/:symbol", requireAuth, async (req, res) => {
   }
 });
 
+// --- Kelly lot-size attachment (item 9) ---
+// Every published signal carries a lot-size recommendation computed from the
+// user's OWN account balance and declared risk profile. The measured win-rate
+// comes from the journal (the only real track record we have); when there is
+// not enough history yet, the conservative default is used and the reason
+// says so.
+function measuredWinRate(symbol = null) {
+  try {
+    const row = symbol
+      ? db.prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS w FROM pullback_journal WHERE status='RESOLVED' AND symbol = ?").get(String(symbol).toUpperCase())
+      : db.prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS w FROM pullback_journal WHERE status='RESOLVED'").get();
+    const n = row?.n || 0;
+    if (n < 20) return { wr: 0.45, n, reliable: false };
+    return { wr: (row.w || 0) / n, n, reliable: true };
+  } catch { return { wr: 0.45, n: 0, reliable: false }; }
+}
+
+function attachLotSize(user_id, signal) {
+  try {
+    const acct = getTradingAccount(user_id);
+    if (!acct) return signal;
+    const m = measuredWinRate(signal.symbol);
+    const sizing = recommendLotSize({
+      symbol: signal.symbol,
+      balance: acct.balance,
+      entry: signal.entry,
+      sl: signal.sl,
+      tp: signal.tp1,
+      rr: signal.rr,
+      winRate: m.wr,
+      profile: acct.riskProfile,
+      pipConfig: PIP_CONFIG,
+      confidence: signal.confidence,
+    });
+    signal.lotSize = sizing.lotSize || null;
+    signal.lotReason = sizing.reason + (m.reliable
+      ? ` (win rate ${(m.wr * 100).toFixed(0)}% over ${m.n} resolved setups)`
+      : ` (default 45% win rate — only ${m.n} resolved setups so far)`);
+    signal.riskUsd = sizing.riskUsd || null;
+    signal.balance = acct.balance;
+    signal.riskProfile = acct.riskProfile;
+  } catch (e) {
+    console.warn("[attachLotSize]", e.message);
+  }
+  return signal;
+}
+
 // --- Signal Scanning (batch analyze watchlist) ---
 app.post("/api/trading/scan", requireAuth, async (req, res) => {
   try {
@@ -7352,6 +7762,10 @@ app.post("/api/trading/scan", requireAuth, async (req, res) => {
       }
       try {
         const signal = formatTradingSignal(sym, r.value);
+        signal.botSource = "engine";
+        // Attach the Kelly lot-size recommendation to EVERY signal (item 9):
+        // sized against the user's own balance and declared risk profile.
+        attachLotSize(user_id, signal);
         // Only persist meaningful signals — plain WAIT/DATA noise would flood
         // history. WAIT_PULLBACK / WAIT_RANGE carry actionable zones.
         const keep = ["BUY", "SELL", "WAIT_PULLBACK", "WAIT_RANGE"].includes(signal.decision);
@@ -7374,6 +7788,63 @@ app.post("/api/trading/scan", requireAuth, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: "Scan failed", details: err.message });
+  }
+});
+
+// --- Trading account: balance, risk profile, own broker credentials ---
+app.get("/api/trading/account", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    res.json({ account: getTradingAccount(user_id) });
+  } catch (err) {
+    res.status(500).json({ error: "Account fetch failed", details: err.message });
+  }
+});
+
+app.post("/api/trading/account", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const account = saveTradingAccount(user_id, req.body || {});
+    res.json({ ok: true, account });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- Lot size recommendation (item 9) ---
+// Kelly-based sizing against the user's own balance + risk profile.
+app.post("/api/trading/lot-size", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const { symbol, entry, sl, tp, rr, winRate, confidence } = req.body || {};
+    const acct = getTradingAccount(user_id);
+    const sym = String(symbol || "").toUpperCase();
+    if (!sym) return res.status(400).json({ error: "symbol required" });
+    const out = recommendLotSize({
+      symbol: sym,
+      balance: acct?.balance || 1000,
+      entry, sl, tp, rr,
+      winRate: winRate != null ? Number(winRate) : undefined,
+      profile: acct?.riskProfile || DEFAULT_RISK_PROFILE,
+      pipConfig: PIP_CONFIG,
+      confidence,
+    });
+    res.json({ ok: true, sizing: out, account: acct });
+  } catch (err) {
+    res.status(500).json({ error: "Lot size failed", details: err.message });
+  }
+});
+
+app.get("/api/trading/risk-profiles", requireAuth, async (_req, res) => {
+  try {
+    res.json({
+      profiles: Object.entries(RISK_PROFILE_INFO).map(([k, v]) => ({
+        key: k, label: v.label, kellyFraction: v.kellyFraction,
+      })),
+      default: DEFAULT_RISK_PROFILE,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Risk profiles failed", details: err.message });
   }
 });
 
@@ -7606,16 +8077,40 @@ app.post("/options/backtest", requireAuth, limitCostly, async (req, res) => {
 });
 
 // --- Portfolio ---
+// P&L in USD for one position, using the SAME pip math for open and closed
+// positions. FIXED BUG: open positions used `(px - entry) * lot * pipVal`,
+// which dropped the /pipSize divisor — a 10-pip EURUSD move was reported as
+// 0.1 pip of P&L, while closed positions (which used /pipSize) reported the
+// truth. Open and closed P&L could therefore never agree, and the equity
+// figure drifted. One formula now serves both.
+function pnlUsdFor(symbol, action, entry, exit, lotSize) {
+  const cfg = PIP_CONFIG[String(symbol || "").toUpperCase()];
+  const e = Number(entry), x = Number(exit);
+  const lot = Number(lotSize) || 0;
+  if (!Number.isFinite(e) || !Number.isFinite(x) || !(lot > 0)) return 0;
+  const isLong = String(action || "").toLowerCase() !== "sell";
+  const dist = (isLong ? x - e : e - x);
+  if (!cfg || !(Number(cfg.pipSize) > 0)) {
+    // Unknown symbol: conservative dollar approximation (documented guess).
+    return dist * lot * 10;
+  }
+  if (cfg.isCrypto) return dist * (cfg.pipValue || 1) * lot;
+  return (dist / cfg.pipSize) * cfg.pipValue * lot;
+}
+
 app.get("/api/trading/portfolio", requireAuth, async (req, res) => {
   try {
     const user_id = boundUser(req);
-    const balance = Number(req.query.balance) || 1000;
+    // The user's own stored balance is the base (persisted, survives reboot).
+    const acct = getTradingAccount(user_id);
+    const balance = Number(req.query.balance) > 0 ? Number(req.query.balance) : (acct?.balance || 1000);
     
     // Get open positions from PositionMonitor
-    const openPositions = positionMonitor.list(100).filter(p => p.status === "MONITORING");
-    
-    // Get resolved positions for P&L
-    const resolvedPositions = positionMonitor.list(500).filter(p => p.status === "RESOLVED");
+    const openPositions = positionMonitor.list(500).filter(p => p.status === "MONITORING");
+
+    // Get resolved positions for P&L — no slice cap: the portfolio must show
+    // the WHOLE history, not the most recent 50.
+    const resolvedPositions = positionMonitor.list(2000).filter(p => p.status === "RESOLVED");
     
     // Calculate metrics
     let unrealizedPnl = 0, realizedPnl = 0;
@@ -7632,9 +8127,7 @@ app.get("/api/trading/portfolio", requireAuth, async (req, res) => {
         console.warn(`[portfolio] skipping ${pos.symbol} (bad price data)`);
         continue;
       }
-      const isLong = pos.action === "buy";
-      const pipVal = num(PIP_CONFIG[pos.symbol]?.pipValue) || 10;
-      const pnl = (isLong ? (px - entry) : (entry - px)) * lot * pipVal;
+      const pnl = pnlUsdFor(pos.symbol, pos.action, entry, px, lot);
       unrealizedPnl += pnl;
       positions.push({
         id: pos.id, symbol: pos.symbol, side: pos.action.toUpperCase(),
@@ -7644,21 +8137,17 @@ app.get("/api/trading/portfolio", requireAuth, async (req, res) => {
       });
     }
     
-    for (const pos of resolvedPositions.slice(0, 50)) {
-      const cfg = PIP_CONFIG[pos.symbol];
-      const isLong = pos.action === "buy";
+    for (const pos of resolvedPositions) {
       const entry = Number(pos.entry), close = Number(pos.close_price), lot = Number(pos.lot_size);
-      const pnl = (cfg && Number.isFinite(entry) && Number.isFinite(close) && Number.isFinite(lot) && Number(cfg.pipSize) > 0) ? (isLong 
-        ? ((close - entry) / cfg.pipSize) * cfg.pipValue * lot
-        : ((entry - close) / cfg.pipSize) * cfg.pipValue * lot
-      ) : 0;
+      const pnl = pnlUsdFor(pos.symbol, pos.action, entry, close, lot);
       realizedPnl += pnl;
       positions.push({
         id: pos.id, symbol: pos.symbol, side: pos.action.toUpperCase(),
-        entryPrice: num(entry), currentPrice: num(close), lotSize: num(lot),
+        entryPrice: num(entry), currentPrice: num(close), lotSize: lot,
         sl: num(pos.sl), tp: num(pos.tp), unrealizedPnl: 0, realizedPnl: num(pnl.toFixed(2)),
         status: pos.outcome === "win" ? "CLOSED_WIN" : "CLOSED_LOSS",
-        openedAt: new Date(pos.placed_at).getTime() || 0, closedAt: new Date(pos.resolved_at).getTime() || 0
+        openedAt: new Date(pos.placed_at).getTime() || 0, closedAt: new Date(pos.resolved_at).getTime() || 0,
+        source: pos.source || "manual", reason: pos.reason || "",
       });
     }
     
@@ -7677,10 +8166,46 @@ app.get("/api/trading/portfolio", requireAuth, async (req, res) => {
         balance,
         equity: num((balance + uPnl + rPnl).toFixed(2))
       },
-      risk: riskStatus
+      risk: riskStatus,
+      account: acct,
     });
   } catch (err) {
     res.status(500).json({ error: "Portfolio fetch failed", details: err.message });
+  }
+});
+
+// --- Regenerate account balance (item 6) ---
+// Recomputes the balance from the ledger: base balance + realized P&L, then
+// stores it as the new account balance. This is how a user re-bases their
+// account after a manual deposit/withdrawal, or after a sizing bug fix.
+app.post("/api/trading/portfolio/regenerate", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const acct = getTradingAccount(user_id);
+    const startBalance = Number(req.body?.baseBalance) > 0
+      ? Number(req.body.baseBalance)
+      : (acct?.balance || 1000);
+    // Recompute realized P&L across EVERY resolved position (no slice).
+    const rows = positionMonitor.list(5000).filter(p => p.status === "RESOLVED");
+    let realized = 0;
+    for (const p of rows) realized += pnlUsdFor(p.symbol, p.action, p.entry, p.close_price, p.lot_size);
+    // Deriv contracts carry their own broker-truth P&L.
+    try {
+      const dc = db.prepare("SELECT profit FROM deriv_contracts WHERE status = 'SETTLED' AND profit IS NOT NULL").all();
+      for (const c of dc) realized += Number(c.profit) || 0;
+    } catch { /* ignore */ }
+    const newBalance = Math.max(0, startBalance + realized);
+    const saved = saveTradingAccount(user_id, { balance: newBalance });
+    res.json({
+      ok: true,
+      account: saved,
+      startBalance,
+      realized: Number(realized.toFixed(2)),
+      newBalance,
+      message: `Balance regenerated: ${startBalance.toFixed(2)} + ${realized.toFixed(2)} realized = ${newBalance.toFixed(2)}`,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

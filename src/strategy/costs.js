@@ -127,16 +127,22 @@ export function applyCosts({ symbol, entry, sl, tp }) {
   const netRisk = grossRisk + costPrice;
   const netWin = grossWin - costPrice;
   const netRR = netWin / netRisk;
+  // F-45: the published R-R was ROUNDED to 2dp while the blocked/weak gates
+  // used the UNROUNDED value, so a raw 0.999 could be displayed as "1.0" and
+  // simultaneously flagged `blocked: true`. Truncate (never round up) so the
+  // number the user sees and the gate always agree, and the gate keeps its
+  // conservative edge at the boundary.
+  const netRRShown = Math.floor(netRR * 100) / 100;
   return {
     costPrice,
     grossRisk,
     grossWin,
     netRisk,
     netWin,
-    netRR: Number(netRR.toFixed(2)),
+    netRR: netRRShown,
     costPctOfRisk: Number(((costPrice / grossRisk) * 100).toFixed(1)),
-    blocked: netRR < NET_RR_BLOCK,
-    weak: netRR < NET_RR_WEAK,
+    blocked: netRRShown < NET_RR_BLOCK,
+    weak: netRRShown < NET_RR_WEAK,
   };
 }
 

@@ -156,6 +156,16 @@ export function analyzeLongterm(symbol, closes, opts = {}) {
   if (regime === "BEAR") reasons.push("below 200DMA — investors stand aside, no longs");
   else reasons.push("above 200DMA but no breakout + momentum alignment — wait for the setup");
   if (!brokeHigh && !brokeLow) reasons.push("inside the 55-day range — nothing to break out of yet");
+  // F-45: the RSI guard is a real blocker, but it was never mentioned. When
+  // it was the ONLY thing standing between the user and a signal, the reasons
+  // said "no breakout" even though the breakout had happened — sending a
+  // trader after the wrong reason. Name the actual missing conditions.
+  if (brokeHigh && regime === "BULL" && rsi14 <= 35) {
+    reasons.push(`RSI14 ${rsi14.toFixed(1)} ≤ 35 — momentum too weak, the RSI guard vetoed the long (breakout alone is not enough)`);
+  }
+  if (brokeLow && regime === "BEAR" && rsi14 >= 65) {
+    reasons.push(`RSI14 ${rsi14.toFixed(1)} ≥ 65 — momentum too strong, the RSI guard vetoed the short (breakdown alone is not enough)`);
+  }
   return {
     symbol: sym, strategy: "donchian_trend_lt", decision, confidence: 0,
     entry: null, sl: null, tp: null, rr: 2.0, reasons, regime,

@@ -18,7 +18,11 @@ export const MODEL_DEFAULTS = {
   OR_DRAFT_MODEL: "deepseek/deepseek-v4-flash",
   OR_IMAGE_MODEL: "bytedance-seed/seedream-5-0-flash",
   OR_STT_MODEL: "openai/whisper-large-v3",
-  OR_DESIGN_MODEL: "inclusionai/ming-image-0.1-design",
+  // Week 6: the old default (inclusionai/ming-image-0.1-design) is NO LONGER
+  // SERVED on OpenRouter /images — every Design Studio job burned a failed call
+  // first. Default to the served image model; a better legible-text specialist
+  // can be set from the Creator console (OR_GRAPHICS_MODEL / OR_DESIGN_MODEL).
+  OR_DESIGN_MODEL: "bytedance-seed/seedream-5-0-flash",
   OR_LAYER_MODEL: "inclusionai/ming-image-0.1-design-layer",
   OR_VIDEO_MODEL: "heygen/heygen-video-1", // HeyGen Video: promo $0.01/s WITH audio
   OR_GENJUTSU_MODEL: "bytedance/seedance-2.5",
@@ -42,8 +46,8 @@ export const MODEL_META = {
   OR_VIDEO_MODEL: { label: "Video model (primary)", hint: "text-to-video clips" },
   OR_GENJUTSU_MODEL: { label: "Genjutsu model", hint: "reference-heavy cinema shots" },
   OR_GRAPHICS_MODEL: { label: "Graphics model", hint: "blank = design model" },
-  OR_TYPE_MODEL: { label: "Type model", hint: "typography posters (blank = off)" },
-  OR_VECTOR_MODEL: { label: "Vector model", hint: "logos/brand (blank = off)" },
+  OR_TYPE_MODEL: { label: "Type model", hint: "typography posters — ideogram/ideogram-v3" },
+  OR_VECTOR_MODEL: { label: "Vector model", hint: "logos/brand — recraft/recraft-v3" },
   OR_AVATAR_MODEL: { label: "Avatar model (primary)", hint: "photo+voice talking head" },
   OR_DIRECTOR_MODEL: { label: "Cinema director", hint: "blank = fast model" },
   OR_FREE_FAST: { label: "Free fast", hint: ":free fallback quota" },

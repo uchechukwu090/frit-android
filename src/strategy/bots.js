@@ -80,9 +80,15 @@ export function ensureBotsTables(db) {
       bot TEXT NOT NULL,
       pair TEXT, timeframe TEXT,
       fired_at INTEGER,
-      decision TEXT, confidence INTEGER, note TEXT
+      decision TEXT, confidence INTEGER, note TEXT,
+      user_id TEXT DEFAULT 'bot'
     );
   `);
+  // Per-user attribution: which user's bot produced this run.
+  try {
+    const cols = db.prepare("PRAGMA table_info(bot_runs)").all().map(c => c.name);
+    if (!cols.includes("user_id")) db.exec("ALTER TABLE bot_runs ADD COLUMN user_id TEXT DEFAULT 'bot'");
+  } catch { /* best-effort */ }
   for (const [name, def] of Object.entries(BOT_DEFS)) {
     try {
       db.prepare(
@@ -141,11 +147,37 @@ function runsToday(db, name) {
   } catch { return 0; }
 }
 
-function logRun(db, bot, pair, timeframe, decision, confidence, note) {
+/** Trades today for ONE user on ONE bot+pair (the per-pair daily cap). */
+function runsTodayFor(db, name, pair, userId) {
+  try {
+    return db.prepare(
+      "SELECT COUNT(*) AS c FROM bot_runs WHERE bot = ? AND pair = ? AND user_id = ? AND date(fired_at/1000,'unixepoch') = date('now') AND decision IN ('BUY','SELL','CALL','PUT')"
+    ).get(name, String(pair).toUpperCase(), userId)?.c || 0;
+  } catch { return 0; }
+}
+
+/**
+ * Per-bot-pair cadence guard. Returns true when the bot may run now, and
+ * records the run. Kept in the DB so a server restart cannot make every bot
+ * fire at once.
+ */
+export function botCooldown(db, key, intervalMin) {
+  try {
+    db.exec("CREATE TABLE IF NOT EXISTS bot_cooldowns (key TEXT PRIMARY KEY, last_run INTEGER)");
+    const row = db.prepare("SELECT last_run FROM bot_cooldowns WHERE key = ?").get(key);
+    const now = Date.now();
+    if (row?.last_run && now - row.last_run < intervalMin * 60_000) return false;
+    db.prepare("INSERT INTO bot_cooldowns (key, last_run) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET last_run = ?")
+      .run(key, now, now);
+    return true;
+  } catch { return true; }
+}
+
+function logRun(db, bot, pair, timeframe, decision, confidence, note, userId = "bot") {
   try {
     db.prepare(
-      "INSERT INTO bot_runs (bot, pair, timeframe, fired_at, decision, confidence, note) VALUES (?,?,?,?,?,?,?)"
-    ).run(bot, pair, timeframe, Date.now(), decision, confidence ?? 0, String(note || "").slice(0, 500));
+      "INSERT INTO bot_runs (bot, pair, timeframe, fired_at, decision, confidence, note, user_id) VALUES (?,?,?,?,?,?,?,?)"
+    ).run(bot, pair, timeframe, Date.now(), decision, confidence ?? 0, String(note || "").slice(0, 500), userId);
   } catch { /* best-effort */ }
 }
 
@@ -176,19 +208,68 @@ export function synthToSignal(pair, r) {
 /**
  * One runner tick. Deps injected from index.js:
  * { db, mtfAnalyze(symbol)->result, analyzeSynth(symbol, closes)->result,
+ *   scalpingAnalyze(symbol, closes, tf)->result, pocketScan(symbol, expiry)->result,
  *   longtermAnalyze(symbol, closes)->result, fetchDaily(symbol)->closes[],
  *   fetchCloses(symbol, interval)->closes[], getChain, scanSymbol, scanFx,
  *   storeSignal(userId, signal), formatSignal(symbol, result),
  *   storeOptionsSignal(userId, signal), openPaper(userId, signal),
- *   executor({symbol, action, lotSize, entry, sl, tp, reason})->result,
+ *   executor({symbol, action, lotSize, entry, sl, tp, reason, userId})->result,
  *   notifyOptions(userId, signal)->void, log }
- * userId "bot" owns bot-generated history (per-user fan-out stays in LiveFeed).
+ *
+ * TWO SOURCES OF WORK:
+ *   1. PER-USER BOT-PAIRS (the modern path). Each row is one user's chosen
+ *      bot on one of their pairs, with its own timeframe and its own
+ *      trade/signal switches. These run FOR THAT USER: the signal is stored
+ *      under their user_id and the trade is sized against THEIR balance.
+ *   2. LEGACY GLOBAL BOTS (the `bots` table). Still honoured for installs
+ *      configured before the per-pair model existed.
  */
 export async function tickBots(deps) {
   const { db } = deps;
   ensureBotsTables(db);
+  ensureBotPairTables(db);
   const now = Date.now();
   const results = [];
+
+  // ---------- 1. Per-user bot-pairs ----------
+  let pairRows = [];
+  try {
+    pairRows = db.prepare("SELECT * FROM bot_pairs").all();
+  } catch { pairRows = []; }
+
+  for (const row of pairRows) {
+    const def = BOT_DEFS[row.bot_name];
+    if (!def) continue;
+    const userId = row.user_id;
+    const pair = String(row.pair || "").toUpperCase();
+    if (!pair) continue;
+    const tradeEnabled = row.trade_enabled === 1;
+    const signalEnabled = row.signal_enabled === 1;
+    // Both switches off = the user stopped this bot for this pair entirely.
+    if (!tradeEnabled && !signalEnabled) continue;
+    const minConf = row.min_confidence ?? 60;
+    // Cadence guard: one bot-pair fires at most once per its interval.
+    const lastKey = `bp:${userId}:${row.bot_name}:${pair}`;
+    if (!deps.botCooldown(db, lastKey, def.intervalMin)) continue;
+    if (tradeEnabled && runsTodayFor(db, row.bot_name, pair, userId) >= (row.max_trades_day ?? 2)) continue;
+
+    try {
+      const out = await runOneBot(deps, {
+        botName: row.bot_name, pair, timeframe: row.timeframe || def.defaultTimeframe,
+        userId, minConf, tradeEnabled, signalEnabled,
+      });
+      for (const r of out.results) results.push({ ...r, userId, pair });
+      if (out.decision && out.decision !== "WAIT") {
+        logRun(db, row.bot_name, pair, row.timeframe, out.decision, out.confidence || 0,
+          `${userId} ${out.note || "fired"}`, userId);
+      }
+    } catch (e) {
+      logRun(db, row.bot_name, pair, row.timeframe, "ERROR", 0, e.message, userId);
+      results.push({ bot: row.bot_name, decision: "ERROR", note: e.message, userId, pair });
+    }
+  }
+
+  // ---------- 2. Legacy global bots ----------
   for (const bot of getBots(db)) {
     const def = BOT_DEFS[bot.name];
     if (!bot.auto_enabled || !bot.pair) continue;
@@ -196,144 +277,154 @@ export async function tickBots(deps) {
     if (runsToday(db, bot.name) >= bot.max_trades_day) continue;
     db.prepare("UPDATE bots SET last_run = ? WHERE name = ?").run(now, bot.name);
     try {
-      if (bot.name === "intraday") {
-        // Deriv synthetics run the generator-aware engine, not the MTF trend
-        // engine — MA crossovers on RNG are coin flips minus costs.
-        const isSynth = /^R_|^1HZ|^BOOM|^CRASH|^STPRNG|^RDBULL|^RDBEAR|^JD|^GDA/.test(bot.pair);
-        const result = isSynth
-          ? synthToSignal(bot.pair, await deps.analyzeSynth(bot.pair, await deps.fetchCloses(bot.pair, "1m")))
-          : await deps.mtfAnalyze(bot.pair, {});
-        const signal = isSynth ? result : deps.formatSignal(bot.pair, result);
-        const actionable = ["BUY", "SELL"].includes(signal.decision) && signal.confidence >= bot.min_confidence;
-        if (actionable) {
-          const exec = await deps.executor({
-            symbol: bot.pair,
-            action: signal.decision === "BUY" ? "buy" : "sell",
-            lotSize: 0.01, entry: signal.entry, sl: signal.sl, tp: signal.tp1,
-            reason: `intraday bot ${bot.pair} ${bot.timeframe} conf=${signal.confidence}%`,
-            source: "bot:intraday",
-          });
-          deps.storeSignal("bot", signal);
-          logRun(db, bot.name, bot.pair, bot.timeframe, signal.decision, signal.confidence, exec?.mode || "sent");
-          results.push({ bot: bot.name, decision: signal.decision, confidence: signal.confidence, execution: exec?.mode || null });
-        } else {
-          logRun(db, bot.name, bot.pair, bot.timeframe, signal.decision, signal.confidence, "below confidence floor or no setup");
-          results.push({ bot: bot.name, decision: signal.decision, note: "no trade" });
-        }
-      } else if (bot.name === "scalping") {
-        // Scalping: TP/SL based on small timeframes. Uses the candle store
-        // for fast access to recent candles, computes EMA trend + momentum,
-        // and fires BUY/SL with TP/SL levels.
-        const candles = await deps.fetchCloses(bot.pair, bot.timeframe);
-        if (!candles || candles.length < 30) {
-          logRun(db, bot.name, bot.pair, bot.timeframe, "WAIT", 0, "warming up — need 30+ candles");
-          results.push({ bot: bot.name, decision: "WAIT", note: "warming up" });
-        } else {
-          const result = deps.scalpingAnalyze(bot.pair, candles, bot.timeframe);
-          const actionable = ["BUY", "SELL"].includes(result.decision) && result.confidence >= bot.min_confidence;
-          if (actionable) {
-            const exec = await deps.executor({
-              symbol: bot.pair,
-              action: result.decision === "BUY" ? "buy" : "sell",
-              lotSize: 0.01, entry: result.entry, sl: result.sl, tp: result.tp1,
-              reason: `scalping bot ${bot.pair} ${bot.timeframe} conf=${result.confidence}%`,
-              source: "bot:scalping",
-            });
-            deps.storeSignal("bot", {
-              id: `sig_${bot.pair}_${Date.now()}_sc`, symbol: bot.pair, decision: result.decision,
-              confidence: result.confidence, entry: result.entry, sl: result.sl,
-              tp1: result.tp1, tp2: result.tp2 || null, rr: result.rr, scenario: "SCALPING",
-              reasoning: (result.reasons || []).join(" | "), timestamp: Date.now(),
-            });
-            logRun(db, bot.name, bot.pair, bot.timeframe, result.decision, result.confidence, exec?.mode || "sent");
-            results.push({ bot: bot.name, decision: result.decision, confidence: result.confidence, execution: exec?.mode || null });
-          } else {
-            logRun(db, bot.name, bot.pair, bot.timeframe, result.decision, result.confidence || 0, "below confidence floor or no setup");
-            results.push({ bot: bot.name, decision: result.decision, note: "no trade" });
-          }
-        }
-      } else if (bot.name === "pocket") {
-        // Pocket option: predicts if a candle will end bullish or bearish
-        // within a given time. Uses the pocket engine's signalFromCandles.
-        const expiryMin = bot.timeframe === "1m" ? 1 : bot.timeframe === "5m" ? 5 : 15;
-        const signal = deps.pocketScan(bot.pair, expiryMin);
-        const actionable = ["CALL", "PUT"].includes(signal.decision) && signal.confidence >= bot.min_confidence;
-        if (actionable) {
-          const exec = await deps.executor({
-            symbol: bot.pair,
-            action: signal.decision === "CALL" ? "buy" : "sell",
-            lotSize: 0.01, entry: signal.entryRef, sl: null, tp: null,
-            reason: `pocket bot ${bot.pair} ${expiryMin}m conf=${signal.confidence}%`,
-            source: "bot:pocket",
-          });
-          deps.storeSignal("bot", {
-            id: `sig_${bot.pair}_${Date.now()}_pk`, symbol: bot.pair, decision: signal.decision,
-            confidence: signal.confidence, entry: signal.entryRef, sl: null,
-            tp1: null, tp2: null, rr: null, scenario: "POCKET",
-            reasoning: (signal.reasons || []).join(" | "), timestamp: Date.now(),
-          });
-          logRun(db, bot.name, bot.pair, bot.timeframe, signal.decision, signal.confidence, exec?.mode || "sent");
-          results.push({ bot: bot.name, decision: signal.decision, confidence: signal.confidence, execution: exec?.mode || null });
-        } else {
-          logRun(db, bot.name, bot.pair, bot.timeframe, signal.decision, signal.confidence || 0, "below confidence floor or no setup");
-          results.push({ bot: bot.name, decision: signal.decision, note: "no trade" });
-        }
-      } else if (bot.name === "longterm") {
-        const daily = await deps.fetchDaily(bot.pair);
-        const closes = bot.timeframe === "1W" ? toWeekly(daily) : daily;
-        const result = deps.longtermAnalyze(bot.pair, closes);
-        const actionable = ["BUY", "SELL"].includes(result.decision) && result.confidence >= bot.min_confidence;
-        if (actionable) {
-          const exec = await deps.executor({
-            symbol: bot.pair,
-            action: result.decision === "BUY" ? "buy" : "sell",
-            lotSize: 0.01, entry: result.entry, sl: result.sl, tp: result.tp,
-            reason: `longterm bot ${bot.pair} ${bot.timeframe} conf=${result.confidence}%`,
-            source: "bot:longterm",
-          });
-          deps.storeSignal("bot", {
-            id: `sig_${bot.pair}_${Date.now()}_lt`, symbol: bot.pair, decision: result.decision,
-            confidence: result.confidence, entry: result.entry, sl: result.sl,
-            tp1: result.tp, tp2: null, rr: result.rr, scenario: "LONGTERM",
-            reasoning: result.reasons.join(" | "), timestamp: Date.now(),
-          });
-          logRun(db, bot.name, bot.pair, bot.timeframe, result.decision, result.confidence, exec?.mode || "sent");
-          results.push({ bot: bot.name, decision: result.decision, confidence: result.confidence, execution: exec?.mode || null });
-        } else {
-          logRun(db, bot.name, bot.pair, bot.timeframe, result.decision, result.confidence || 0, "below confidence floor or no setup");
-          results.push({ bot: bot.name, decision: result.decision, note: "no trade" });
-        }
-      } else if (bot.name === "options") {
-        // Scan + notify + paper only. NEVER the executor — no options rail.
-        const isFxStyle = /USD$|XAU|XAG|JPY|GBP|EUR|CHF|CAD|AUD|NZD/.test(bot.pair) && !/^(SPY|QQQ|IWM|XSP)$/.test(bot.pair);
-        if (isFxStyle) {
-          const closes = await deps.fetchDaily(bot.pair);
-          const out = deps.scanFx({ symbol: bot.pair, closes });
-          if (out.signal) {
-            deps.storeOptionsSignal("bot", out.signal);
-            deps.notifyOptions?.("bot", out.signal);
-          }
-          logRun(db, bot.name, bot.pair, bot.timeframe, out.signal ? "FX_LEVELS" : "SKIP", 0, out.signal ? out.signal.id : out.why);
-          results.push({ bot: bot.name, decision: out.signal ? "FX_LEVELS" : "SKIP" });
-        } else {
-          const chain = await deps.getChain(bot.pair);
-          const closes = await deps.fetchDaily(bot.pair);
-          const out = deps.scanSymbol({ symbol: bot.pair, chain, closes, db });
-          if (out.signal) {
-            deps.storeOptionsSignal("bot", out.signal);
-            deps.openPaper?.("bot", { ...out.signal, entrySpot: chain.underlying });
-            deps.notifyOptions?.("bot", out.signal);
-          }
-          logRun(db, bot.name, bot.pair, bot.timeframe, out.signal ? out.signal.kind : "SKIP", 0, out.signal ? out.signal.id : out.why);
-          results.push({ bot: bot.name, decision: out.signal ? out.signal.kind : "SKIP" });
-        }
-      }
+      const out = await runOneBot(deps, {
+        botName: bot.name, pair: bot.pair, timeframe: bot.timeframe,
+        userId: "bot", minConf: bot.min_confidence,
+        tradeEnabled: bot.auto_enabled, signalEnabled: true, legacy: true,
+      });
+      for (const r of out.results) results.push(r);
     } catch (e) {
       logRun(db, bot.name, bot.pair, bot.timeframe, "ERROR", 0, e.message);
       results.push({ bot: bot.name, decision: "ERROR", note: e.message });
     }
   }
   return results;
+}
+
+/**
+ * Run a single bot for a single pair. Returns { decision, confidence, results[] }.
+ * `tradeEnabled` controls whether an order is placed; `signalEnabled` controls
+ * whether the signal is stored/notified. Both can be on at once.
+ */
+async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, tradeEnabled, signalEnabled, legacy }) {
+  const { db } = deps;
+  const out = { decision: "WAIT", confidence: 0, note: "", results: [] };
+  const def = BOT_DEFS[botName];
+
+  if (botName === "options") {
+    // Scan + notify + paper only. NEVER the executor — no options rail.
+    const isFxStyle = /USD$|XAU|XAG|JPY|GBP|EUR|CHF|CAD|AUD|NZD/.test(pair) && !/^(SPY|QQQ|IWM|XSP)$/.test(pair);
+    if (isFxStyle) {
+      const closes = await deps.fetchDaily(pair);
+      const scan = deps.scanFx({ symbol: pair, closes });
+      if (scan.signal) {
+        deps.storeOptionsSignal(userId, scan.signal);
+        deps.notifyOptions?.(userId, scan.signal);
+      }
+      logRun(db, botName, pair, timeframe, scan.signal ? "FX_LEVELS" : "SKIP", 0, scan.signal ? scan.signal.id : scan.why, userId);
+      out.decision = scan.signal ? "FX_LEVELS" : "SKIP";
+      out.note = scan.signal ? scan.signal.id : scan.why;
+      out.results.push({ bot: botName, decision: out.decision });
+      return out;
+    }
+    const chain = await deps.getChain(pair);
+    const closes = await deps.fetchDaily(pair);
+    const scan = deps.scanSymbol({ symbol: pair, chain, closes, db });
+    if (scan.signal) {
+      deps.storeOptionsSignal(userId, scan.signal);
+      deps.openPaper?.(userId, { ...scan.signal, entrySpot: chain.underlying });
+      deps.notifyOptions?.(userId, scan.signal);
+    }
+    logRun(db, botName, pair, timeframe, scan.signal ? scan.signal.kind : "SKIP", 0, scan.signal ? scan.signal.id : scan.why, userId);
+    out.decision = scan.signal ? scan.signal.kind : "SKIP";
+    out.note = scan.signal ? scan.signal.id : scan.why;
+    out.results.push({ bot: botName, decision: out.decision });
+    return out;
+  }
+
+  // ---- analyse ----
+  let signal = null;
+  if (botName === "scalping") {
+    const candles = await deps.fetchCandles(pair, timeframe);
+    if (!candles || candles.length < 30) {
+      out.note = "warming up — need 30+ candles";
+      out.results.push({ bot: botName, decision: "WAIT", note: out.note });
+      return out;
+    }
+    const r = deps.scalpingAnalyze(pair, candles, timeframe);
+    signal = {
+      id: `sig_${pair}_${Date.now()}_sc`, symbol: pair, decision: r.decision,
+      confidence: r.confidence, entry: r.entry, sl: r.sl, tp1: r.tp1, tp2: r.tp2,
+      rr: r.rr, scenario: "SCALPING", reasoning: (r.reasons || []).join(" | "),
+      timestamp: Date.now(), botSource: "scalping",
+    };
+  } else if (botName === "pocket") {
+    // TRUE pocket option: predicts if the candle ends bullish or bearish
+    // within the given time. Expiry follows the chosen timeframe.
+    const expiryMin = timeframe === "1m" ? 1 : timeframe === "5m" ? 5 : 15;
+    const r = deps.pocketScan(pair, expiryMin);
+    signal = {
+      id: `sig_${pair}_${Date.now()}_pk`, symbol: pair, decision: r.decision,
+      confidence: r.confidence, entry: r.entryRef, sl: null, tp1: null, tp2: null,
+      rr: null, scenario: "POCKET", reasoning: (r.reasons || []).join(" | "),
+      timestamp: Date.now(), botSource: "pocket", expiryMin,
+    };
+  } else if (botName === "longterm") {
+    const daily = await deps.fetchDaily(pair);
+    const closes = timeframe === "1W" ? toWeekly(daily) : daily;
+    const r = deps.longtermAnalyze(pair, closes);
+    signal = {
+      id: `sig_${pair}_${Date.now()}_lt`, symbol: pair, decision: r.decision,
+      confidence: r.confidence, entry: r.entry, sl: r.sl, tp1: r.tp, tp2: null,
+      rr: r.rr, scenario: "LONGTERM", reasoning: r.reasons.join(" | "),
+      timestamp: Date.now(), botSource: "longterm",
+    };
+  } else {
+    // intraday (and any other directional bot)
+    const isSynth = /^R_|^1HZ|^BOOM|^CRASH|^STPRNG|^RDBULL|^RDBEAR|^JD|^GDA/.test(pair);
+    const r = isSynth
+      ? synthToSignal(pair, await deps.analyzeSynth(pair, await deps.fetchCloses(pair, "1m")))
+      : await deps.mtfAnalyze(pair, {});
+    const formatted = isSynth ? r : deps.formatSignal(pair, r);
+    signal = { ...formatted, id: `sig_${pair}_${Date.now()}_${isSynth ? "sy" : "in"}`, botSource: "intraday" };
+  }
+
+  const actionable = ["BUY", "SELL", "CALL", "PUT"].includes(signal.decision)
+    && signal.confidence >= minConf;
+  if (!actionable) {
+    out.decision = signal.decision;
+    out.confidence = signal.confidence;
+    out.note = "below confidence floor or no setup";
+    // A non-actionable read can still be stored when the user asked for
+    // signals — but only the actionable ones are worth the history noise.
+    out.results.push({ bot: botName, decision: signal.decision, note: out.note });
+    return out;
+  }
+
+  out.decision = signal.decision;
+  out.confidence = signal.confidence;
+
+  // ---- lot size: Kelly against the USER's own balance (item 8 + 9) ----
+  // Legacy global bots have no user account, so they use the platform default.
+  const sizing = deps.sizeFor
+    ? deps.sizeFor(userId, signal)
+    : { lotSize: 0.01, reason: "default 0.01 lot (no account configured)", riskUsd: 0 };
+  signal.lotSize = sizing.lotSize || null;
+  signal.lotReason = sizing.reason;
+  signal.riskUsd = sizing.riskUsd || null;
+
+  // ---- store the signal (for THIS user) ----
+  if (signalEnabled) deps.storeSignal(userId, signal);
+
+  // ---- execute ----
+  if (tradeEnabled && def.executes) {
+    const exec = await deps.executor({
+      symbol: pair,
+      action: signal.decision === "SELL" || signal.decision === "PUT" ? "sell" : "buy",
+      lotSize: sizing.lotSize || 0.01,
+      entry: signal.entry, sl: signal.sl, tp: signal.tp1,
+      reason: `${botName} bot ${pair} ${timeframe} conf=${signal.confidence}% lot=${sizing.lotSize}`,
+      source: `bot:${botName}`,
+      userId,
+      botName,
+    });
+    out.note = exec?.mode || "sent";
+    out.results.push({ bot: botName, decision: signal.decision, confidence: signal.confidence, execution: exec?.mode || null, lotSize: sizing.lotSize });
+  } else {
+    out.note = "signal only (trading off)";
+    out.results.push({ bot: botName, decision: signal.decision, confidence: signal.confidence, execution: null, lotSize: sizing.lotSize, signalOnly: true });
+  }
+  return out;
 }
 
 // ============================================================================

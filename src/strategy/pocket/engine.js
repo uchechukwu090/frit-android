@@ -170,6 +170,14 @@ export function assessPullback(symbol, trend, trig, trendDir /* +1 bull, -1 bear
   const out = { verdict: "UNCERTAIN", retracePct: null, adxPct: null, trendDir, reasons: [] };
   const sym = String(symbol).toUpperCase();
   const sw = swingLast(trend);
+  // F-45: this is a public export and it used to throw a TypeError on an
+  // empty trigger array (`trig[trig.length-1].close`). The current callers
+  // always pass enough candles, but an unguarded export is a trap for the
+  // next caller. Return the safe UNCERTAIN verdict instead of crashing.
+  if (!Array.isArray(trig) || !trig.length) {
+    out.reasons.push("no trigger candles — pullback cannot be assessed");
+    return out;
+  }
   const price = trig[trig.length - 1].close;
   // Retrace depth of the last trend leg (ratio — symbol-agnostic).
   let retrace = null;
@@ -326,6 +334,11 @@ export function signalFromCandles(symbol, trend, trig, opts = {}) {
       return out;
     }
     conf = Math.round(0.4 * conf + 0.6 * calib.wr * 100);
+    // F-45: the published cap (MAX_CONF) was applied BEFORE the calibration
+    // blend and never re-applied, so a well-calibrated setup could publish a
+    // confidence of 89 while the engine advertised a hard cap of 78. Re-clamp
+    // here so the number the user sees always respects the documented cap.
+    conf = Math.max(20, Math.min(MAX_CONF, conf));
     reasons.push(`calibrated ${(calib.wr * 100).toFixed(1)}% over ${calib.n} paper trades — confidence grounded in reality`);
   } else {
     conf = Math.min(conf, 65);

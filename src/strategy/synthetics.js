@@ -214,6 +214,11 @@ function analyzeTrend(symbol, closes, lock, cfg = {}) {
       decision: "SELL", entry: S, sl: S + 2 * atr, tp: S - 4 * atr, rr: 2.0, confidence: 65,
       maxHoldMin: cfg.maxHoldMin || 240,
       reasons: [`RDBEAR breakdown: ${N}-bar low ${lo.toFixed(5)}, direction locked short by generator`, `stop 2xATR, target 4xATR`],
+      // F-45: the BUY branch returned `details` and the SELL branch did not,
+      // so every RDBEAR/DEX-DN sell came back with `details: undefined`
+      // while the matching buy had a populated object. Downstream consumers
+      // had to special-case the short side.
+      details: { donchianHigh: hi, donchianLow: lo, atr },
     };
   }
   // Wrong-way break on a locked family is not a counter-trend signal — WAIT.
