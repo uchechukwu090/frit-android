@@ -49,7 +49,7 @@ import * as brandKit from "./creative/brand.js";
 import * as designAgent from "./creative/designAgent.js";
 import * as imageProviders from "./creative/imageProviders.js";
 import * as typeLayer from "./creative/typeLayer.js";
-import * as refCache from "./creative/refCache.js";
+import * as refs from "./creative/refs.js";
 import * as directorAgent from "./creative/directorAgent.js";
 import { runBounded } from "./concurrency.js";
 import { setModelDb, MODEL_DEFAULTS, MODEL_KEYS, MODEL_META, overrideOf, M } from "./model_config.js";
@@ -895,7 +895,11 @@ function buildFallbackChain(primary) {
     chain.push(`openrouter:${OR_FREE_DRAFT}`);
   }
   if (HAS_ZEN) chain.push(`go:${GO_MODEL}`);
-  if (MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
+  // Only offer a Mistral fallback when there IS a key for it. The check used to
+  // be on MISTRAL_MODEL, which is always truthy (it defaults to
+  // "mistral-large-latest") — so with no Mistral key the chain ended on a
+  // mistral model that answered "Bearer undefined" and burned a retry.
+  if (MISTRAL_API_KEY && MISTRAL_MODEL) chain.push(MISTRAL_MODEL);
   return [...new Set(chain)];
 }
 
@@ -906,12 +910,28 @@ function buildVisionFallbackChain(primary) {
   return [...new Set(chain)];
 }
 
+// Bulk-text work (a design brief, a shot list): the DRAFT model first because
+// it answers fast and does not spend minutes reasoning. The reasoning model
+// (OR_FAST) is the fallback, not the primary — it blew the brief stage's
+// time budget on the first live runs.
+function buildDraftFallbackChain() {
+  const chain = [];
+  if (HAS_OR) {
+    if (OR_DRAFT) chain.push(`openrouter:${OR_DRAFT}`);
+    if (OR_PRIMARY && !chain.includes(`openrouter:${OR_PRIMARY}`)) chain.push(`openrouter:${OR_PRIMARY}`);
+    if (OR_FAST && !chain.includes(`openrouter:${OR_FAST}`)) chain.push(`openrouter:${OR_FAST}`);
+  }
+  if (!chain.length) chain.push(MODELS.conversation);
+  return [...new Set(chain)];
+}
+
 const FALLBACK_CHAINS = {
   vision: buildVisionFallbackChain(MODELS.vision),
   agent: buildFallbackChain(MODELS.agent),
   tools: buildFallbackChain(MODELS.tools),
   conversation: buildFallbackChain(MODELS.conversation),
   fast: buildFallbackChain(MODELS.fast),
+  draft: buildDraftFallbackChain(),
 };
 // The :free roster rotates — resolve the live list at boot, re-check every 6h.
 await refreshFreeModels();
@@ -947,6 +967,7 @@ function refreshModelConfig() {
   MODELS.coding = process.env.CODING_MODEL || (HAS_OR ? `openrouter:${OR_PRIMARY}` : "codestral-latest");
   MODELS.fast = process.env.FAST_MODEL || (HAS_OR ? `openrouter:${OR_FAST}` : MISTRAL_FAST_MODEL);
   FALLBACK_CHAINS.vision = buildVisionFallbackChain(MODELS.vision);
+  FALLBACK_CHAINS.draft = buildDraftFallbackChain();
   for (const role of ["agent", "tools", "conversation", "fast"]) {
     FALLBACK_CHAINS[role] = buildFallbackChain(MODELS[role]);
   }
@@ -981,21 +1002,34 @@ function loadAppFlows(goal = "") {
 
 // Same signature as mistralChat, but walks a role's fallback chain on failure
 // (e.g. Groq rate limit exhausted) instead of bubbling the error straight up.
-async function chatWithFallback(role, { messages, tools = null, tool_choice = "auto", temperature, max_tokens }) {
+async function chatWithFallback(role, { messages, tools = null, tool_choice = "auto", temperature, max_tokens, retries, timeoutMs }) {
   const chain = FALLBACK_CHAINS[role] || [MODELS[role] || MODELS.conversation];
   const attempts = [];
   for (let i = 0; i < chain.length; i++) {
     const model = chain[i];
     try {
-      const out = await mistralChat({ model, messages, tools, tool_choice, temperature, max_tokens });
-      if (i > 0) console.warn(`[chatWithFallback] role=${role} primary model unavailable — recovered on ${model} (normal fallback)`);
+      const out = await mistralChat({ model, messages, tools, tool_choice, temperature, max_tokens, retries, timeoutMs });
+      // An EMPTY completion is not a success: it is a model that answered
+      // with nothing (a reasoning model that spent the whole budget on
+      // thinking, or a provider quirk). It must move the chain on to the
+      // next model, exactly like an error does — otherwise the caller gets
+      // "" and silently falls back to a default. A tool call is a real
+      // answer even with empty content.
+      const msg = out?.choices?.[0]?.message;
+      const content = typeof msg?.content === "string"
+        ? msg.content
+        : (Array.isArray(msg?.content) ? msg.content.map((p) => (typeof p === "string" ? p : (p?.text || ""))).join("") : "");
+      if (!content.trim() && !(msg?.tool_calls || []).length) {
+        throw new Error("empty completion");
+      }
+      if (i > 0) console.warn(`[chatWithFallback] role=${role} primary model unavailable - recovered on ${model} (normal fallback)`);
       return out;
     } catch (err) {
       attempts.push(`${model}: ${err.message}`);
       console.warn(`[chatWithFallback] role=${role} model=${model} unavailable: ${err.message}`);
     }
   }
-  
+
   const allRateLimited = attempts.every(a => /rate limit|429|tpm|too many requests/i.test(a));
   const err = new Error(
     allRateLimited
@@ -1073,7 +1107,7 @@ function resolveProvider(model) {
   return "mistral";
 }
 
-async function mistralChat({ model, messages, tools = null, temperature = 0.3, max_tokens = 1600, tool_choice = "auto", retries = 3 }) {
+async function mistralChat({ model, messages, tools = null, temperature = 0.3, max_tokens = 1600, tool_choice = "auto", retries = 3, timeoutMs = 90_000 }) {
   const provider = resolveProvider(model);
 
   const base = provider === "openrouter" ? "https://openrouter.ai/api/v1/chat/completions"
@@ -1081,7 +1115,11 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
     : provider === "zen" ? "https://opencode.ai/zen/v1/chat/completions"
     : `${MISTRAL_BASE}/chat/completions`;
   const apiKey = provider === "openrouter" ? OPENROUTER_API_KEY : (provider === "zen" || provider === "go") ? ZEN_API_KEY : MISTRAL_API_KEY;
-  
+  // F-26: a provider with no key used to be called as "Bearer undefined",
+  // which came back as a confusing 401 instead of a clear "this provider is
+  // not configured". Fail fast so the fallback chain moves on immediately.
+  if (!apiKey) throw new Error(`no API key configured for provider "${provider}" (model "${model}")`);
+
   const cleanModel = provider === "go" ? model.slice(3)
     : provider === "openrouter" ? model.slice("openrouter:".length)
     : provider === "zen" ? model.slice(model.indexOf(":") + 1)
@@ -1115,7 +1153,7 @@ async function mistralChat({ model, messages, tools = null, temperature = 0.3, m
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(90_000), // hung providers must not pin workers forever
+        signal: AbortSignal.timeout(timeoutMs), // hung providers must not pin workers forever
       });
       const data = await res.json();
       if (!res.ok) {
@@ -1828,6 +1866,9 @@ app.post("/agent/chat/stream", requireAuth, limitNormal, async (req, res) => {
         : provider === "zen" ? "https://opencode.ai/zen/v1/chat/completions"
         : `${MISTRAL_BASE}/chat/completions`;
       const apiKey = provider === "openrouter" ? OPENROUTER_API_KEY : (provider === "zen" || provider === "go") ? ZEN_API_KEY : MISTRAL_API_KEY;
+      // F-26: skip a provider with no key instead of calling it as
+      // "Bearer undefined" and burning a retry on a guaranteed 401.
+      if (!apiKey) { lastError = new Error(`no API key configured for provider "${provider}"`); continue; }
       const cleanModel = provider === "go" ? model.slice(3)
         : provider === "openrouter" ? model.slice("openrouter:".length)
         : provider === "zen" ? model.slice(model.indexOf(":") + 1)
@@ -2017,28 +2058,23 @@ async function mistralTranscribe(audio_base64, mime_type = "audio/webm") {
   return "";
 }
 
-// Image generation. Three providers, one normalised return shape:
-//   OpenRouter (default) — the /images gateway.
-//   Ideogram             — model slug "ideogram/..." (typography specialist).
-//   Recraft              — model slug "recraft/..." (real fonts via `texts[]`).
-// The provider is chosen by the model slug, so the existing craft routing
-// (OR_TYPE_MODEL / OR_VECTOR_MODEL) lights up with no extra plumbing.
+// Image generation. ONE gateway: OpenRouter /images. There are no
+// per-provider API keys — the catalogue serves 61 image models (including
+// the Recraft family), and the request body is built per model family
+// because they accept different parameters (Recraft rejects `n` and
+// `output_format` and only takes 1:1 / 4:3 / 3:4 / 16:9 / 9:16 / auto).
 async function generateImage(prompt, opts = {}) {
-  const provider = imageProviders.providerFor(opts.model, opts);
-  if (provider !== imageProviders.PROVIDER_OPENROUTER) {
-    return imageProviders.generateWithProvider(provider, prompt, opts);
-  }
   if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY missing");
   const model = opts.model || OR_IMAGE_MODEL;
   const isMing = model.startsWith("inclusionai/ming");
   // Ming models REJECT sizes/aspect ratios instead of reshaping — never send them.
-  const body = { model, prompt: String(prompt || "") };
-  if (!isMing) {
-    if (opts.aspect_ratio) body.aspect_ratio = opts.aspect_ratio;
-    body.n = opts.n || 1;
-  }
-  if (opts.output_format) body.output_format = opts.output_format;
-  if (opts.input_references?.length) body.input_references = opts.input_references;
+  const body = imageProviders.imageRequestBody(model, prompt, {
+    aspect_ratio: opts.aspect_ratio,
+    n: opts.n,
+    output_format: opts.output_format,
+    input_references: opts.input_references,
+    drop: isMing ? ["aspect_ratio", "n"] : [],
+  });
   let res;
   try {
     res = await fetch("https://openrouter.ai/api/v1/images", {
@@ -2062,7 +2098,9 @@ async function generateImage(prompt, opts = {}) {
       ? " — image models need PAID OpenRouter credits (free 1000/day quota never covers /images). Top up at openrouter.ai/credits."
       : res.status === 404
         ? ` — model '${model}' not served on /images right now; check GET /api/v1/images/models.`
-        : "";
+        : res.status === 400
+          ? ` — '${model}' rejected the request parameters. The served list is GET /api/v1/images/models.`
+          : "";
     throw new Error(msg + hint);
   }
   // Normalize shapes: {data:[{b64_json|url}]} | {data:{...}} | {images:[...]}
@@ -3728,7 +3766,7 @@ function riskGate({ symbol, action, lotSize, entry, sl, balance }) {
 // everything else -> MT5 bridge (existing behavior, paper while unset).
 // riskUsdOverride is ALWAYS set for deriv/alpaca so the per-trade cap can
 // never be silently skipped for lack of a PIP row.
-async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual", balance = 1000, riskPercent = 1, userId = null, botName = null }) {
+async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual", balance = 1000, riskPercent = 1, userId = null, botName = null, expiryMin = 0 }) {
   const sym = canonicalSymbol(symbol);
   const rail = marketOf(sym);
   const riskBudget = Math.max(0.5, (Number(balance) || 1000) * (Number(riskPercent) || 1) / 100);
@@ -3737,8 +3775,8 @@ async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reas
     const acct = getTradingAccount(userId);
     if (acct?.balance > 0) balance = acct.balance;
   }
-  if (rail === "deriv") return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName });
-  if (rail === "alpaca") return executeAlpacaTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget });
+  if (rail === "deriv") return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName, expiryMin, balance });
+  if (rail === "alpaca") return executeAlpacaTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, balance });
   // F-06: bots pass a placeholder 0.01 lot. Size MT5-bridge trades from the
   // risk budget (balance x riskPercent, capped by calculateLotSize) instead;
   // the risk gate below still has the final say.
@@ -3760,7 +3798,7 @@ async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reas
   // but Deriv lists them as real OTC pairs), so bot orders for EURUSD/XAUUSD
   // reach Deriv through here.
   if (!MT5_BRIDGE_URL) {
-    return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName });
+    return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName, expiryMin, balance });
   }
   const result = await sendToMT5Bridge({ symbol: sym, action, lotSize, entry, sl, tp, reason });
   if (result.status !== "failed" && sl && tp) {
@@ -3774,8 +3812,9 @@ async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reas
 /** Deriv MULT execution. take_profit/stop_loss are dollar approximations
  *  (moveRatio x multiplier x stake at the default x100); Deriv prices the
  *  proposal exactly and the native contract levels enforce the exit. */
-async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget, userId = null, botName = null }) {
+async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget, userId = null, botName = null, expiryMin = 0, balance = 1000 }) {
   const stake = Math.max(0.5, Math.min(1000, Number(riskBudget) || 5));
+  const gateBalance = Number(balance) > 0 ? Number(balance) : 1000;
   const direction = String(action).toLowerCase() === "sell" ? "sell" : "buy";
   const e = Number(entry);
   const mult = Number(process.env.DERIV_MULTIPLIER) || 100;
@@ -3799,21 +3838,70 @@ async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source
       }
     } catch (e) { console.warn("[deriv] own-token executor failed:", e.message); }
   }
+  // TRUE POCKET OPTION: a CALL/PUT (Rise/Fall) contract with a fixed expiry.
+  // The pocket bot predicts whether the candle ENDS bullish or bearish within
+  // the given time, so it must buy a Rise/Fall contract — not a MULT contract
+  // (which has no expiry and rides TP/SL instead). The scalping bot, which
+  // DOES carry TP/SL, keeps the MULT path.
+  if (source === "bot:pocket" && Number(expiryMin) > 0) {
+    const dir = String(action).toLowerCase() === "sell" ? "PUT" : "CALL";
+    const gateP = riskGate({ symbol, action: dir === "PUT" ? "sell" : "buy", lotSize: 0, entry, sl: null, balance: gateBalance, riskUsdOverride: stake });
+    if (!gateP.allowed) {
+      return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gateP.reasons, exposure: gateP.exposure };
+    }
+    try {
+      const dSym = await executor.resolveSymbol(symbol);
+      if (!dSym) {
+        return { mode: "paper", status: "simulated", symbol, action: dir, stake,
+                 message: `no Rise/Fall market for ${symbol} on this account — paper mode` };
+      }
+      const r = await executor.client.buyRiseFall({
+        symbol: dSym, direction: dir, stake, durationMin: Number(expiryMin), currency: "USD",
+      });
+      if (r.error) {
+        return { mode: "paper", status: "simulated", symbol, action: dir, stake,
+                 message: `Deriv refused (${r.error}) — paper mode` };
+      }
+      try {
+        db.prepare(`
+          INSERT OR REPLACE INTO deriv_contracts
+          (contract_id, position_id, symbol, deriv_symbol, direction, stake, duration_min, entry_tick, status, mode, placed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+        `).run(String(r.contract_id), null, symbol, dSym, dir, stake, Number(expiryMin),
+          r.entry_tick ?? null, executor.client.account?.isDemo ? "demo" : "REAL", Date.now());
+      } catch (e) { console.warn("[deriv] pocket ledger failed:", e.message); }
+      const mode = executor.client.account?.isDemo ? "demo" : "REAL";
+      console.log(`[deriv] ${mode} ${dir} ${dSym} ${expiryMin}m stake=${stake} contract=${r.contract_id}`);
+      return { mode: mode === "REAL" ? "deriv-live" : "deriv-demo", status: "sent", symbol, action: dir,
+               stake, contract_id: r.contract_id, expiryMin: Number(expiryMin), reason };
+    } catch (err) {
+      console.log(`[Deriv] pocket paper fallback ${symbol}: ${err.message}`);
+      return { mode: "paper", status: "simulated", symbol, action: dir, stake,
+               message: `Deriv unavailable (${err.message}) — paper mode` };
+    }
+  }
   const takeProfit = e > 0 && tp != null ? +((Math.abs(tp - e) / e) * mult * stake).toFixed(2) : null;
   const stopLoss = e > 0 && sl != null ? +Math.min((Math.abs(e - sl) / e) * mult * stake, stake).toFixed(2) : null;
-  const gate = riskGate({ symbol, action: direction, lotSize: 0, entry, sl, balance: 1000, riskUsdOverride: stake });
+  // FIXED BUG: the risk gate was checked against a HARDCODED $1000 balance
+  // while the stake was sized from the user's real balance. A $50k account
+  // had its trade judged as if it risked 5% of $1000 — the guard was
+  // measuring the wrong account entirely. The user's real balance is used
+  // for both sizing and the risk check.
+  const gate = riskGate({ symbol, action: direction, lotSize: 0, entry, sl, balance: gateBalance, riskUsdOverride: stake });
   if (!gate.allowed) {
     return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
   }
   let result;
   try {
-    const r = await derivExecutor.executeMult
-      ? await derivExecutor.executeMult({ symbol, direction, stake, multiplier: mult, takeProfit, stopLoss })
+    const r = executor.executeMult
+      ? await executor.executeMult({ symbol, direction, stake, multiplier: mult, takeProfit, stopLoss })
       : { ok: false, why: "mult path unavailable" };
     if (!r.ok) throw new Error(r.why || "deriv refused");
     result = { mode: r.mode === "REAL" ? "deriv-live" : "deriv-demo", status: "sent", symbol, action: direction, stake, contract_id: r.contract_id, tp, sl, reason };
+    // Tag the source with the bot name so the portfolio attributes it.
+    const src = botName ? `${source}` : source;
     try {
-      const pos = positionMonitor.register({ symbol, action: direction, lotSize: stake, entry, sl, tp, source: `${source}:${result.mode}`, reason });
+      const pos = positionMonitor.register({ symbol, action: direction, lotSize: stake, entry, sl, tp, source: `${src}:${result.mode}`, reason });
       r.positionId = pos?.id;
     } catch (e) { console.warn("[PositionMonitor] deriv register failed:", e.message); }
   } catch (err) {
@@ -3827,14 +3915,16 @@ async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source
 }
 
 /** Alpaca bracket execution: dollar-risk share qty, native TP/SL, clock gate. */
-async function executeAlpacaTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget }) {
+async function executeAlpacaTrade({ symbol, action, entry, sl, tp, reason, source, riskBudget, balance = 1000 }) {
   const direction = String(action).toLowerCase() === "sell" ? "sell" : "buy";
   const stopDist = Math.abs(Number(entry) - Number(sl));
   const qty = qtyForRisk({ price: entry, stopDist, riskUsd: riskBudget });
   if (qty == null) {
     return { mode: "blocked", status: "blocked", blocked_by: "sizing", reasons: [`qty math failed (entry=${entry} sl=${sl} risk=$${riskBudget}) — no order`] };
   }
-  const gate = riskGate({ symbol, action: direction, lotSize: 0, entry, sl, balance: 1000, riskUsdOverride: stopDist * qty });
+  // Same fix as the Deriv path: judge the risk against the user's REAL
+  // balance, not a hardcoded $1000.
+  const gate = riskGate({ symbol, action: direction, lotSize: 0, entry, sl, balance: Number(balance) > 0 ? Number(balance) : 1000, riskUsdOverride: stopDist * qty });
   if (!gate.allowed) {
     return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
   }
@@ -6845,15 +6935,14 @@ app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) =>
   }
 });
 
-// ==================== REFERENCE PROXY ====================
-// Pinterest / Behance CDNs hotlink-protect a lot of their images. When the
-// VISION PROVIDER (not our server) fetches a CDN URL it gets a 403 and the
-// agent silently loses a reference. This route serves the bytes WE already
-// fetched, under an unguessable id, so the provider always gets the image.
-// It is also what the Android client uses to SHOW which references the
-// agent actually studied.
-app.get("/creative-suite/refs/:id", limitNormal, (req, res) => {
-  const entry = refCache.refStore().get(req.params.id);
+// ==================== REFERENCE SERVING ====================
+// Pinterest / Behance CDNs hotlink-protect a lot of their images. The
+// reference transport (creative/refs.js) fetches the bytes ONCE, browser-like,
+// and caches them on disk under a content-addressed id. This route serves
+// those bytes back, so the Android client can SHOW which references the
+// agent actually studied without hotlinking a third party.
+app.get("/creative-suite/refs/:id", limitNormal, async (req, res) => {
+  const entry = await refs.readRef(req.params.id);
   if (!entry) return res.status(404).json({ error: "reference expired" });
   res.set("Content-Type", entry.mime || "image/jpeg");
   res.set("Cache-Control", "private, max-age=1800");
@@ -6877,21 +6966,56 @@ app.get("/creative-suite/refs/:id", limitNormal, (req, res) => {
 //   * the brief is pushed AWAY from the references it studied,
 //   * a TYPE LAYER sets the real typography over the rendered artwork.
 const designAgentDeps = {
+  // retries: 1 + a bounded timeout. The default (3 polite retries that wait
+  // out a 429) burned the whole stage budget on one rate-limited provider;
+  // with this, a 429 moves to the NEXT MODEL in the chain immediately.
   chat: async (messages, opts = {}) => {
-    const out = await chatWithFallback("vision", {
+    // One retry: an "empty completion" from a vision model is a provider
+    // hiccup, not a verdict. The stage timeout bounds the total.
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const out = await chatWithFallback("vision", {
+          messages,
+          max_tokens: opts.max_tokens ?? 900,
+          temperature: opts.temperature ?? 0.2,
+          retries: 1,
+          timeoutMs: 45_000,
+        });
+        const c = String(out?.choices?.[0]?.message?.content || "");
+        if (c.trim()) return c;
+        lastErr = new Error("the vision model returned an empty completion");
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("the vision model returned nothing");
+  },
+  // The BRIEF writer only needs text (the reference DNA is already text), so
+  // it runs on the DRAFT chain. The vision model is reserved for reading the
+  // references and for reviewing the render. Using the vision model for the
+  // brief blew the stage budget on the first live run.
+  chatText: async (messages, opts = {}) => {
+    const out = await chatWithFallback("draft", {
       messages,
-      max_tokens: opts.max_tokens ?? 900,
-      temperature: opts.temperature ?? 0.2,
+      max_tokens: opts.max_tokens ?? 1400,
+      temperature: opts.temperature ?? 0.4,
+      retries: 1,
+      timeoutMs: 30_000,
     });
-    return String(out?.choices?.[0]?.message?.content || "");
+    const c = out?.choices?.[0]?.message?.content;
+    return typeof c === "string" ? c : (Array.isArray(c) ? c.map((p) => p?.text || "").join("") : "");
   },
   // Model CHAIN, not a single slug: an unserved/retired graphics model must
   // never kill a finished brief (that is exactly what Week 6 found — the old
   // design default was retired upstream). Explicit caller model wins.
-  // The chain also carries the TYPE model (Ideogram-class) because a
-  // type-heavy brief is exactly what Ideogram is good at.
+  // The chain stays in ONE class: the prompt tells the model whether WE set
+  // the type, so a chain that mixed a type specialist with a general model
+  // would hand half the chain the wrong prompt (and double the copy).
   generate: async (prompt, opts = {}) => {
-    const chain = [...new Set([opts.model, OR_GRAPHICS_MODEL, OR_TYPE_MODEL, OR_IMAGE_MODEL].filter(Boolean))];
+    const wanted = [...new Set([opts.model, OR_GRAPHICS_MODEL, OR_TYPE_MODEL, OR_IMAGE_MODEL].filter(Boolean))];
+    const specialist = imageProviders.isTypeSpecialist(wanted[0] || "");
+    const chain = imageProviders.classConsistentChain(wanted, { specialist });
     let lastErr = null;
     for (const model of chain) {
       try {
@@ -6899,9 +7023,6 @@ const designAgentDeps = {
           model,
           output_format: opts.output_format || "png",
           ...(opts.aspect_ratio ? { aspect_ratio: opts.aspect_ratio } : {}),
-          ...(opts.brief ? { brief: opts.brief } : {}),
-          ...(opts.seed != null ? { seed: opts.seed } : {}),
-          ...(opts.negative_prompt ? { negative_prompt: opts.negative_prompt } : {}),
         });
       } catch (e) {
         lastErr = e;
@@ -6910,18 +7031,27 @@ const designAgentDeps = {
     }
     throw lastErr || new Error("no image model configured");
   },
-  // Reference bytes are fetched ONCE by us and served from our own host, so
-  // the vision provider never has to hotlink a protected CDN.
-  proxyReference: async (url) => {
-    try {
-      const entry = await refCache.refStore().fetchAndStore(url, { fetchImpl: fetch });
-      const base = PUBLIC_BASE_URL || "";
-      if (!base) return null; // no public base URL -> the inline path is used
-      return `${base}${refCache.REFERENCE_PATH_PREFIX}${entry.id}`;
-    } catch (e) {
-      console.warn(`[design-agent] reference proxy failed for ${String(url).slice(0, 80)}: ${e.message}`);
-      return null;
+  // Who sets the type? A type specialist (Recraft) renders real fonts itself,
+  // so we must NOT draw the copy again on top. Every other model mangles
+  // lettering, so WE typeset it over the artwork.
+  typesetByUs: (model) => !imageProviders.isTypeSpecialist(model || OR_GRAPHICS_MODEL || OR_IMAGE_MODEL),
+  // Reference transport: browser-like fetch, public origin-side proxy
+  // fallback, <=1024px downscale, content-addressed disk cache. The inline
+  // data URI is what the vision model reads; the proxy URL is what the app
+  // shows the user.
+  loadReference: async (url) => {
+    const got = await refs.loadReference(url, { fetchImpl: fetch });
+    if (!got) {
+      const fallback = refs.proxyImageUrl(url);
+      return { dataUri: null, url: fallback, id: null };
     }
+    const base = PUBLIC_BASE_URL || "";
+    return {
+      dataUri: got.dataUri,
+      id: got.id,
+      url: base && got.id ? `${base}/creative-suite/refs/${got.id}` : null,
+      bytes: got.bytes,
+    };
   },
   // The type layer: real glyphs, real sizes, set from the brief.
   applyType: async (buffer, brief) => typeLayer.applyTypeLayer(buffer, brief),
@@ -7008,7 +7138,15 @@ app.post("/creative-suite/director", requireAuth, limitCostly, async (req, res) 
         }
         return { refs: designAgent.rankInspirationUrls(refs, { max: 4, seed }) };
       },
-      readLook: (ref, goal) => directorAgent.readLookReference(ref, goal, { chat: deps.chat, fetchImpl: fetch }),
+      readLook: async (ref, goal) => {
+        const loaded = await refs.loadReference(ref, { fetchImpl: fetch });
+        return directorAgent.readLookReference(ref, goal, {
+          chat: deps.chat,
+          loaded: loaded
+            ? { dataUri: loaded.dataUri, url: loaded.id ? `${PUBLIC_BASE_URL || ""}/creative-suite/refs/${loaded.id}` : null }
+            : { dataUri: null, url: refs.proxyImageUrl(ref) },
+        });
+      },
       planFilm: (goal, n, looks) => directorAgent.synthesizeShotPlan(goal, n, looks, { chat: deps.chat }),
       renderShot: async (shot, { attempt, correction }) => {
         const directed = cinema.buildDirectorPrompt({
@@ -7314,24 +7452,26 @@ app.get("/api/trading/notifications", requireAuth, async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const notifications = [];
 
-    // 1. Bot runs (scalping, pocket, intraday, longterm, options)
+    // 1. Bot runs (scalping, pocket, intraday, longterm) — THIS user's runs
+    //    first, then the platform's shared book.
     try {
       const runs = db.prepare(`
-        SELECT bot, pair, timeframe, decision, confidence, note, fired_at
-        FROM bot_runs WHERE bot != 'options' AND decision IN ('BUY','SELL','CALL','PUT')
+        SELECT bot, pair, timeframe, decision, confidence, note, fired_at, user_id
+        FROM bot_runs WHERE decision IN ('BUY','SELL','CALL','PUT')
         ORDER BY fired_at DESC LIMIT ?
-      `).all(limit);
+      `).all(limit * 2);
       for (const r of runs) {
         notifications.push({
-          id: `bot_${r.bot}_${r.fired_at}`,
+          id: `bot_${r.user_id || "bot"}_${r.bot}_${r.fired_at}`,
           bot: r.bot,
           type: "bot_signal",
           symbol: r.pair,
           decision: r.decision,
           confidence: r.confidence,
-          note: r.note,
+          note: `${r.timeframe || ""} · ${r.note || ""}`.trim(),
           timestamp: r.fired_at,
           read: false,
+          mine: r.user_id === user_id,
         });
       }
     } catch { /* best-effort */ }
@@ -7339,12 +7479,14 @@ app.get("/api/trading/notifications", requireAuth, async (req, res) => {
     // 2. Trading signals (main engine, intraday bot, longterm bot, scalping bot)
     try {
       const sigs = db.prepare(`
-        SELECT id, symbol, decision, confidence, reasoning, timestamp
-        FROM trading_signals WHERE user_id = ? AND decision IN ('BUY','SELL')
+        SELECT id, symbol, decision, confidence, reasoning, entry, sl, tp1, tp2, rr,
+               scenario, bot_source, lot_size, lot_reason, risk_usd, timestamp
+        FROM trading_signals WHERE user_id = ? AND decision IN ('BUY','SELL','CALL','PUT')
         ORDER BY timestamp DESC LIMIT ?
       `).all(user_id, limit);
       for (const s of sigs) {
-        const botName = s.id.includes("_sc") ? "scalping" : s.id.includes("_lt") ? "longterm" : s.id.includes("_sy") ? "intraday" : "engine";
+        // The signal records which engine/bot produced it — that is the tag.
+        const botName = s.bot_source || "engine";
         notifications.push({
           id: `sig_${s.id}`,
           bot: botName,
@@ -7355,6 +7497,12 @@ app.get("/api/trading/notifications", requireAuth, async (req, res) => {
           note: (s.reasoning || "").slice(0, 200),
           timestamp: s.timestamp,
           read: false,
+          // Full trade detail, shown when the user taps the bar entry.
+          detail: {
+            entry: s.entry, sl: s.sl, tp1: s.tp1, tp2: s.tp2, rr: s.rr,
+            scenario: s.scenario, reasoning: s.reasoning,
+            lotSize: s.lot_size, lotReason: s.lot_reason, riskUsd: s.risk_usd,
+          },
         });
       }
     } catch { /* best-effort */ }
@@ -7502,8 +7650,7 @@ setInterval(async () => {
       formatSignal: (symbol, result) => formatTradingSignal(symbol, result),
       storeOptionsSignal: (userId, signal) => storeOptionsSignal(userId, signal),
       openPaper: (userId, signal) => openPaperPosition(db, userId, signal),
-      executor: (args) => executeTradeSignal({ ...args, source: args.source || "bots" }),
-      log: (...a) => console.log("[bots]", ...a),
+      executor: (args) => executeTradeSignal({ ...args, source: args.source || "bots" }),      log: (...a) => console.log("[bots]", ...a),
     });
   } catch (e) {
     console.warn("[bots] tick failed:", e.message);
@@ -7585,8 +7732,10 @@ function saveTradingAccount(user_id, patch = {}) {
 // Comprehensive AI-powered trading endpoints for mobile app
 
 // --- Tier gating for bot operations ---
-// Non-paid users cannot: add pairs, toggle bots, set timeframe.
-// They receive a 402 with an upgrade message + wallet link.
+// Non-paid users cannot: add pairs, toggle 24/7 watching, turn a bot on for
+// trading or signals, or choose a timeframe. They receive a 402 with an
+// upgrade message AND the wallet subscription link so the app can deep-link
+// the user straight to the screen where they pay.
 function requireBotAccess(req, res) {
   const user_id = boundUser(req);
   const ent = checkEntitlement(user_id, "trading");
@@ -7595,7 +7744,9 @@ function requireBotAccess(req, res) {
       error: ent.message,
       code: ent.code || "feature_locked",
       feature: "trading",
-      upgradeUrl: "/billing/subscribe",
+      // The app routes this to its Wallet → Subscribe screen.
+      upgradeUrl: "wallet://subscribe",
+      upgradePath: "/wallet",
       needed: ent.needed,
       balance: ent.balance,
     });
@@ -7666,7 +7817,9 @@ app.delete("/api/trading/watchlist/:symbol", requireAuth, async (req, res) => {
 
 app.patch("/api/trading/watchlist/:symbol", requireAuth, async (req, res) => {
   try {
-    const user_id = boundUser(req);
+    // The 24/7 watch toggle is a bot operation — gated like the rest.
+    const user_id = requireBotAccess(req, res);
+    if (!user_id) return;
     const sym = String(req.params.symbol).toUpperCase();
     const { isEnabled, sortOrder } = req.body || {};
     const updates = [];
@@ -8242,17 +8395,25 @@ app.get("/api/trading/paper-portfolio", requireAuth, async (req, res) => {
     };
     const botOfSource = (s) => {
       const v = String(s || "");
-      if (v === "bot:intraday") return "intraday";
-      if (v === "bot:longterm") return "longterm";
+      // Bot sources are tagged "bot:<name>" — cover every bot we run.
+      if (v.startsWith("bot:")) {
+        const n = v.slice(4).split(":")[0];
+        return n || "bot";
+      }
       if (v === "scheduler") return "scheduler";
-      if (v === "bots") return "intraday/longterm";
-      if (v === "pocket-deriv") return "pocket-deriv";
+      if (v === "bots") return "intraday";
+      if (v.startsWith("pocket-deriv")) return "pocket";
+      if (v.startsWith("deriv-")) return "deriv";
+      if (v.startsWith("alpaca")) return "alpaca";
+      if (v.startsWith("options")) return "options";
+      if (v.startsWith("engine")) return "engine";
+      if (v.startsWith("manual")) return "manual";
       return "manual";
     };
 
-    // 1. Spot/CFD positions (intraday, longterm, scheduler, manual).
+    // 1. Spot/CFD positions (intraday, longterm, scalping, scheduler, manual).
     try {
-      const all = positionMonitor.list(500);
+      const all = positionMonitor.list(5000);
       for (const p of all) {
         const open = p.status === "MONITORING";
         let exit = p.close_price ?? null;
@@ -8331,8 +8492,72 @@ app.get("/api/trading/paper-portfolio", requireAuth, async (req, res) => {
       }
     } catch (e) { console.warn("[paper-portfolio] alpaca:", e.message); }
 
+    // 5. DERIV CONTRACTS — the broker-truth book. The old portfolio only
+    //    showed pocket + positions, so Deriv fills (the rail the bots
+    //    actually trade on) were invisible. Every contract the executor
+    //    bought appears here, open or settled, with its real P&L.
+    try {
+      const rows = db.prepare("SELECT * FROM deriv_contracts ORDER BY placed_at DESC LIMIT 1000").all();
+      for (const c of rows) {
+        const settled = c.status === "SETTLED";
+        const profit = Number(c.profit) || 0;
+        add({
+          bot: c.direction === "MULTUP" || c.direction === "MULTDN" ? "deriv" : "pocket",
+          source: `deriv-${String(c.mode || "demo")}`,
+          symbol: c.symbol,
+          side: c.direction,
+          entry: c.entry_tick, exit: null,
+          pnl: settled ? profit : 0, pnlKind: "usd",
+          status: settled ? (profit > 0 ? "CLOSED_WIN" : "CLOSED_LOSS") : "OPEN",
+          openedAt: c.placed_at, closedAt: settled ? c.placed_at : null,
+          note: `${c.stake} stake · ${c.duration_min ? c.duration_min + "m" : "MULT"} · ${c.mode} · ${c.deriv_symbol || c.symbol}`,
+        });
+      }
+    } catch (e) { console.warn("[paper-portfolio] deriv:", e.message); }
+
+    // 6. JOURNAL SETUPS — every published setup with its outcome. This is
+    //    the "did my trades actually work" record across ALL engines.
+    try {
+      const rows = db.prepare("SELECT * FROM pullback_journal ORDER BY recorded_at DESC LIMIT 1000").all();
+      for (const j of rows) {
+        const resolved = j.status === "RESOLVED";
+        add({
+          bot: "engine", source: "journal",
+          symbol: j.symbol, side: j.direction,
+          entry: j.entry, exit: null,
+          pnl: resolved ? (j.outcome === "win" ? (j.planned_rr || 0) : -1) : 0,
+          pnlKind: "units", // R-multiples, not dollars
+          status: resolved ? (j.outcome === "win" ? "CLOSED_WIN" : "CLOSED_LOSS")
+            : (j.status === "EXPIRED" ? "EXPIRED" : "OPEN"),
+          openedAt: j.recorded_at, closedAt: j.resolved_at || null,
+          note: `${j.strategy} · ${j.outcome || j.status} · R${(j.planned_rr ?? 0).toFixed(2)}`,
+        });
+      }
+    } catch (e) { console.warn("[paper-portfolio] journal:", e.message); }
+
     trades.sort((a, b) => (b.openedAt || 0) - (a.openedAt || 0));
-    res.json({ trades: trades.slice(0, 300), byBot, serverTime: Date.now() });
+    // Headline performance per bot, so the portfolio reads like a real book
+    // rather than a raw trade dump.
+    for (const b of Object.values(byBot)) {
+      const closed = b.wins + b.losses;
+      b.winRate = closed ? Number(((b.wins / closed) * 100).toFixed(1)) : null;
+      b.closed = closed;
+      b.open = Math.max(0, b.trades - closed);
+      b.pnlUsd = Number((b.pnlUsd || 0).toFixed(2));
+      b.pnlUnits = Number((b.pnlUnits || 0).toFixed(2));
+    }
+    const acct = getTradingAccount(user_id);
+    const totalUsd = Object.values(byBot).reduce((a, b) => a + (b.pnlUsd || 0), 0);
+    res.json({
+      trades: trades.slice(0, 1000),
+      byBot,
+      total: trades.length,
+      totalPnlUsd: Number(totalUsd.toFixed(2)),
+      balance: acct?.balance || 1000,
+      equity: Number(((acct?.balance || 1000) + totalUsd).toFixed(2)),
+      account: acct,
+      serverTime: Date.now(),
+    });
   } catch (err) {
     res.status(500).json({ error: "Paper portfolio failed", details: err.message });
   }
