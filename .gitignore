@@ -19,3 +19,12 @@ frit.db
 frit.db-shm
 frit.db-wal
 *.db-journal
+# F-26 SECURITY: a runtime DB BACKUP was tracked while this repo was PUBLIC.
+# The rules above only covered the exact names, so `frit.db.backup-tmp` slipped
+# through and was published. Ignore the whole family.
+frit.db*
+*.db
+*.db-*
+*.db.backup*
+*.sqlite
+*.sqlite3
