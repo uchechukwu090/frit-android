@@ -77,16 +77,21 @@ export function kellyFraction({ winRate = 0.45, rr = 1.5, profile = DEFAULT_RISK
   const info = riskProfileInfo(profile);
   let fraction = kelly * info.kellyFraction;
   let reason = `Kelly ${(kelly * 100).toFixed(1)}% x ${info.label} ${(info.kellyFraction * 100).toFixed(1)}%`;
-  // Hard per-trade risk cap.
-  const maxPct = Number(process.env.RISK_MAX_TRADE_PCT) || 2;
+  // Hard per-trade backstop. This is a CEILING on an already-fractional
+  // Kelly bet, not the sizing rule itself: 1/2 Kelly on a strong edge is a
+  // large bet by design, and a 2% cap would collapse AGGRESSIVE and MODERATE
+  // onto the same number — the profile would stop meaning anything. The
+  // backstop only bites on absurd edges.
+  const maxPct = Number(process.env.KELLY_MAX_TRADE_PCT) || 10;
   if (fraction * 100 > maxPct) {
     fraction = maxPct / 100;
-    reason += ` — capped at ${maxPct}% per trade`;
+    reason += ` — backstopped at ${maxPct}% per trade`;
   }
   return {
     fraction: Number(fraction.toFixed(6)),
     kelly: Number(kelly.toFixed(4)),
     capped: fraction * 100 >= maxPct - 1e-9,
+    maxFraction: maxPct / 100,
     reason,
   };
 }

@@ -81,13 +81,16 @@ export function ensureBotsTables(db) {
       pair TEXT, timeframe TEXT,
       fired_at INTEGER,
       decision TEXT, confidence INTEGER, note TEXT,
-      user_id TEXT DEFAULT 'bot'
+      user_id TEXT DEFAULT 'bot',
+      placed INTEGER DEFAULT 0
     );
   `);
-  // Per-user attribution: which user's bot produced this run.
+  // Per-user attribution: which user's bot produced this run, and whether the
+  // run actually PLACED a trade (only placed trades count against the cap).
   try {
     const cols = db.prepare("PRAGMA table_info(bot_runs)").all().map(c => c.name);
     if (!cols.includes("user_id")) db.exec("ALTER TABLE bot_runs ADD COLUMN user_id TEXT DEFAULT 'bot'");
+    if (!cols.includes("placed")) db.exec("ALTER TABLE bot_runs ADD COLUMN placed INTEGER DEFAULT 0");
   } catch { /* best-effort */ }
   for (const [name, def] of Object.entries(BOT_DEFS)) {
     try {
@@ -100,19 +103,27 @@ export function ensureBotsTables(db) {
 
 export function getBots(db) {
   ensureBotsTables(db);
-  return db.prepare("SELECT * FROM bots").all().map((b) => ({
-    name: b.name,
-    label: BOT_DEFS[b.name]?.label || b.name,
-    pair: b.pair || "",
-    timeframe: b.timeframe || BOT_DEFS[b.name]?.defaultTimeframe || "",
-    auto_enabled: b.auto_enabled === 1,
-    min_confidence: b.min_confidence ?? 60,
-    max_trades_day: b.max_trades_day ?? 2,
-    intervalMin: BOT_DEFS[b.name]?.intervalMin ?? 60,
-    executes: BOT_DEFS[b.name]?.executes ?? false,
-    blurb: BOT_DEFS[b.name]?.blurb || "",
-    last_run: b.last_run || null,
-  }));
+  const rows = db.prepare("SELECT * FROM bots").all();
+  const byName = new Map(rows.map((b) => [b.name, b]));
+  // Return in BOT_DEFS order (scalping, pocket, intraday, longterm, options)
+  // so the UI always shows the same sequence — a plain SELECT has no order.
+  return Object.keys(BOT_DEFS).map((name) => {
+    const b = byName.get(name);
+    if (!b) return null;
+    return {
+      name: b.name,
+      label: BOT_DEFS[b.name]?.label || b.name,
+      pair: b.pair || "",
+      timeframe: b.timeframe || BOT_DEFS[b.name]?.defaultTimeframe || "",
+      auto_enabled: b.auto_enabled === 1,
+      min_confidence: b.min_confidence ?? 60,
+      max_trades_day: b.max_trades_day ?? 2,
+      intervalMin: BOT_DEFS[b.name]?.intervalMin ?? 60,
+      executes: BOT_DEFS[b.name]?.executes ?? false,
+      blurb: BOT_DEFS[b.name]?.blurb || "",
+      last_run: b.last_run || null,
+    };
+  }).filter(Boolean);
 }
 
 export function saveBot(db, name, cfg = {}) {
@@ -137,12 +148,11 @@ export function saveBot(db, name, cfg = {}) {
 
 function runsToday(db, name) {
   try {
+    // Only PLACED trades count against the daily cap. A signal that fired
+    // below the confidence floor (or a signal-only bot) must not consume
+    // the user's daily allowance.
     return db.prepare(
-      // F-43 (Week 5): the pocket bot logs CALL/PUT, not BUY/SELL. Counting
-      // only BUY/SELL meant the pocket bot's daily cap never incremented —
-      // max_trades_day was silently ignored for that bot (unlimited trades
-      // per day). Every decision that PLACES a trade now counts.
-      "SELECT COUNT(*) AS c FROM bot_runs WHERE bot = ? AND date(fired_at/1000,'unixepoch') = date('now') AND decision IN ('BUY','SELL','CALL','PUT')"
+      "SELECT COUNT(*) AS c FROM bot_runs WHERE bot = ? AND date(fired_at/1000,'unixepoch') = date('now') AND placed = 1 AND decision IN ('BUY','SELL','CALL','PUT')"
     ).get(name)?.c || 0;
   } catch { return 0; }
 }
@@ -151,7 +161,7 @@ function runsToday(db, name) {
 function runsTodayFor(db, name, pair, userId) {
   try {
     return db.prepare(
-      "SELECT COUNT(*) AS c FROM bot_runs WHERE bot = ? AND pair = ? AND user_id = ? AND date(fired_at/1000,'unixepoch') = date('now') AND decision IN ('BUY','SELL','CALL','PUT')"
+      "SELECT COUNT(*) AS c FROM bot_runs WHERE bot = ? AND pair = ? AND user_id = ? AND date(fired_at/1000,'unixepoch') = date('now') AND placed = 1 AND decision IN ('BUY','SELL','CALL','PUT')"
     ).get(name, String(pair).toUpperCase(), userId)?.c || 0;
   } catch { return 0; }
 }
@@ -173,11 +183,11 @@ export function botCooldown(db, key, intervalMin) {
   } catch { return true; }
 }
 
-function logRun(db, bot, pair, timeframe, decision, confidence, note, userId = "bot") {
+function logRun(db, bot, pair, timeframe, decision, confidence, note, userId = "bot", placed = 0) {
   try {
     db.prepare(
-      "INSERT INTO bot_runs (bot, pair, timeframe, fired_at, decision, confidence, note, user_id) VALUES (?,?,?,?,?,?,?,?)"
-    ).run(bot, pair, timeframe, Date.now(), decision, confidence ?? 0, String(note || "").slice(0, 500), userId);
+      "INSERT INTO bot_runs (bot, pair, timeframe, fired_at, decision, confidence, note, user_id, placed) VALUES (?,?,?,?,?,?,?,?,?)"
+    ).run(bot, pair, timeframe, Date.now(), decision, confidence ?? 0, String(note || "").slice(0, 500), userId, placed ? 1 : 0);
   } catch { /* best-effort */ }
 }
 
@@ -259,12 +269,15 @@ export async function tickBots(deps) {
         userId, minConf, tradeEnabled, signalEnabled,
       });
       for (const r of out.results) results.push({ ...r, userId, pair });
-      if (out.decision && out.decision !== "WAIT") {
+      if (out.decision) {
+        // placed=1 only when an order was actually sent — that is what the
+        // daily cap counts. A signal that fired below the confidence floor
+        // must not eat the user's daily allowance.
         logRun(db, row.bot_name, pair, row.timeframe, out.decision, out.confidence || 0,
-          `${userId} ${out.note || "fired"}`, userId);
+          `${userId} ${out.note || "fired"}`, userId, out.traded ? 1 : 0);
       }
     } catch (e) {
-      logRun(db, row.bot_name, pair, row.timeframe, "ERROR", 0, e.message, userId);
+      logRun(db, row.bot_name, pair, row.timeframe, "ERROR", 0, e.message, userId, 0);
       results.push({ bot: row.bot_name, decision: "ERROR", note: e.message, userId, pair });
     }
   }
@@ -283,6 +296,12 @@ export async function tickBots(deps) {
         tradeEnabled: bot.auto_enabled, signalEnabled: true, legacy: true,
       });
       for (const r of out.results) results.push(r);
+      // The legacy global bot must log its run too — without this the daily
+      // cap never incremented and the bot traded without limit.
+      if (out.decision) {
+        logRun(db, bot.name, bot.pair, bot.timeframe, out.decision, out.confidence || 0,
+          out.note || "fired", "bot", out.traded ? 1 : 0);
+      }
     } catch (e) {
       logRun(db, bot.name, bot.pair, bot.timeframe, "ERROR", 0, e.message);
       results.push({ bot: bot.name, decision: "ERROR", note: e.message });
@@ -298,7 +317,7 @@ export async function tickBots(deps) {
  */
 async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, tradeEnabled, signalEnabled, legacy }) {
   const { db } = deps;
-  const out = { decision: "WAIT", confidence: 0, note: "", results: [] };
+  const out = { decision: "WAIT", confidence: 0, note: "", results: [], traded: false };
   const def = BOT_DEFS[botName];
 
   if (botName === "options") {
@@ -417,8 +436,15 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
       source: `bot:${botName}`,
       userId,
       botName,
+      // The pocket bot buys a Rise/Fall contract with this expiry; the
+      // scalping bot uses TP/SL on a MULT contract instead.
+      expiryMin: signal.expiryMin || 0,
     });
     out.note = exec?.mode || "sent";
+    // "placed" means an order was actually SENT. A blocked/refused order
+    // (risk gate, no Deriv market) is NOT a placed trade and must not
+    // consume the daily cap.
+    out.traded = !!(exec && exec.mode !== "blocked" && exec.status !== "blocked");
     out.results.push({ bot: botName, decision: signal.decision, confidence: signal.confidence, execution: exec?.mode || null, lotSize: sizing.lotSize });
   } else {
     out.note = "signal only (trading off)";

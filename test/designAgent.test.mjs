@@ -231,6 +231,32 @@ test("synthesizeBrief: retries once when the model answers with prose instead of
   assert.equal(out.layout.alignment, "center");
 });
 
+test("synthesizeBrief: THROWS when neither reply is usable JSON (never a silent default)", async () => {
+  await assert.rejects(
+    () => synthesizeBrief("coffee flyer", {}, [], { chat: async () => "just prose, no JSON at all" }),
+    /did not return usable JSON/
+  );
+});
+
+test("runDesignAgent: an unusable brief reply falls back to the REFERENCE DNA, not to a default", async () => {
+  const { deps } = baseDeps({
+    describeReference: async (ref) => ({
+      ref,
+      dna: {},
+      structure: { grid: "diagonal", alignment: "right", palette_temp: "cool", type_pairing: "mono-sans", motif_density: "dense", texture: "grain" },
+      palette: [{ hex: "#224466", role: "dominant", share_pct: 70 }, { hex: "#FFCC00", role: "accent", share_pct: 30 }],
+      typography: { display: "Roboto Mono" },
+      mood: "cool",
+    }),
+    synthesizeBrief: async () => { throw new Error("the brief writer did not return usable JSON"); },
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer" }, deps);
+  assert.ok(out.warnings.some((w) => /reference DNA/.test(w)), "the fallback must be reported");
+  assert.equal(out.brief.layout.grid, "diagonal", "the brief keeps the reference's grid");
+  assert.equal(out.brief.layout.alignment, "right");
+  assert.deepEqual(out.brief.palette.map((p) => p.hex), ["#224466", "#FFCC00"], "the brief keeps the reference's palette");
+});
+
 test("runDesignAgent: full run returns brief, render and a passing verification", async () => {
   const { deps, prompts } = baseDeps();
   const out = await runDesignAgent({ goal: "coffee shop flyer", headline: "COLD BREW" }, deps);
@@ -301,4 +327,217 @@ test("defaultBrief is a valid starting point on its own", () => {
   const b = defaultBrief({ headline: "SALE" });
   assert.equal(b.copy.headline, "SALE");
   assert.ok(briefToPrompt(b).includes("SALE"));
+});
+
+// ------------------------------------------------------ the anti-copy rules ---
+
+test("planInspirationQueries: the style token changes with the seed and rides in the query", () => {
+  const a = planInspirationQueries("birthday poster", { seed: 1 });
+  const b = planInspirationQueries("birthday poster", { seed: 2 });
+  assert.match(a[0], /site:pinterest\.com birthday poster .+ design/);
+  assert.notEqual(a[0], b[0], "the same request must not browse the same way twice");
+  const same = planInspirationQueries("birthday poster", { seed: 1 });
+  assert.deepEqual(a, same, "the same seed must browse the same way");
+});
+
+test("rankInspirationUrls: the host bonus always wins, the seed only breaks ties", () => {
+  const urls = [
+    "https://random.example.com/a.jpg",
+    "https://i.pinimg.com/736x/x.jpg",
+    "https://mir-s3-cdn-cf.behance.net/p.jpg",
+  ];
+  for (const seed of [1, 2, 3, 99]) {
+    const out = rankInspirationUrls(urls, { max: 1, seed });
+    assert.ok(/pinimg|behance/.test(out[0]), `seed ${seed} must still prefer the inspiration hosts`);
+  }
+});
+
+test("rankInspirationUrls: two seeds pick DIFFERENT references from the same pool", () => {
+  const urls = [
+    "https://i.pinimg.com/736x/a.jpg",
+    "https://i.pinimg.com/736x/b.jpg",
+    "https://i.pinimg.com/736x/c.jpg",
+    "https://i.pinimg.com/736x/d.jpg",
+    "https://mir-s3-cdn-cf.behance.net/p.jpg",
+    "https://i.pinimg.com/736x/e.jpg",
+  ];
+  const seen = new Set();
+  for (const seed of [11, 22, 33, 44, 55]) {
+    seen.add(rankInspirationUrls(urls, { max: 3, seed }).join("|"));
+  }
+  assert.ok(seen.size >= 3, `the seed must change the selection, got ${seen.size} distinct picks`);
+});
+
+test("describeReference: the reply is split into structure and content", async () => {
+  const out = await describeReference("data:image/png;base64,AAAA", "coffee flyer", {
+    chat: async () => JSON.stringify({
+      structure: { grid: "diagonal", alignment: "right", palette_temp: "cool", type_pairing: "mono-sans", motif_density: "dense", texture: "grain" },
+      palette: [{ hex: "#112233", role: "dominant" }],
+      typography: { display: "Grotesk" },
+      content: { subject: "a smiling barista", motifs: ["steam"] },
+      mood: "warm",
+    }),
+  });
+  assert.equal(out.structure.grid, "diagonal");
+  assert.equal(out.structure.palette_temp, "cool");
+  assert.equal(out.content.subject, "a smiling barista");
+  assert.equal(out.mood, "warm");
+});
+
+test("synthesizeBrief: the reference's SUBJECT never reaches the brief writer", async () => {
+  const seen = [];
+  await synthesizeBrief("coffee flyer", { headline: "COLD BREW" }, [
+    {
+      ref: "https://i.pinimg.com/736x/a.jpg",
+      dna: {
+        structure: { grid: "centered", alignment: "center", palette_temp: "warm" },
+        palette: [{ hex: "#0E3B2E", role: "dominant" }],
+        typography: { display: "Didot" },
+        content: { subject: "a smiling barista holding a latte", motifs: ["steam", "barista"] },
+        mood: "warm",
+      },
+    },
+  ], {
+    chat: async (messages) => { seen.push(JSON.stringify(messages)); return '{"layout":{"alignment":"left"}}'; },
+  });
+  const all = seen.join("\n");
+  assert.ok(!all.includes("barista"), "the reference's subject must never be shown to the brief writer");
+  assert.ok(!all.includes("steam"), "the reference's motifs must never be shown to the brief writer");
+  assert.ok(all.includes("centered"), "the reference's STRUCTURE must be shown");
+});
+
+test("runDesignAgent: the same goal with a different seed produces a different prompt", async () => {
+  const a = await runDesignAgent({ goal: "coffee flyer", seed: 1 }, baseDeps().deps);
+  const b = await runDesignAgent({ goal: "coffee flyer", seed: 2 }, baseDeps().deps);
+  assert.notEqual(a.prompt, b.prompt, "the prompt must vary or the render repeats");
+  assert.notEqual(a.seed, b.seed);
+  assert.ok(a.art_direction.length > 5);
+
+  const same = await runDesignAgent({ goal: "coffee flyer", seed: 1 }, baseDeps().deps);
+  assert.equal(same.prompt, a.prompt, "the same seed must be reproducible");
+});
+
+test("runDesignAgent: the brief is pushed AWAY from a reference it mirrors", async () => {
+  const mirrored = {
+    layout: { grid: "centered", alignment: "center", margins_pct: 8, focal: "middle" },
+    palette: [{ hex: "#0E3B2E", role: "dominant", share_pct: 60 }, { hex: "#F4EFE4", role: "secondary", share_pct: 40 }],
+    typography: [{ role: "headline", font: "Didot serif", size_px: 96, weight: 800, tracking: -1, case: "UPPER" }],
+    elements: [],
+    background: { description: "flat", color_hex: "#F4EFE4" },
+    copy: { headline: "COLD BREW" },
+  };
+  const { deps } = baseDeps({
+    describeReference: async (ref) => ({
+      ref,
+      dna: {},
+      structure: { grid: "centered", alignment: "center", palette_temp: "warm", type_pairing: "serif-sans", motif_density: "sparse", texture: "flat" },
+      palette: [{ hex: "#0E3B2E", role: "dominant" }],
+      typography: { display: "Didot" },
+      mood: "warm",
+    }),
+    synthesizeBrief: async () => mirrored,
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer" }, deps);
+  assert.ok(out.divergence.changed.length > 0, "the divergence guard must act");
+  assert.notEqual(out.brief.layout.grid, "centered");
+  assert.notEqual(out.brief.layout.alignment, "center");
+});
+
+test("runDesignAgent: references are picked for structural SPREAD, not top-of-search", async () => {
+  const refs = {
+    u1: { structure: { grid: "centered", alignment: "center", palette_temp: "warm", type_pairing: "serif-sans", motif_density: "sparse", texture: "flat" } },
+    u2: { structure: { grid: "centered", alignment: "center", palette_temp: "warm", type_pairing: "serif-sans", motif_density: "sparse", texture: "flat" } },
+    u3: { structure: { grid: "diagonal", alignment: "right", palette_temp: "cool", type_pairing: "mono-sans", motif_density: "dense", texture: "grain" } },
+  };
+  const { deps } = baseDeps({
+    searchImages: async () => ({ queries: ["q"], refs: ["u1", "u2", "u3"], errors: [] }),
+    describeReference: async (ref) => ({ ref, dna: {}, ...refs[ref] }),
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer", max_refs: 2 }, deps);
+  const studied = out.inspiration.studied.map((s) => s.ref);
+  assert.deepEqual(studied, ["u1", "u3"], "the near-duplicate must lose to the distant reference");
+  assert.equal(out.inspiration.dropped.length, 1);
+});
+
+test("runDesignAgent: when too few references are found the search is widened once", async () => {
+  let calls = 0;
+  const { deps } = baseDeps({
+    searchImages: async () => { calls++; return { queries: ["q"], refs: ["https://i.pinimg.com/736x/ref.jpg"], errors: [] }; },
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer", min_refs: 3 }, deps);
+  assert.equal(calls, 2, "the named hosts did not deliver, so the query is widened");
+  assert.ok(out.warnings.length >= 0);
+});
+
+test("runDesignAgent: the type layer is applied to the artwork when available", async () => {
+  let applied = 0;
+  const { deps } = baseDeps({
+    applyType: async (buffer, brief) => {
+      applied++;
+      return { applied: true, buffer: Buffer.from("typed-image") };
+    },
+    generate: async () => ({ image_b64: Buffer.from("artwork").toString("base64"), model: "test-image" }),
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer" }, deps);
+  assert.equal(applied, 1);
+  assert.equal(out.render.type_layer, true);
+  assert.equal(Buffer.from(out.render.image_b64, "base64").toString(), "typed-image");
+  assert.equal(out.render.image_url, null);
+});
+
+test("runDesignAgent: a type layer that fails never kills the render", async () => {
+  const { deps } = baseDeps({
+    applyType: async () => ({ applied: false, reason: "host cannot rasterise text" }),
+    generate: async () => ({ image_b64: Buffer.from("artwork").toString("base64"), model: "test-image" }),
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer" }, deps);
+  assert.equal(out.ok, true);
+  assert.ok(out.warnings.some((w) => /type layer skipped/.test(w)));
+});
+
+// ---------------------------------------------------------- who sets type ---
+
+test("briefToPrompt: with typesetByUs the copy is NOT quoted and the model is told to leave it blank", () => {
+  const b = normalizeBrief({ copy: { headline: "COLD BREW", cta: "Order now" } }, { headline: "COLD BREW", cta: "Order now" });
+  const p = briefToPrompt(b, { typesetByUs: true });
+  assert.ok(!p.includes('"COLD BREW"'), "the copy must not reach the renderer");
+  assert.ok(!p.includes('"Order now"'));
+  assert.ok(/ARTWORK ONLY/i.test(p), "the renderer is asked for a background plate");
+  assert.ok(/DO NOT RENDER/i.test(p), "the renderer must be told to leave the type area clean");
+  assert.ok(p.includes("TYPE PLAN"), "the type plan still drives the composition");
+});
+
+test("briefToPrompt: without typesetByUs the copy is quoted for the renderer", () => {
+  const b = normalizeBrief({}, { headline: "COLD BREW", cta: "Order now" });
+  const p = briefToPrompt(b, { typesetByUs: false });
+  assert.ok(p.includes('"COLD BREW"'));
+  assert.ok(p.includes('"Order now"'));
+  assert.ok(!/NO TEXT IN THE IMAGE/i.test(p));
+});
+
+test("runDesignAgent: a type specialist gets the quoted copy and NO type layer", async () => {
+  const { deps, prompts } = baseDeps({
+    typesetByUs: () => false,
+    applyType: async () => { throw new Error("must not typeset over a type specialist"); },
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer" }, deps);
+  assert.equal(out.ok, true);
+  assert.ok(prompts[0].includes('"COLD BREW"'), "the specialist must receive the copy");
+  assert.equal(out.render.type_layer, false);
+});
+
+test("runDesignAgent: a general model gets artwork only and the copy is typeset over it", async () => {
+  const { deps, prompts } = baseDeps({
+    typesetByUs: () => true,
+    applyType: async () => ({ applied: true, buffer: Buffer.from("typed") }),
+    generate: async (prompt) => {
+      prompts.push(prompt);
+      return { image_b64: Buffer.from("artwork").toString("base64"), model: "test-image" };
+    },
+  });
+  const out = await runDesignAgent({ goal: "coffee flyer" }, deps);
+  assert.ok(!prompts[0].includes('"COLD BREW"'), "the model must not draw the copy");
+  assert.ok(/ARTWORK ONLY/i.test(prompts[0]));
+  assert.ok(/DO NOT RENDER/i.test(prompts[0]));
+  assert.equal(out.render.type_layer, true);
 });

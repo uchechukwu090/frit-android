@@ -33,6 +33,18 @@ const LOOK_TAXONOMY = {
   composition: ["centered", "rule-of-thirds", "leading-lines", "frame-within-frame"],
 };
 
+const LOOK_FALLBACK = {
+  grade_temp: "neutral",
+  grade_contrast: "medium",
+  palette_temp: "neutral",
+  lighting: "mixed",
+  framing: "medium",
+  lens_character: "normal",
+  depth: "medium",
+  texture: "clean",
+  composition: "rule-of-thirds",
+};
+
 const MOVES = ["Static", "Pan Left", "Pan Right", "Tilt Up", "Tilt Down", "Dolly In", "Dolly Out", "Tracking", "Crane Up", "Crane Down", "Orbit", "Handheld", "Gimbal Walk", "Slow Push-In"];
 const ANGLES = ["Eye Level", "Low Angle", "High Angle", "Bird's Eye", "Worm's Eye", "Dutch Tilt", "Over Shoulder", "Close-Up", "Extreme Close-Up", "Wide Establishing", "Aerial"];
 const LENSES = ["Clean Sharp", "Anamorphic", "Vintage Soft", "Fisheye", "Macro", "Tilt-Shift", "Telephoto 200mm", "Wide 18mm", "50mm Prime", "35mm Prime", "85mm Portrait"];
@@ -76,21 +88,21 @@ export function normalizeLook(raw) {
   const out = {};
   for (const [key, allowed] of Object.entries(LOOK_TAXONOMY)) {
     const v = String(l?.[key] ?? "").trim().toLowerCase();
-    out[key] = allowed.includes(v) ? v : allowed[0];
+    out[key] = allowed.includes(v) ? v : (LOOK_FALLBACK[key] ?? allowed[0]);
   }
-  out.framing = String(l?.framing || "").toLowerCase().includes("close") ? "close" : out.framing;
+  if (String(l?.framing || "").toLowerCase().includes("close")) out.framing = "close";
   const split = splitDNA(r);
   return { look: out, palette: split.palette, mood: split.mood };
 }
 
 /** Read one look reference with the vision model. */
-export async function readLookReference(ref, goal, { chat, fetchImpl, proxyUrl = null } = {}) {
+export async function readLookReference(ref, goal, { chat, fetchImpl, loaded = null } = {}) {
   if (!chat) return null;
-  let image = null;
+  let image = loaded?.dataUri || loaded?.url || null;
   const v = String(ref || "");
-  if (v.startsWith("data:")) {
+  if (!image && v.startsWith("data:")) {
     image = v;
-  } else {
+  } else if (!image) {
     try {
       const res = await fetchImpl(v, { signal: AbortSignal.timeout(12_000) });
       if (res?.ok) {
@@ -99,7 +111,7 @@ export async function readLookReference(ref, goal, { chat, fetchImpl, proxyUrl =
       }
     } catch { /* fall through to the proxy / raw url */ }
   }
-  if (!image) image = proxyUrl || v;
+  if (!image) image = v;
   if (!image) return null;
 
   const prompt = [
@@ -309,6 +321,7 @@ export async function runDirectorAgent(input = {}, deps = {}, opts = {}) {
       const r = await withTimeout(deps.research(goal, { seed, maxRefs: 3 }), Math.min(25_000, left() * 0.1), "look research");
       refs = r?.refs || [];
     } catch (e) {
+      console.warn("[director-agent] look research failed:", e.message);
       warnings.push(`look research skipped: ${e.message}`);
     }
   }
@@ -318,6 +331,7 @@ export async function runDirectorAgent(input = {}, deps = {}, opts = {}) {
       try {
         return await withTimeout(deps.readLook(ref, goal), Math.min(25_000, left() * 0.1), "look read");
       } catch (e) {
+        console.warn("[director-agent] look unreadable:", e.message);
         warnings.push(`look unreadable (${str(ref, 60)}): ${e.message}`);
         return null;
       }
@@ -332,6 +346,7 @@ export async function runDirectorAgent(input = {}, deps = {}, opts = {}) {
     const raw = await withTimeout(plan(goal, numShots, looks), Math.min(45_000, left() * 0.15), "shot plan");
     shots = (raw || []).map((s, i) => normalizeShot(s, i));
   } catch (e) {
+    console.warn("[director-agent] shot plan failed:", e.message);
     warnings.push(`shot plan failed: ${e.message}`);
     shots = [];
   }
@@ -384,6 +399,7 @@ export async function runDirectorAgent(input = {}, deps = {}, opts = {}) {
           retry,
         };
       } catch (e) {
+        console.warn("[director-agent] shot", shot.index, "attempt", attempt, "failed:", e.message);
         warnings.push(`shot ${shot.index} attempt ${attempt} failed: ${e.message}`);
         return {
           item: { ...item, attempt, last: { ok: false, error: e.message } },

@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // TYPE LAYER — the brief rendered as REAL type, on top of the artwork
 // ----------------------------------------------------------------------------
 // Why: the #1 reason a piece "looks AI generated" is not the composition, it
@@ -121,10 +121,23 @@ export function applyCase(text, mode) {
   return t;
 }
 
-/** Rough advance width per character, in em. Bold display faces are wider. */
+/** Rough advance width per character, in em.
+ *
+ *  The estimate must err on the SAFE side: a headline that overflows the
+ *  margin is the single most common "AI poster" tell, and a clipped
+ *  headline is worse than a slightly small one. Uppercase is wider than
+ *  mixed case, and a bold display face is wider again. */
 export function estimateWidth(text, fontSizePx, weight = 400) {
-  const factor = Number(weight) >= 600 ? 0.585 : 0.525;
-  return String(text || "").length * fontSizePx * factor;
+  const s = String(text || "");
+  const bold = Number(weight) >= 600;
+  let factor = bold ? 0.66 : 0.55;
+  const letters = s.replace(/[^A-Za-z]/g, "");
+  if (letters.length > 1) {
+    const upper = (letters.match(/[A-Z]/g) || []).length / letters.length;
+    if (upper > 0.7) factor *= 1.1;      // all-caps runs wide
+    else if (upper > 0.2) factor *= 1.04;
+  }
+  return s.length * fontSizePx * factor;
 }
 
 /** Greedy wrap to a pixel width. */
@@ -147,6 +160,19 @@ export function wrapText(text, fontSizePx, maxWidthPx, weight = 400, maxLines = 
   return lines;
 }
 
+/** Shrink a type block until its widest line fits. A designer sets the type
+ *  to FIT the space; a naive renderer clips it. Returns the fitted size. */
+export function fitTypeSize(text, sizePx, maxWidthPx, weight = 400, tracking = 0, floor = 0.6) {
+  let s = sizePx;
+  const trackingPx = Math.abs(Number(tracking) || 0) * String(text || "").length;
+  for (let i = 0; i < 8; i++) {
+    const w = estimateWidth(text, s, weight) + trackingPx;
+    if (w <= maxWidthPx || s <= sizePx * floor) break;
+    s = Math.floor(s * 0.93);
+  }
+  return s;
+}
+
 // ---------------------------------------------------------------------------
 // LAYOUT PLAN — one plan, two renderers (SVG + Recraft)
 // ---------------------------------------------------------------------------
@@ -163,7 +189,8 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
   const alignment = String(b.layout?.alignment || "left").toLowerCase();
   const anchor = alignment === "center" ? "middle" : alignment === "right" ? "end" : "start";
   const x = alignment === "center" ? Math.round(width / 2) : alignment === "right" ? width - margin : margin;
-  const maxWidth = Math.round(width - margin * 2);
+  // 3% safety: the width estimate is an estimate.
+  const maxWidth = Math.round((width - margin * 2) * 0.97);
 
   const typo = b.typography || [];
   const roleFor = (role) => typo.find((t) => t.role === role) || {};
@@ -185,15 +212,26 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
   const push = (text, spec, size, { gap = 0, lines = 3, weight, tracking, cased } = {}) => {
     if (!text) return;
     const t = applyCase(text, cased ?? spec.case);
-    const wrapped = wrapText(t, size, maxWidth, weight ?? spec.weight, lines);
+    const w = weight ?? spec.weight ?? 400;
+    const tr = tracking ?? spec.tracking ?? 0;
+    // Fit the block to the column before it is set: a headline that overflows
+    // the margin is the single most common "AI poster" tell.
+    let fitted = size;
+    let wrapped = wrapText(t, fitted, maxWidth, w, lines);
+    for (let i = 0; i < 6; i++) {
+      const widest = wrapped.reduce((m, l) => Math.max(m, estimateWidth(l, fitted, w) + Math.abs(tr) * l.length), 0);
+      if (widest <= maxWidth || fitted <= size * 0.6) break;
+      fitted = Math.floor(fitted * 0.93);
+      wrapped = wrapText(t, fitted, maxWidth, w, lines);
+    }
     if (!wrapped.length) return;
     items.push({
       role: spec.role,
       text: t,
       lines: wrapped,
-      size,
-      weight: weight ?? spec.weight ?? 400,
-      tracking: tracking ?? spec.tracking ?? 0,
+      size: fitted,
+      weight: w,
+      tracking: tr,
       font: spec.font || "sans-serif",
       x,
       y,
@@ -201,7 +239,7 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
       align: alignment,
       width: maxWidth,
     });
-    y += wrapped.length * size * 1.06 + gap;
+    y += wrapped.length * fitted * 1.06 + gap;
   };
 
   push(copy.headline, { ...headline, role: "headline" }, headlineSize, { gap: Math.round(headlineSize * 0.18), lines: 3 });
@@ -212,19 +250,21 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
   let ctaItem = null;
   if (copy.cta) {
     const ctaText = applyCase(copy.cta, cta.case);
-    const w = Math.round(estimateWidth(ctaText, ctaSize, cta.weight) + ctaSize * 1.6);
-    const h = Math.round(ctaSize * 2);
+    const ctaFitted = fitTypeSize(ctaText, ctaSize, maxWidth, cta.weight || 700, cta.tracking || 0);
+    const w = Math.round(estimateWidth(ctaText, ctaFitted, cta.weight || 700) + Math.abs(cta.tracking || 0) * ctaText.length + ctaFitted * 1.6);
+    const h = Math.round(ctaFitted * 2);
     const cx = alignment === "center" ? Math.round(width / 2 - w / 2) : alignment === "right" ? width - margin - w : margin;
     const cy = Math.max(0, height - margin - h);
     ctaItem = {
       role: "cta",
       text: ctaText,
-      size: ctaSize,
+      lines: [ctaText],
+      size: ctaFitted,
       weight: cta.weight || 700,
       tracking: cta.tracking || 0,
       font: cta.font || "sans-serif",
       x: cx + w / 2,
-      y: cy + h * 0.5 + ctaSize * 0.34,
+      y: cy + h * 0.5 + ctaFitted * 0.34,
       anchor: "middle",
       box: { x: cx, y: cy, w, h, r: Math.round(h / 2) },
     };
@@ -244,6 +284,12 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
   };
 }
 
+/** The colour of the type ON the accent badge. It must be judged against the
+ *  BADGE, not against white — a dark accent with dark text is invisible. */
+export function onAccentColor(accentHex) {
+  return pickTypeColor([{ hex: accentHex }], accentHex);
+}
+
 /** Recraft's native `texts` payload — real fonts, real positions (percent). */
 export function briefToTextSpecs(brief, { size } = {}) {
   const width = size?.width || 1024;
@@ -258,7 +304,7 @@ export function briefToTextSpecs(brief, { size } = {}) {
       font_family: mapFontFamily(item.font),
       font_size: Math.max(8, Math.round(item.size)),
       font_weight: String(item.weight || 400),
-      text_color: item.role === "cta" ? pickTypeColor([{ hex: plan.colors.accent }], "#FFFFFF") : plan.colors.type,
+      text_color: item.role === "cta" ? onAccentColor(plan.colors.accent) : plan.colors.type,
       text_align: item.anchor === "middle" ? "center" : item.align === "right" ? "right" : "left",
       x: Math.round((item.x / width) * 100),
       y: Math.round((item.y / height) * 100),
@@ -295,7 +341,7 @@ function svgForPlan(plan) {
   parts.push(`<svg width="${plan.width}" height="${plan.height}" xmlns="http://www.w3.org/2000/svg">`);
   for (const item of plan.items) {
     const family = escapeXml(fontStack(item.font));
-    const fill = item.role === "cta" ? pickTypeColor([{ hex: plan.colors.accent }], "#FFFFFF") : plan.colors.type;
+    const fill = item.role === "cta" ? onAccentColor(plan.colors.accent) : plan.colors.type;
     if (item.box) {
       parts.push(`<rect x="${item.box.x}" y="${item.box.y}" width="${item.box.w}" height="${item.box.h}" rx="${item.box.r}" fill="${plan.colors.accent}"/>`);
     }

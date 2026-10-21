@@ -42,6 +42,12 @@ test("styleTokenFor / artDirectionFor: seed-derived and always from the roster",
   assert.ok(typeof artDirectionFor(5) === "string" && artDirectionFor(5).length > 10);
 });
 
+test("artDirectionFor: two seeds rarely land on the same visual route", () => {
+  const dirs = new Set([1, 2, 3, 4, 5, 6, 7, 8].map((s) => artDirectionFor(s)));
+  assert.ok(dirs.size >= 6, `expected variety, got ${dirs.size} distinct directions`);
+  assert.ok(artDirectionFor(7).includes("Finish:"), "the direction carries a finish too");
+});
+
 // ------------------------------------------------------------------- dna ---
 
 const V2_DNA = {

@@ -46,11 +46,14 @@ const DEFAULT_PALETTE = [
   { hex: "#D4A574", role: "accent", share_pct: 10 },
 ];
 const TYPE_ROLES = ["headline", "subhead", "body", "cta"];
+// Poster sizes, not document sizes. The old body floor (12px) produced copy
+// that was literally unreadable on a 1080 canvas — the reviewer called the
+// body "missing" because 16px type is invisible on a poster.
 const TYPE_SIZE = {
   headline: [48, 160],
-  subhead: [22, 56],
-  body: [12, 28],
-  cta: [14, 42],
+  subhead: [24, 64],
+  body: [20, 40],
+  cta: [16, 48],
 };
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, Number(n) || 0));
@@ -152,7 +155,11 @@ export function rankInspirationUrls(urls, { max = 3, seed = 0 } = {}) {
     let score = 0;
     for (const [re, bonus] of HOST_BONUS) if (re.test(url)) score += bonus;
     if (IMAGE_EXT.test(url)) score += 1;
-    score += (hashSeed(url, seed) % 100) / 100;
+    // Seed jitter. It must be able to REORDER results inside a host tier
+    // (otherwise the same request browses the same three images forever)
+    // but never let a random blog image outrank an inspiration host:
+    // max random = 1 + 2.5 = 3.5 < min inspiration host = 3 + 1 = 4.
+    score += (hashSeed(url, seed) % 250) / 100;
     scored.push({ url, score });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -283,9 +290,12 @@ export function normalizeBrief(raw, input = {}) {
   };
 
   // Palette: 3–5 entries, valid hexes, shares normalised toward 60-30-10 only
-  // when the model gave nothing usable.
+  // when the model gave nothing usable. `colors` is accepted as an alias.
   const palette = [];
-  for (const p of Array.isArray(r.palette) ? r.palette.slice(0, 5) : []) {
+  const rawPalette = Array.isArray(r.palette) ? r.palette
+    : (Array.isArray(r.colors) ? r.colors
+      : (Array.isArray(r.palette?.colors) ? r.palette.colors : null));
+  for (const p of (rawPalette || []).slice(0, 5)) {
     const hex = normalizeHex(p?.hex || p, "");
     if (!hex || palette.some((c) => c.hex === hex)) continue;
     palette.push({ hex, role: s(p?.role, 24) || (palette.length ? "secondary" : "dominant"), share_pct: clamp(num(p?.share_pct, 0), 0, 100) });
@@ -353,6 +363,45 @@ export function normalizeBrief(raw, input = {}) {
   return out;
 }
 
+/**
+ * A brief built WITHOUT the model, straight from the reference DNA.
+ *
+ * This is the fallback when the brief writer times out. Falling back to the
+ * DEFAULT brief would throw away everything the agent learned from the
+ * references; this keeps the references' grammar (grid, alignment, palette,
+ * whitespace) and only loses the model's judgement.
+ */
+export function briefFromReferences(goal, input = {}, references = []) {
+  const base = defaultBrief(input);
+  const out = JSON.parse(JSON.stringify(base));
+  const ref = references[0] || {};
+  const st = ref.structure || {};
+  if (st.grid) out.layout.grid = st.grid;
+  if (st.alignment) out.layout.alignment = st.alignment;
+  if (st.focal) out.layout.focal = st.focal;
+  if (Number.isFinite(Number(st.whitespace_pct))) {
+    out.layout.margins_pct = clamp(Math.round(Number(st.whitespace_pct) / 2.5), 4, 18);
+  }
+  const pal = (ref.palette || []).filter((p) => p && p.hex);
+  if (pal.length >= 2) {
+    const total = pal.reduce((n, c) => n + (Number(c.share_pct) || 0), 0);
+    out.palette = total > 0
+      ? pal.map((c, i) => ({ hex: normalizeHex(c.hex), role: c.role || (i ? "secondary" : "dominant"), share_pct: Math.round(((Number(c.share_pct) || 0) / total) * 100) }))
+      : pal.map((c, i) => ({ hex: normalizeHex(c.hex), role: c.role || (i ? "secondary" : "dominant"), share_pct: [60, 30, 10, 5, 5][i] ?? 5 }));
+  }
+  if (ref.typography?.display) {
+    const font = String(ref.typography.display).trim();
+    // Guard against the vision model answering "N/A" / "unknown".
+    if (font && !/^(n\/?a|unknown|none|null)$/i.test(font)) {
+      out.typography = out.typography.map((t) => (t.role === "headline" ? { ...t, font } : t));
+    }
+  }
+  if (ref.mood) out.mood = ref.mood;
+  out.generation_prompt = "";
+  out.negative_prompt = "gibberish text, watermark, lorem ipsum, cluttered collage, blurry type, extra fingers, low contrast";
+  return out;
+}
+
 /** The deterministic prompt sent to the image model. This is the artifact the
  *  user asked for in step 2: arrangement, alignment, colours, fonts, sizes,
  *  icons/images, background and the exact copy — every field spelled out.
@@ -361,22 +410,41 @@ export function normalizeBrief(raw, input = {}) {
  *  are near-deterministic for an identical prompt, so the SAME request must
  *  never produce the SAME prompt — that is what makes repeat runs feel
  *  creative instead of canned. */
-export function briefToPrompt(brief, { artDirection = null } = {}) {
+export function briefToPrompt(brief, { artDirection = null, typesetByUs = false } = {}) {
   const b = brief || defaultBrief();
   const c = b.copy || {};
   const L = [];
+  const pal = (b.palette || []).map((p) => `${p.hex} (${p.role || "color"}, ${p.share_pct}%)`).join(", ");
+  const typo = (b.typography || []).map((t) => `${t.role}: ${t.font}, ${t.size_px}px, weight ${t.weight}, tracking ${t.tracking}, ${t.case}`).join("; ");
+  const els = (b.elements || []).map((e) => `${e.type} — ${e.description} (${e.placement}, ~${e.size_pct}% of the canvas)`).join("; ");
+
+  if (typesetByUs) {
+    // THE TYPE IS SET BY US, AFTER the render. The model is asked for a
+    // BACKGROUND PLATE, not a poster: a poster request makes it write its
+    // own (mangled) lettering, and then the copy appears twice.
+    L.push(`ARTWORK ONLY — the background plate for a poster. The typography is added afterwards, so this image must contain NO text at all.`);
+    L.push(`Graphic design — ${b.canvas?.usage || "social graphic"}, ${b.canvas?.aspect_ratio || DEFAULT_ASPECT} aspect ratio.`);
+    L.push(`COMPOSITION: ${b.layout?.grid} grid, ${b.layout?.margins_pct}% safe margins, ${b.layout?.alignment} alignment, focal point ${b.layout?.focal}. Reserve a calm, EMPTY area for the headline — ${b.layout?.alignment}-aligned, across the upper third. One focal idea only, generous breathing room.`);
+    L.push(`COLORS (60-30-10 balance, exact hexes, no drifting hues): ${pal}. Background: ${b.background?.description || "flat brand color"} ${b.background?.color_hex || ""}.`);
+    if (els) L.push(`ARTWORK: ${els}.`);
+    if (b.imagery?.description) L.push(`IMAGERY: ${b.imagery.description} — ${b.imagery.treatment}, ${b.imagery.placement}.`);
+    L.push(`TYPE PLAN (set later, do NOT draw it): ${typo}.`);
+    L.push(`MOOD: ${b.mood}.`);
+    if (artDirection) L.push(`ART DIRECTION: ${artDirection}.`);
+    L.push("DO NOT RENDER: any letters, words, numbers, logos, slogans, captions, signage, watermarks, badges with wording or gibberish text. The only typography in this poster is added afterwards.");
+    if (b.negative_prompt) L.push(`AVOID: ${b.negative_prompt}, any text, any letters, any numbers, any typography, any caption, any watermark.`);
+    return L.join(" ");
+  }
+
   L.push(`Graphic design — ${b.canvas?.usage || "social graphic"}, ${b.canvas?.aspect_ratio || DEFAULT_ASPECT} aspect ratio.`);
   L.push(`LAYOUT: ${b.layout?.grid} grid, ${b.layout?.margins_pct}% safe margins, ${b.layout?.alignment} alignment, focal point ${b.layout?.focal}; reading order ${b.layout?.reading_order}. Keep generous breathing room, one focal idea only.`);
-  const pal = (b.palette || []).map((p) => `${p.hex} (${p.role || "color"}, ${p.share_pct}%)`).join(", ");
   L.push(`COLORS (60-30-10 balance, exact hexes, no drifting hues): ${pal}. Background: ${b.background?.description || "flat brand color"} ${b.background?.color_hex || ""}.`);
-  const typo = (b.typography || []).map((t) => `${t.role}: ${t.font}, ${t.size_px}px, weight ${t.weight}, tracking ${t.tracking}, ${t.case}`).join("; ");
   L.push(`TYPOGRAPHY: ${typo}. Hierarchy must be obvious at thumbnail size; text left-aligned to the grid unless stated.`);
   if (c.headline) L.push(`Headline (render EXACTLY as quoted, dominant type): "${c.headline}".`);
   if (c.subhead) L.push(`Subhead (render exactly): "${c.subhead}".`);
   if (c.body) L.push(`Body copy (render exactly, smaller than the headline): "${c.body}".`);
   if (c.cta) L.push(`CTA as a distinct button or badge (render exactly): "${c.cta}".`);
-  const els = (b.elements || []).map((e) => `${e.type} — ${e.description} (${e.placement}, ~${e.size_pct}% of the canvas)`).join("; ");
-  L.push(`ELEMENTS: ${els}.`);
+  if (els) L.push(`ELEMENTS: ${els}.`);
   if (b.imagery?.description) L.push(`IMAGERY: ${b.imagery.description} — ${b.imagery.treatment}, ${b.imagery.placement}.`);
   L.push(`MOOD: ${b.mood}.`);
   if (artDirection) L.push(`ART DIRECTION: ${artDirection}.`);
@@ -428,7 +496,7 @@ async function shrinkForVision(buf) {
 
 /** Fetch remote image bytes once, with the hotlink-friendly UA the CDNs want.
  *  Returns null when the host refuses us — which is exactly the case the
- *  reference proxy exists to solve. */
+ *  reference transport (creative/refs.js) exists to solve. */
 async function fetchImageBytes(src, fetchImpl, maxBytes = 8 * 1024 * 1024) {
   if (!fetchImpl || !/^https?:\/\//i.test(String(src || ""))) return null;
   try {
@@ -444,22 +512,6 @@ async function fetchImageBytes(src, fetchImpl, maxBytes = 8 * 1024 * 1024) {
   } catch {
     return null;
   }
-}
-
-/** The image the vision model actually sees.
- *  1. remote bytes fetched BY US (no hotlink trouble, no provider egress),
- *  2. our own reference proxy when the CDN refused us,
- *  3. the raw URL as a last resort. */
-async function resolveVisionImage(src, { fetchImpl, proxyUrl = null } = {}) {
-  const v = asImageUrl(src);
-  if (!v) return null;
-  if (v.startsWith("data:")) return await imageForVision(v, fetchImpl);
-  const bytes = await fetchImageBytes(v, fetchImpl);
-  if (bytes) {
-    const small = await shrinkForVision(bytes.buf);
-    return `data:${small.mime || bytes.mime || "image/jpeg"};base64,${small.buf.toString("base64")}`;
-  }
-  return proxyUrl || v;
 }
 
 async function imageForVision(src, fetchImpl, maxBytes = 6 * 1024 * 1024) {
@@ -494,8 +546,20 @@ function parseJsonLoose(text) {
   const t = String(text || "");
   const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = fenced ? fenced[1] : t;
-  try { return JSON.parse(candidate); } catch { /* fall through */ }
-  try { return JSON.parse(candidate.match(/\{[\s\S]*\}/)?.[0] || "{}"); } catch { return {}; }
+  let parsed = null;
+  try { parsed = JSON.parse(candidate); } catch { /* fall through */ }
+  if (parsed == null) {
+    try { parsed = JSON.parse(candidate.match(/\{[\s\S]*\}/)?.[0] || "{}"); } catch { parsed = null; }
+  }
+  if (!parsed || typeof parsed !== "object") return parsed || {};
+  // Some models wrap the answer: {"brief": {...}} or {"output": {...}}.
+  // Unwrap a single wrapper key so the brief is still found.
+  const keys = Object.keys(parsed);
+  if (keys.length === 1 && parsed[keys[0]] && typeof parsed[keys[0]] === "object" && !Array.isArray(parsed[keys[0]])) {
+    const inner = parsed[keys[0]];
+    if (inner.palette || inner.layout || inner.copy || inner.typography) return inner;
+  }
+  return parsed;
 }
 
 /**
@@ -506,9 +570,12 @@ function parseJsonLoose(text) {
  * allowed downstream — that is the mechanical guarantee that the agent
  * studies the reference instead of copying it.
  */
-export async function describeReference(ref, goal, { chat, fetchImpl, proxyUrl = null } = {}) {
+export async function describeReference(ref, goal, { chat, fetchImpl, loaded = null } = {}) {
   if (!chat) return null;
-  const image = await resolveVisionImage(ref, { fetchImpl, proxyUrl });
+  // `loaded` comes from creative/refs.js: browser-like fetch, public-proxy
+  // fallback, <=1024px downscale and a content-addressed cache id. The
+  // inline data URI is preferred so the provider never has to fetch anything.
+  const image = loaded?.dataUri || loaded?.url || (await imageForVision(ref, fetchImpl));
   if (!image) return null;
   const prompt = [
     "You are a senior graphic designer reading a visual reference for a new piece.",
@@ -538,6 +605,21 @@ export async function describeReference(ref, goal, { chat, fetchImpl, proxyUrl =
   return { ref, dna: raw, structure: split.structure, content: split.content, palette: split.palette, typography: split.typography, mood: split.mood };
 }
 
+/** The decisive structural axes of a reference, as one compact line. The
+ *  brief writer needs the GRAMMAR of the reference, not its whole DNA — a
+ *  compact block keeps the synthesis call inside its time budget. */
+export function referenceDNAline(ref, index) {
+  // Accepts either a reference object ({ref, dna}) or a bare DNA blob.
+  const dna = ref?.structure
+    ? { structure: ref.structure, palette: ref.palette, typography: ref.typography, mood: ref.mood }
+    : (ref?.dna || ref);
+  const so = structuralOnly(dna);
+  const s = so.structure || {};
+  const p = (so.palette || []).slice(0, 3).map((c) => c.hex).join("/");
+  const t = so.typography || {};
+  return `REF${index + 1} grid=${s.grid} align=${s.alignment} temp=${s.palette_temp} mood=${s.palette_mood || "?"} contrast=${s.type_contrast} pairing=${s.type_pairing} density=${s.motif_density} texture=${s.texture} whitespace=${s.whitespace_pct}% palette=${p || "?"} type=${t.display || "?"}/${t.body || "?"}`;
+}
+
 /** Ask the fast model for a structured brief, briefed by the reference DNA. */
 export async function synthesizeBrief(goal, input = {}, references = [], { chat } = {}) {
   if (!chat) return {};
@@ -545,18 +627,15 @@ export async function synthesizeBrief(goal, input = {}, references = [], { chat 
   // writer, so the result cannot be a re-skin of the reference.
   const refBlock = references
     .filter((r) => r?.dna || r?.structure)
-    .slice(0, 4)
-    .map((r, i) => {
-      const so = structuralOnly(r?.structure ? { structure: r.structure, palette: r.palette, typography: r.typography, mood: r.mood } : r.dna);
-      return `REFERENCE ${i + 1} — STRUCTURE ONLY (never reuse its subject, motifs or imagery): ${JSON.stringify(so).slice(0, 900)}`;
-    })
+    .slice(0, 3)
+    .map((r, i) => referenceDNAline(r, i))
     .join("\n");
   const system = [
-    "You are a graphic-design art director writing ONE production brief.",
-    "Be concrete and measurable. Never invent brand assets. Keep the user's exact copy.",
-    "You may borrow the REFERENCES' structural principles (grid discipline, whitespace ratio, type contrast, palette temperature).",
+    "You are a graphic-design art director writing ONE production brief. Be concrete and measurable.",
+    "You may borrow the references' STRUCTURE (grid, whitespace, type contrast, palette temperature).",
     "You must NOT reproduce a reference's subject, motifs, colours or imagery — the content comes from the user only.",
-    "Return ONLY JSON with this shape:",
+    "Never invent brand assets. Keep the user's exact copy.",
+    "Return ONLY JSON:",
     '{"canvas":{"aspect_ratio":"1:1","usage":"instagram post"},',
     '"layout":{"grid":"rule-of-thirds","margins_pct":8,"alignment":"left","focal":"...","reading_order":"..."},',
     '"palette":[{"hex":"#RRGGBB","role":"dominant","share_pct":60}],',
@@ -587,12 +666,29 @@ export async function synthesizeBrief(goal, input = {}, references = [], { chat 
   if (first && (first.palette || first.layout || first.copy || first.typography)) return first;
   // Some models answer with prose instead of JSON. One corrective retry is much
   // cheaper than silently shipping the default brief (Week 6: that happened).
-  const retry = await chat([
+  let retryText = "";
+  const retry = parseJsonLoose(retryText = await chat([
     ...messages,
     { role: "assistant", content: "(reply was not JSON)" },
     { role: "user", content: "Return ONLY the JSON object described above — no prose, no markdown, no explanation." },
-  ], { max_tokens: 1400, temperature: 0 });
-  return parseJsonLoose(retry);
+  ], { max_tokens: 1400, temperature: 0 }));
+  if (retry && (retry.palette || retry.layout || retry.copy || retry.typography)) return retry;
+  // Neither reply was usable. THROW, so the caller falls back to the reference
+  // DNA and says so. Returning {} here silently shipped a default brief that
+  // ignored everything the agent learned from the references.
+  throw new Error(`the brief writer did not return usable JSON (reply started: ${String(retryText).replace(/\s+/g, " ").slice(0, 160) || "empty"})`);
+}
+
+/** The copy string for a role AS TYPESET (the brief's case rule applied). */
+export function typesetString(brief, role) {
+  const text = brief?.copy?.[role];
+  if (!text) return "";
+  const spec = (brief?.typography || []).find((t) => t.role === role);
+  const mode = String(spec?.case || "SENTENCE").toUpperCase();
+  if (mode === "UPPER") return String(text).toUpperCase();
+  if (mode === "LOWER") return String(text).toLowerCase();
+  if (mode === "TITLE") return String(text).replace(/\w\S*/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase());
+  return String(text);
 }
 
 /** Does the render match the brief? Vision model, structured answer. */
@@ -602,10 +698,19 @@ export async function verifyRender(render, brief, { chat, fetchImpl, threshold =
   if (!image) return { score: 0, pass: false, issues: ["no render to verify"], threshold, checked: false };
   const facts = {
     palette: (brief?.palette || []).map((p) => p.hex),
-    headline: brief?.copy?.headline || "",
-    body: brief?.copy?.body || "",
-    cta: brief?.copy?.cta || "",
+    // The strings AS TYPESET (the brief's case rule applied). The reviewer
+    // must judge what was actually set, not the raw copy, or it flags an
+    // intentional all-caps CTA as a spelling error.
+    copy_rule: "the copy below is the brief's exact copy with the case rule applied",
+    headline: typesetString(brief, "headline"),
+    subhead: typesetString(brief, "subhead"),
+    body: typesetString(brief, "body"),
+    cta: typesetString(brief, "cta"),
     alignment: brief?.layout?.alignment,
+    // The brief's px are relative to a 1080-wide canvas; the render may be a
+    // different size. Without this the reviewer calls a correctly scaled
+    // headline "too small".
+    type_base_canvas_px: 1080,
     typography: (brief?.typography || []).map((t) => `${t.role}:${t.font} ${t.size_px}px`),
     checks: brief?.checks || [],
   };
@@ -676,7 +781,7 @@ async function withTimeout(promise, ms, label) {
 export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   const now = deps.now || (() => Date.now());
   const t0 = now();
-  const totalMs = opts.totalMs ?? 110_000;
+  const totalMs = opts.totalMs ?? 150_000;
   const maxAttempts = input.verify === false ? 1 : Math.min(3, Math.max(1, Number(input.maxAttempts) || 2));
   const maxRefs = Math.min(4, Math.max(0, Number(input.max_refs ?? 3)));
   const minRefs = Math.min(maxRefs, Math.max(0, Number(input.min_refs ?? 3)));
@@ -706,7 +811,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       const searchFn = deps.searchImages || ((g, o) => searchInspiration(g, { ...o, fetchImpl: deps.fetchImpl }));
       const first = await withTimeout(
         searchFn(goal, { maxRefs: candidateCount, sources: input.sources, seed, fetchImpl: deps.fetchImpl }),
-        Math.min(20_000, left() * 0.25), "inspiration search"
+        Math.min(20_000, left() * 0.2), "inspiration search"
       );
       inspiration = first || inspiration;
       // The user asked for AT LEAST three references studied. If the named
@@ -714,7 +819,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       if ((inspiration.refs || []).length < minRefs && left() > 12_000) {
         const wide = await withTimeout(
           searchFn(goal, { maxRefs: candidateCount, sources: [], seed: seed + 7919, fetchImpl: deps.fetchImpl }),
-          Math.min(20_000, left() * 0.25), "widened inspiration search"
+          Math.min(20_000, left() * 0.2), "widened inspiration search"
         );
         inspiration = mergeInspiration(inspiration, wide, { maxRefs: candidateCount, seed });
       }
@@ -727,11 +832,14 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   // ---- stage 2: read references, then write the brief -------------------
   let references = [];
   if (inspiration.refs?.length && (deps.chat || deps.describeReference)) {
-    const describe = deps.describeReference || ((ref, g, extra) => describeReference(ref, g, { chat: deps.chat, fetchImpl: deps.fetchImpl, proxyUrl: extra?.proxyUrl || null }));
+    const describe = deps.describeReference || ((ref, g, extra) => describeReference(ref, g, { chat: deps.chat, fetchImpl: deps.fetchImpl, loaded: extra?.loaded || null }));
     references = (await Promise.all(inspiration.refs.slice(0, candidateCount).map(async (ref) => {
       try {
-        const proxyUrl = deps.proxyReference ? await deps.proxyReference(ref) : null;
-        return await withTimeout(describe(ref, goal, { proxyUrl }), Math.min(25_000, left() * 0.35), "reference read");
+        // The reference transport fetches the bytes ONCE, browser-like, and
+        // falls back to a public origin-side proxy when the CDN refuses us.
+        const loaded = deps.loadReference ? await deps.loadReference(ref) : null;
+        const out = await withTimeout(describe(ref, goal, { loaded }), Math.min(25_000, left() * 0.3), "reference read");
+        return out ? { ...out, ref_image: loaded?.url || null, ref_id: loaded?.id || null } : null;
       } catch (e) {
         warnings.push(`reference unreadable (${s(ref, 80)}): ${e.message}`);
         return null;
@@ -754,29 +862,52 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   const dropped = allCandidates.filter((r) => !diverse.includes(r));
 
   let brief;
+  let raw = null;
+  let briefFromFallback = false;
   try {
-    const synth = deps.synthesizeBrief || ((g, i, r) => synthesizeBrief(g, i, r, { chat: deps.chat }));
-    const raw = await withTimeout(synth(goal, input, diverse), Math.min(35_000, Math.max(8_000, left() * 0.4)), "brief synthesis");
+    // The brief writer only needs TEXT (the reference DNA is already
+    // extracted), so it runs on the fast model. The vision model is reserved
+    // for reading references and reviewing the render.
+    const synth = deps.synthesizeBrief || ((g, i, r) => synthesizeBrief(g, i, r, { chat: deps.chatText || deps.chat }));
+    raw = await withTimeout(synth(goal, input, diverse), Math.min(60_000, Math.max(20_000, left() * 0.6)), "brief synthesis");
     brief = normalizeBrief(raw, input);
   } catch (e) {
-    warnings.push(`brief synthesis fell back to defaults: ${e.message}`);
-    brief = normalizeBrief({}, input);
+    // The model timed out or failed. Do NOT throw the references away: build
+    // the brief straight from their DNA instead of falling back to a default
+    // that ignores everything the agent learned.
+    warnings.push(`brief synthesis fell back to the reference DNA: ${e.message}`);
+    briefFromFallback = true;
+    try {
+      brief = normalizeBrief(briefFromReferences(goal, input, diverse), input);
+    } catch {
+      brief = normalizeBrief({}, input);
+    }
+  }
+  // A palette the model never produced is a silent downgrade — say so.
+  if (!Array.isArray(raw?.palette) && !Array.isArray(raw?.colors) && raw) {
+    warnings.push("the brief writer returned no palette — the default colour system was used");
   }
 
   // Push the brief AWAY from the references: if it mirrors one too closely it
   // is a re-skin, not a design. Brand/user-pinned colours are never touched.
+  // (A brief that already came FROM the reference DNA is already a synthesis —
+  // pushing it away again would leave a generic default, so it is exempt.)
   const refStructures = diverse.map((r) => r.structure).filter(Boolean);
   const userPinned = !!(input.palette || input.brand?.colors?.length);
   let divergence = { changed: [] };
-  try {
-    divergence = enforceDivergence(brief, refStructures, {
-      seed,
-      maxShared: 3,
-      allowPaletteShift: !userPinned,
-    });
-    brief = divergence.brief;
-  } catch (e) {
-    warnings.push(`divergence check failed: ${e.message}`);
+  if (briefFromFallback) {
+    divergence = { changed: ["brief built from the reference DNA (divergence guard skipped)"] };
+  } else {
+    try {
+      divergence = enforceDivergence(brief, refStructures, {
+        seed,
+        maxShared: 3,
+        allowPaletteShift: !userPinned,
+      });
+      brief = divergence.brief;
+    } catch (e) {
+      warnings.push(`divergence check failed: ${e.message}`);
+    }
   }
   mark("brief");
 
@@ -786,7 +917,16 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   let render = null;
   let attempt = 0;
   let correction = "";
-  const promptBase = briefToPrompt(brief, { artDirection });
+  // Who sets the type?
+  //   typesetByUs  — a general image model draws the ARTWORK only and we
+  //                  typeset the real copy on top. This is the path that
+  //                  kills the "AI poster" look: real glyphs, real
+  //                  hierarchy, no mangled lettering, no duplicated copy.
+  //   otherwise    — a typography specialist (Ideogram/Recraft) sets the
+  //                  type itself with real fonts, so we must not draw it
+  //                  again on top.
+  const typesetByUs = deps.typesetByUs ? !!deps.typesetByUs(input.model) : true;
+  const promptBase = briefToPrompt(brief, { artDirection, typesetByUs });
   while (attempt < maxAttempts && left() > 5_000) {
     attempt++;
     const prompt = promptBase + (correction ? ` CORRECTIONS FROM REVIEW: ${correction}.` : "");
@@ -809,8 +949,9 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       break;
     }
     // The TYPE LAYER: real glyphs set from the brief on top of the artwork.
-    // Optional — the artwork alone is still a valid deliverable.
-    if (deps.applyType && render && input.type_layer !== false) {
+    // Only when we are the ones setting the type — a typography specialist
+    // has already rendered it and drawing it again would double the copy.
+    if (deps.applyType && render && input.type_layer !== false && typesetByUs) {
       try {
         const source = render.image_url
           ? await fetchToBuffer(render.image_url, deps.fetchImpl)
@@ -818,10 +959,12 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
         if (source) {
           const layered = await deps.applyType(source, brief, { model: render.model });
           if (layered?.applied && layered.buffer) {
-            render = { ...render, image_b64: layered.buffer.toString("base64"), image_url: null, type_layer: true };
+            render = { ...render, image_b64: layered.buffer.toString("base64"), image_url: null, media_type: "image/png", type_layer: true };
           } else if (layered?.reason) {
             warnings.push(`type layer skipped: ${layered.reason}`);
           }
+        } else {
+          warnings.push("type layer skipped: the render bytes could not be fetched");
         }
       } catch (e) {
         warnings.push(`type layer failed: ${e.message}`);
@@ -835,7 +978,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
     }
     try {
       const verify = deps.verifyRender || ((r, b) => verifyRender(r, b, { chat: deps.chat, fetchImpl: deps.fetchImpl, threshold }));
-      verification = await withTimeout(verify(render.image_url || render.image_b64, brief), Math.min(30_000, left() - 1_000), "verification");
+      verification = await withTimeout(verify(render.image_url || render.image_b64, brief), Math.min(45_000, Math.max(10_000, left() - 1_000)), "verification");
     } catch (e) {
       warnings.push(`verification failed: ${e.message}`);
       verification = { score: 0, pass: false, issues: [], threshold, checked: false };
@@ -859,12 +1002,21 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       queries: inspiration.queries || [],
       refs: inspiration.refs || [],
       read: diverse.length,
-      studied: diverse.map((r) => ({ ref: r.ref, structure: r.structure })),
-      dropped: dropped.map((r) => ({ ref: r.ref, structure: r.structure })),
+      studied: diverse.map((r) => ({ ref: r.ref, image_url: r.ref_image || null, structure: r.structure })),
+      dropped: dropped.map((r) => ({ ref: r.ref, image_url: r.ref_image || null, structure: r.structure })),
       errors: inspiration.errors || [],
     },
     divergence: { changed: divergence.changed || [], shared_axes: refStructures.map((s) => sharedAxes(briefAxes(brief), s)) },
-    render: render ? { image_url: render.image_url || null, image_b64: render.image_b64 || null, model_used: render.model || null, type_layer: !!render.type_layer } : null,
+    render: render ? {
+      image_url: render.image_url || null,
+      image_b64: render.image_b64 || null,
+      model_used: render.model || null,
+      // OpenRouter returns whatever the model produced (Recraft hands back
+      // webp, Seedream png). The client MUST use this or it will wrap a
+      // webp payload in a data:image/png URI and show nothing.
+      media_type: render.media_type || (render.type_layer ? "image/png" : "image/png"),
+      type_layer: !!render.type_layer,
+    } : null,
     verification: verification || null,
     attempts: attempt,
     stages,

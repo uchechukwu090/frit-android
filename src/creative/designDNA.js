@@ -88,10 +88,25 @@ export function styleTokenFor(seed, tokens = STYLE_TOKENS) {
   return seededPick(tokens, seed) || tokens[0];
 }
 
-/** The art direction line appended to the render prompt — also seed-derived,
+// The FINISH is drawn from a different pool than the composition, with a
+// different hash, so two runs rarely land on the same visual route.
+export const FINISH_TREATMENTS = [
+  "flat vector finish, no gradients, no drop shadows",
+  "risograph two-colour overprint with visible grain",
+  "soft studio light, gentle vignette, generous negative space",
+  "hard daylight, crisp shadows, saturated colour blocking",
+  "paper collage, torn deckled edges, printed texture",
+  "neon night light, wet reflective surfaces",
+  "clean print-ready poster, flat CMYK-safe colour",
+  "cinematic grade, cool shadows, warm highlights",
+];
+
+/** The art direction line appended to the render prompt — seed-derived,
  *  because the image model is near-deterministic for an identical prompt. */
-export function artDirectionFor(seed, directions = ART_DIRECTIONS) {
-  return seededPick(directions, seed) || directions[0];
+export function artDirectionFor(seed, directions = ART_DIRECTIONS, finishes = FINISH_TREATMENTS) {
+  const a = seededPick(directions, seed) || directions[0];
+  const f = seededPick(finishes, hashSeed(seed, "finish")) || finishes[0];
+  return `${a}. Finish: ${f}`;
 }
 
 // ---------------------------------------------------------------------------

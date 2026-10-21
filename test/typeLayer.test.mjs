@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
   planTypeLayout, briefToTextSpecs, applyTypeLayer, pickTypeColor,
   contrastRatio, luminance, applyCase, wrapText, fontStack, escapeXml,
+  estimateWidth, fitTypeSize, onAccentColor,
 } from "../src/creative/typeLayer.js";
 
 const brief = {
@@ -41,6 +42,12 @@ test("pickTypeColor: picks the palette colour with the best contrast on the back
 test("pickTypeColor: falls back to black/white when nothing in the palette is readable", () => {
   assert.equal(pickTypeColor([{ hex: "#EEEEEE" }], "#F0F0F0"), "#111111");
   assert.equal(pickTypeColor([{ hex: "#222222" }], "#111111"), "#FFFFFF");
+});
+
+test("onAccentColor: the type on the badge is judged against the BADGE, not against white", () => {
+  // A dark badge must carry light type, and a bright badge dark type.
+  assert.equal(onAccentColor("#223E1E"), "#FFFFFF");
+  assert.equal(onAccentColor("#73FF00"), "#111111");
 });
 
 test("applyCase: UPPER / LOWER / TITLE / SENTENCE", () => {
@@ -109,6 +116,23 @@ test("briefToTextSpecs: produces Recraft-shaped type payloads", () => {
 test("briefToTextSpecs: no copy means no specs", () => {
   const specs = briefToTextSpecs({ ...brief, copy: {} }, { size: { width: 1024, height: 1024 } });
   assert.equal(specs.length, 0);
+});
+
+test("planTypeLayout: a headline that would overflow is shrunk to FIT the column", () => {
+  const long = { ...brief, copy: { ...brief.copy, headline: "AN EXTREMELY LONG HEADLINE THAT CANNOT POSSIBLY FIT" } };
+  const plan = planTypeLayout(long, { width: 1000, height: 1250 });
+  const h = plan.items[0];
+  const widest = h.lines.reduce((m, l) => Math.max(m, estimateWidth(l, h.size, h.weight)), 0);
+  assert.ok(widest <= plan.maxWidth, `the headline must fit: ${widest} > ${plan.maxWidth}`);
+  assert.ok(h.size < 96, "the size must shrink rather than overflow");
+});
+
+test("planTypeLayout: the CTA badge is wide enough for its own text", () => {
+  const plan = planTypeLayout(brief, { width: 1000, height: 1250 });
+  const cta = plan.cta;
+  const textW = estimateWidth(cta.text, cta.size, cta.weight);
+  assert.ok(cta.box.w >= textW, `the badge must contain the text: ${cta.box.w} < ${textW}`);
+  assert.ok(cta.box.x + cta.box.w <= 1000, "the badge must stay inside the canvas");
 });
 
 test("applyTypeLayer: composites real glyphs over the artwork (or says why not)", async () => {
