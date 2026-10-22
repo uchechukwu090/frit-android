@@ -393,7 +393,9 @@ function svgForPlan(plan) {
   }
   for (const item of plan.items) {
     const family = escapeXml(fontStack(item.font));
-    const fill = item.role === "cta" ? onAccentColor(plan.colors.accent) : plan.colors.type;
+    // Each line carries the colour that was picked against the artwork
+    // actually under IT.
+    const fill = item.color || (item.role === "cta" ? onAccentColor(plan.colors.accent) : plan.colors.type);
     if (item.box) {
       parts.push(`<rect x="${item.box.x}" y="${item.box.y}" width="${item.box.w}" height="${item.box.h}" rx="${item.box.r}" fill="${plan.colors.accent}"/>`);
     }
@@ -413,25 +415,25 @@ function svgForPlan(plan) {
 }
 
 /**
- * The mean luminance of the artwork BEHIND the type block.
+ * The mean luminance of the artwork behind ONE line of type.
  *
  * The brief's background colour is the DESIGN's background, not what the
- * renderer actually painted (it may be a photo). Judging the type against
- * the brief alone let "white on a bright photo" through, and the reviewer
- * rightly called it illegible. This measures the real pixels.
+ * renderer actually painted (it may be a photo, a gradient, a band). Judging
+ * the type against the brief alone let "white on a bright photo" through,
+ * and the reviewer rightly called it illegible. This measures the real
+ * pixels, per line — a block that spans a dark area and a bright band needs
+ * a different decision for each line.
  */
-export async function measureBackdrop(buffer, plan, { sharp }) {
+export async function measureLineBackdrop(buffer, item, plan, { sharp }) {
   try {
-    const top = Math.max(0, Math.min(plan.height - 1, Math.round(plan.items[0]?.y ?? 0) - plan.margin));
-    const bottom = Math.max(top + 1, Math.min(plan.height, Math.round((plan.items[plan.items.length - 1]?.y ?? plan.height)) + plan.margin));
+    const top = Math.max(0, Math.min(plan.height - 1, Math.round(item.y - item.size * 1.05)));
+    const height = Math.max(2, Math.min(plan.height - top, Math.round(item.size * 1.5)));
     const left = Math.max(0, Math.min(plan.width - 1, Math.round(plan.margin)));
-    const right = Math.max(left + 1, Math.min(plan.width, plan.width - plan.margin));
+    const width = Math.max(2, Math.min(plan.width - left, plan.width - plan.margin * 2));
     const { channels } = await sharp(buffer)
-      .extract({ left, top, width: right - left, height: bottom - top })
+      .extract({ left, top, width, height })
       .stats();
     const ch = channels[0] || {};
-    // sharp's stats shape differs between versions: `mean`/`stdev` are
-    // per-channel arrays on some builds and single numbers on others.
     const means = Array.isArray(ch.mean) ? ch.mean : [ch.mean, ch.mean, ch.mean];
     const stdevs = Array.isArray(ch.stdev) ? ch.stdev : [ch.stdev, ch.stdev, ch.stdev];
     const luma = (0.299 * (means[0] || 0) + 0.587 * (means[1] || 0) + 0.114 * (means[2] || 0)) / 255;
@@ -468,30 +470,36 @@ export async function applyTypeLayer(imageBuffer, brief, { width, height } = {})
     const h = height || meta.height || Math.round(w * 1.25);
     const plan = planTypeLayout(brief, { width: w, height: h });
 
-    // Measure the artwork behind the copy and re-pick the type colour
-    // against it. If the type still cannot be read, lay a scrim band behind
-    // it — the standard poster move, and it also covers the stray lettering
-    // an image model leaves behind when it ignores "no text".
+    // Measure the artwork under EACH line and pick the type colour per line.
+    // A scrim band goes down only when a line is unreadable even after the
+    // colour is re-picked, or when the backdrop is busy enough that any
+    // single colour will fight it.
     let scrim = null;
-    const backdrop = await measureBackdrop(imageBuffer, plan, { sharp });
-    if (backdrop) {
-      const bgHex = greyAt(backdrop.luma);
-      // The best readable colour against the artwork's real pixels.
-      const picked = pickTypeColor([{ hex: plan.colors.type }, { hex: "#111111" }, { hex: "#FFFFFF" }], bgHex);
-      if (backdrop.busy || contrastRatio(picked, bgHex) < 4.5) {
-        // A busy backdrop (a photo, a pattern) or a low-contrast one: lay a
-        // scrim band. It guarantees the copy is readable AND covers the
-        // stray lettering an image model leaves when it ignores "no text".
-        const band = plan.colors.type;
-        plan.colors.type = pickTypeColor([{ hex: band }], band);
-        plan.scrim = {
-          y0: Math.max(0, Math.round(plan.items[0].y - plan.size * 1.1)),
-          y1: Math.min(h, Math.round((plan.items[plan.items.length - 1]?.y ?? h) + plan.size * 0.8)),
-          color: band, alpha: 0.82,
-        };
-        scrim = plan.scrim;
-      } else {
-        plan.colors.type = picked;
+    for (const item of plan.items) {
+      const back = await measureLineBackdrop(imageBuffer, item, plan, { sharp });
+      if (!back) continue;
+      const bgHex = greyAt(back.luma);
+      const best = pickTypeColor([{ hex: plan.colors.type }, { hex: "#111111" }, { hex: "#FFFFFF" }], bgHex);
+      item.color = best;
+      item.backdrop = bgHex;
+      if (contrastRatio(best, bgHex) < 4.5 || back.busy) {
+        item.needsScrim = true;
+      }
+    }
+    const needy = plan.items.filter((i) => i.needsScrim);
+    if (needy.length) {
+      // One soft band behind the whole copy block, in the brief's own type
+      // colour: it guarantees legibility AND covers the stray lettering an
+      // image model leaves when it ignores "no text in the image".
+      const band = plan.colors.type;
+      const scrimItems = needy.map((i) => i);
+      const y0 = Math.max(0, Math.round(Math.min(...scrimItems.map((i) => i.y)) - plan.size * 1.2));
+      const y1 = Math.min(h, Math.round(Math.max(...scrimItems.map((i) => i.y)) + plan.size * 0.9));
+      plan.scrim = { y0, y1, color: band, alpha: 0.82 };
+      scrim = plan.scrim;
+      // Every line now sits on the band, so re-pick against the band colour.
+      for (const item of plan.items) {
+        item.color = pickTypeColor([{ hex: band }], band);
       }
     }
 
@@ -510,6 +518,9 @@ export async function applyTypeLayer(imageBuffer, brief, { width, height } = {})
       colors: plan.colors,
     };
   } catch (e) {
+    // The artwork is still a valid deliverable without the type layer, so this
+    // degrades instead of failing — but it must be visible in the log.
+    console.warn("[type-layer] failed:", e.message);
     return { buffer: imageBuffer, applied: false, reason: `type layer failed: ${e.message}` };
   }
 }

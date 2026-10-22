@@ -196,16 +196,16 @@ test("applyTypeLayer: a scrim band is laid over a BUSY backdrop (a photo or patt
   assert.equal(out.scrim, true, "a busy backdrop must get a scrim");
 });
 
-test("applyTypeLayer: a flat, readable backdrop gets NO scrim", async () => {
+test("applyTypeLayer: the type colour is picked against the artwork under EACH line", async () => {
   const sharp = (await import("sharp")).default;
+  // A bright band in the middle, dark at the edges: one colour for the whole
+  // block cannot work, so each line must be judged on its own pixels.
   const artwork = await sharp({
-    create: { width: 1000, height: 1250, channels: 3, background: { r: 14, g: 59, b: 46 } },
-  }).png().toBuffer();
-  const out = await applyTypeLayer(artwork, {
-    ...brief,
-    palette: [{ hex: "#F4EFE4", role: "secondary", share_pct: 100 }],
-    background: { description: "deep green", color_hex: "#0E3B2E" },
-  });
+    create: { width: 1000, height: 1250, channels: 3, background: { r: 20, g: 20, b: 20 } },
+  }).composite([{ input: Buffer.from(`<svg width="1000" height="400" xmlns="http://www.w3.org/2000/svg"><rect width="1000" height="400" fill="#FAFAFA"/></svg>`), top: 100, left: 0 }])
+    .png().toBuffer();
+  const out = await applyTypeLayer(artwork, brief);
   assert.equal(out.applied, true);
-  assert.equal(out.scrim, false, "cream on deep green is already readable");
+  assert.ok(out.scrim, "a line over a bright band must get a scrim");
+  assert.ok(out.colors.type.startsWith("#"));
 });

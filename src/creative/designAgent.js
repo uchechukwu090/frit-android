@@ -844,6 +844,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
         inspiration = mergeInspiration(inspiration, wide, { maxRefs: candidateCount, seed });
       }
     } catch (e) {
+      console.warn("[design-agent] inspiration search failed:", e.message);
       warnings.push(`inspiration skipped: ${e.message}`);
     }
   }
@@ -872,6 +873,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
           const out = await withTimeout(describe(ref, goal, { loaded }), Math.min(40_000, Math.max(15_000, left() * 0.35)), "reference read");
           return out ? { ...out, ref_image: loaded?.url || null, ref_id: loaded?.id || null } : null;
         } catch (e) {
+          console.warn("[design-agent] reference read failed:", e.message);
           warnings.push(`reference unreadable (${s(ref, 80)}): ${e.message}`);
           return null;
         }
@@ -906,6 +908,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
     raw = await withTimeout(synth(goal, input, diverse), Math.min(75_000, Math.max(30_000, left() * 0.6)), "brief synthesis");
     brief = normalizeBrief(raw, input);
   } catch (e) {
+    console.warn(`[design-agent] brief synthesis failed:`, e.message);
     // The model timed out or failed. Do NOT throw the references away: build
     // the brief straight from their DNA instead of falling back to a default
     // that ignores everything the agent learned.
@@ -940,6 +943,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       });
       brief = divergence.brief;
     } catch (e) {
+      console.warn("[design-agent] divergence check failed:", e.message);
       warnings.push(`divergence check failed: ${e.message}`);
     }
   }
@@ -980,6 +984,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
         "render"
       );
     } catch (e) {
+      console.warn(`[design-agent] render attempt ${attempt} failed:`, e.message);
       warnings.push(`render attempt ${attempt} failed: ${e.message}`);
       render = null;
       break;
@@ -1000,9 +1005,11 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
             warnings.push(`type layer skipped: ${layered.reason}`);
           }
         } else {
+          console.warn("[design-agent] type layer skipped: the render bytes could not be fetched");
           warnings.push("type layer skipped: the render bytes could not be fetched");
         }
       } catch (e) {
+        console.warn("[design-agent] type layer failed:", e.message);
         warnings.push(`type layer failed: ${e.message}`);
       }
     }
@@ -1016,6 +1023,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       const verify = deps.verifyRender || ((r, b) => verifyRender(r, b, { chat: deps.chat, fetchImpl: deps.fetchImpl, threshold }));
       verification = await withTimeout(verify(render.image_url || render.image_b64, brief), Math.min(45_000, Math.max(12_000, left() - 1_000)), "verification");
     } catch (e) {
+      console.warn("[design-agent] verification failed:", e.message);
       warnings.push(`verification failed: ${e.message}`);
       verification = { score: 0, pass: false, issues: [], threshold, checked: false };
       break;
