@@ -850,31 +850,42 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   mark("research");
 
   // ---- stage 2: read references, then write the brief -------------------
+  // Read in small batches, not all at once: five concurrent vision calls
+  // congest the provider (they time out) and every timeout is an EXTRA paid
+  // call when the chain falls through. Stop as soon as we have enough.
   let references = [];
   if (inspiration.refs?.length && (deps.chat || deps.describeReference)) {
     const describe = deps.describeReference || ((ref, g, extra) => describeReference(ref, g, { chat: deps.chat, fetchImpl: deps.fetchImpl, loaded: extra?.loaded || null }));
-    references = (await Promise.all(inspiration.refs.slice(0, candidateCount).map(async (ref) => {
-      try {
-        // The reference transport fetches the bytes ONCE, browser-like, and
-        // falls back to a public origin-side proxy when the CDN refuses us.
-        const loaded = deps.loadReference ? await deps.loadReference(ref) : null;
-        // The reference reads run in PARALLEL, so a generous per-read cap
-        // costs no wall-clock time — and a timeout is EXPENSIVE: it throws the
-        // read away and the agent falls back to a default brief.
-        const out = await withTimeout(describe(ref, goal, { loaded }), Math.min(45_000, Math.max(15_000, left() * 0.35)), "reference read");
-        return out ? { ...out, ref_image: loaded?.url || null, ref_id: loaded?.id || null } : null;
-      } catch (e) {
-        warnings.push(`reference unreadable (${s(ref, 80)}): ${e.message}`);
-        return null;
-      }
-    }))).filter(Boolean).map((r) => ({
+    const candidates = inspiration.refs.slice(0, candidateCount);
+    const BATCH = 2;
+    // Read one more than we need: the diversity pick needs a spare to choose
+    // from, and a spare is also the fallback when one read fails.
+    const want = Math.min(candidates.length, maxRefs + 1);
+    for (let i = 0; i < candidates.length && references.length < want; i += BATCH) {
+      const slice = candidates.slice(i, i + BATCH);
+      const batch = await Promise.all(slice.map(async (ref) => {
+        try {
+          // The reference transport fetches the bytes ONCE, browser-like, and
+          // falls back to a public origin-side proxy when the CDN refuses us.
+          const loaded = deps.loadReference ? await deps.loadReference(ref) : null;
+          // The reads are concurrent, so a generous cap costs no wall-clock.
+          const out = await withTimeout(describe(ref, goal, { loaded }), Math.min(40_000, Math.max(15_000, left() * 0.35)), "reference read");
+          return out ? { ...out, ref_image: loaded?.url || null, ref_id: loaded?.id || null } : null;
+        } catch (e) {
+          warnings.push(`reference unreadable (${s(ref, 80)}): ${e.message}`);
+          return null;
+        }
+      }));
+      references.push(...batch.filter(Boolean));
+    }
+  }
+  references = references.map((r) => ({
       ...r,
       structure: r.structure || splitDNA(r.dna).structure,
       palette: r.palette || splitDNA(r.dna).palette,
       typography: r.typography || splitDNA(r.dna).typography,
       mood: r.mood || splitDNA(r.dna).mood,
     }));
-  }
   mark("references");
 
   // Pick the references that are STRUCTURALLY FAR APART, not the top three of
@@ -963,7 +974,9 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
           seed: seed + attempt,
           negative_prompt: brief.negative_prompt,
         }),
-        Math.min(60_000, left() - 2_000),
+        // The render gets whatever is LEFT: it is the one stage that must not
+        // be cut short, and a cut render means no design at all.
+        Math.min(90_000, Math.max(20_000, left() - 2_000)),
         "render"
       );
     } catch (e) {
