@@ -135,6 +135,23 @@ test("planTypeLayout: the CTA badge is wide enough for its own text", () => {
   assert.ok(cta.box.x + cta.box.w <= 1000, "the badge must stay inside the canvas");
 });
 
+test("planTypeLayout: right-aligned copy is FLUSH right, badge and label alike", () => {
+  const plan = planTypeLayout({ ...brief, layout: { ...brief.layout, alignment: "right" } }, { width: 1000, height: 1250 });
+  const cta = plan.cta;
+  assert.equal(cta.anchor, "end", "the label must be right-anchored inside the badge");
+  assert.equal(cta.box.x + cta.box.w, 1000 - 100, "the badge must be flush with the right margin");
+  assert.ok(cta.x <= cta.box.x + cta.box.w, "the label must end inside the badge");
+  assert.equal(plan.items[0].anchor, "end");
+  assert.equal(plan.items[0].x, 1000 - 100);
+});
+
+test("planTypeLayout: left-aligned copy is flush left", () => {
+  const plan = planTypeLayout(brief, { width: 1000, height: 1250 });
+  assert.equal(plan.items[0].x, 100);
+  assert.equal(plan.cta.anchor, "start");
+  assert.equal(plan.cta.box.x, 100);
+});
+
 test("applyTypeLayer: composites real glyphs over the artwork (or says why not)", async () => {
   const sharp = (await import("sharp")).default;
   const artwork = await sharp({
@@ -162,4 +179,33 @@ test("applyTypeLayer: a brief with no copy leaves the artwork untouched", async 
   const out = await applyTypeLayer(artwork, { ...brief, copy: {} });
   assert.equal(out.applied, false);
   assert.equal(out.buffer, artwork);
+});
+
+test("applyTypeLayer: a scrim band is laid over a BUSY backdrop (a photo or pattern)", async () => {
+  const sharp = (await import("sharp")).default;
+  // High-contrast stripes behind the copy: the type cannot be read reliably
+  // on it, so the layer must lay a scrim band.
+  const stripe = Buffer.from(
+    `<svg width="1000" height="1250" xmlns="http://www.w3.org/2000/svg">` +
+    Array.from({ length: 40 }, (_, i) => `<rect y="${i * 32}" width="1000" height="32" fill="${i % 2 ? "#ffffff" : "#111111"}"/>`).join("") +
+    `</svg>`,
+  );
+  const artwork = await sharp(stripe).png().toBuffer();
+  const out = await applyTypeLayer(artwork, brief);
+  assert.equal(out.applied, true);
+  assert.equal(out.scrim, true, "a busy backdrop must get a scrim");
+});
+
+test("applyTypeLayer: a flat, readable backdrop gets NO scrim", async () => {
+  const sharp = (await import("sharp")).default;
+  const artwork = await sharp({
+    create: { width: 1000, height: 1250, channels: 3, background: { r: 14, g: 59, b: 46 } },
+  }).png().toBuffer();
+  const out = await applyTypeLayer(artwork, {
+    ...brief,
+    palette: [{ hex: "#F4EFE4", role: "secondary", share_pct: 100 }],
+    background: { description: "deep green", color_hex: "#0E3B2E" },
+  });
+  assert.equal(out.applied, true);
+  assert.equal(out.scrim, false, "cream on deep green is already readable");
 });

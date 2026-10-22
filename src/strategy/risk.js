@@ -147,10 +147,29 @@ export class PortfolioRisk {
       const rUsd = riskUsdOverride ?? this.riskUsd({ symbol: sym, lotSize, entry, sl });
       if (rUsd != null) {
         exposure.newRiskUsd = Number(rUsd.toFixed(2));
-        exposure.newRiskPct = Number(((rUsd / bal) * 100).toFixed(2));
-        if (exposure.newRiskPct > limits.maxTradePct) {
+        // F-50: compare the RAW percentage against the cap. The rounded
+        // value was compared, so a $20.04 risk on a $1000 book (2.004%)
+        // rounded to 2.00 and sailed under a 2% cap. The rounded number is
+        // still what we DISPLAY; the gate uses the exact one.
+        const rawRiskPct = (rUsd / bal) * 100;
+        exposure.newRiskPct = Number(rawRiskPct.toFixed(2));
+        // Compare the RAW percentage against the cap, with a tiny epsilon so
+        // float noise does not reject a trade that is EXACTLY at the cap
+        // (20/1000*100 is 2.0000000000000004 in IEEE754, not 2).
+        if (rawRiskPct - limits.maxTradePct > 1e-9) {
           reasons.push(`Single-trade risk ${exposure.newRiskPct}% exceeds cap ${limits.maxTradePct}% — reduce size`);
         }
+      } else {
+        // F-50: when the risk cannot be priced at all (no pip row for the
+        // symbol, or a missing/equal stop) the per-trade cap was simply
+        // SKIPPED, so the trade sailed through with no size limit. A risk
+        // layer that cannot price the risk must BLOCK, not admit — the same
+        // fail-closed rule the F-04 fix applied to internal errors.
+        reasons.push(
+          riskUsdOverride != null
+            ? `Single-trade risk could not be priced (${sym}) — no stop distance, so the size cap cannot be applied — trade blocked`
+            : `Single-trade risk could not be priced for ${sym} (no pip/price row) — the size cap cannot be applied — trade blocked`
+        );
       }
 
       // 3a. Per-group cap (correlation guard, part 1)

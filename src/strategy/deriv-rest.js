@@ -1,20 +1,26 @@
 // ============================================================================
-// DERIV REST — account management, payments, application insights
+// DERIV REST — real endpoints of the Deriv "Options" API (api.derivws.com)
 // ----------------------------------------------------------------------------
-// DerivClient only speaks WebSocket (data + trade). Account settings, payment
-// agents, wallets, and app markup statistics are REST on
-// https://api.derivws.com with an OAuth2 Bearer token (or PAT + Deriv-App-ID
-// header). This module keeps DerivClient as-is and gives it a `rest()` for
-// everything else.
+// MIGRATED (Oct 2026): the legacy REST surface (account settings, statistics,
+// self-exclusion, cashier, app registration) does NOT exist on the current
+// API — verified live: /account/v1/settings|statistics|self-exclusion,
+// /cashier/v1/info, /applications/v1/list|get|register|update|delete and
+// /account/v1/statement all return 404. This module only exposes what actually
+// exists (route probed live, HTTP 401/422 = exists):
+//   GET  /v1/health                                            (public)
+//   GET  /trading/v1/options/accounts                          (Bearer)
+//   POST /trading/v1/options/accounts/{accountId}/otp          (Bearer)
+//   GET  /trading/v1/options/legacy/statement                  (Bearer)
+//   GET  /wallet/v1/wallets                                    (old /accounts 404s)
+//   GET  /payment-agents/v1/agents?country=...
+//   POST /payment-agents/v1/withdraw                            (verification code)
+//   GET  /applications/v1/markup-statistics?date_from&date_to
+//   POST /account/v1/nickname
 //
 // SAFETY:
-//   - All endpoints are read-first; mutating ones (self-exclusion, account
-//     closure, withdrawal) live behind explicit named methods so a stray call
-//     cannot move money or close an account.
-//   - Withdrawal requires a verification code (phone/SMS) — the API itself
-//     enforces that; we never attempt to bypass it.
-//   - App registration requires the `trade` scope; markup statistics require
-//     application_read + Deriv-App-ID. Everything is opted-in via env.
+//   - Read-first; the one money-moving method (payment-agent withdrawal) is
+//     named explicitly and the API itself enforces the SMS verification code.
+//   - PAT auth needs the Deriv-App-ID header — sent automatically.
 // ============================================================================
 
 const REST_BASE = "https://api.derivws.com";
@@ -25,18 +31,20 @@ export class DerivRestClient {
       || process.env.DERIV_DEMO_TOKEN
       || process.env.DERIV_REAL_TOKEN
       || "",
-    appId = process.env.DERIV_APP_ID || "1089",
+    appId = process.env.DERIV_APP_ID || "",
     fetchImpl = fetch,
   } = {}) {
     this.token = token;
-    this.appId = String(appId || "1089");
+    this.appId = String(appId || "");
     this.fetch = fetchImpl;
   }
 
   _headers() {
     const H = { "Content-Type": "application/json" };
-    if (this.token) H.Authorization = `Bearer ${this.token}`;
-    if (this.token) H["Deriv-App-ID"] = this.appId;
+    if (this.token) {
+      H.Authorization = `Bearer ${this.token}`;
+      H["Deriv-App-ID"] = this.appId;
+    }
     return H;
   }
 
@@ -51,7 +59,7 @@ export class DerivRestClient {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const err = data?.errors?.[0] || data?.error || { message: `HTTP ${res.status}` };
+        const err = data?.errors?.[0] || data?.error || data?.detail || {};
         return { error: { message: err.message || err.detail?.message || `HTTP ${res.status}`, code: err.code } };
       }
       return data;
@@ -60,31 +68,48 @@ export class DerivRestClient {
     }
   }
 
-  // ---- account management (read) ----
-  async getSettings() { return this.rest("GET", "/account/v1/settings"); }
-  async getAccountStatistics() { return this.rest("GET", "/account/v1/statistics"); }
-  async getFinancialAssessment() { return this.rest("GET", "/account/v1/financial-assessment"); }
-  async getResidenceList() { return this.rest("GET", "/residence/v1/list"); }
-  async getLandingCompany() { return this.rest("GET", "/landingcompany/v1/details"); }
-  async getRealityCheck() { return this.rest("GET", "/reality-check/v1/summary"); }
+  /** Public service health check (no auth). */
+  health() {
+    return this._raw("GET", "/v1/health", null, true);
+  }
 
-  // ---- account management (mutating — named so they cannot be called by accident) ----
-  async updateSettings(patch) { return this.rest("PATCH", "/account/v1/settings", patch); }
-  async submitFinancialAssessment(answers) { return this.rest("POST", "/account/v1/financial-assessment", answers); }
-  async setSelfExclusion(params) { return this.rest("POST", "/account/v1/self-exclusion", params); }
-  async getSelfExclusion() { return this.rest("GET", "/account/v1/self-exclusion"); }
-  async requestAccountClosure(reason, verificationCode) {
-    return this.rest("POST", "/account/v1/close", { reason, verification_code: verificationCode });
+  /** Unauthenticated-capable variant (token optional). */
+  async _raw(method, path, body = null, allowNoToken = false, timeoutMs = 20_000) {
+    if (!this.token && !allowNoToken) return { error: { message: "no DERIV_TOKEN — set it in server/.env" } };
+    try {
+      const res = await this.fetch(`${REST_BASE}${path}`, {
+        method,
+        headers: this._headers(),
+        body: body != null ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = data?.errors?.[0] || data?.error || data?.detail || {};
+        return { error: { message: err.message || err.detail?.message || `HTTP ${res.status}`, code: err.code } };
+      }
+      return data;
+    } catch (e) {
+      return { error: { message: e.message } };
+    }
   }
-  async requestAccountReopen(reason, verificationCode) {
-    return this.rest("POST", "/account/v1/reopen", { reason, verification_code: verificationCode });
+
+  // ---- trading accounts (drives the websocket OTP flow in DerivClient) ----
+  async accounts() { return this.rest("GET", "/trading/v1/options/accounts"); }
+  async otpUrl(accountId) { return this.rest("POST", `/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`); }
+
+  /** Trade history for the account (legacy-named route on the new platform). */
+  async statement({ limit = 50, offset = 0 } = {}) {
+    return this.rest("GET", `/trading/v1/options/legacy/statement?limit=${limit}&offset=${offset}`);
   }
-  async logout() { return this.rest("POST", "/account/v1/logout", {}); }
+
+  // ---- wallet ----
+  async wallets() { return this.rest("GET", "/wallet/v1/wallets"); }
 
   // ---- payments ----
-  async paymentAgents(countryCode) { return this.rest("GET", `/payment-agents/v1/agents?country=${encodeURIComponent(countryCode)}`); }
-  async cashierInfo(currency) { return this.rest("GET", `/cashier/v1/info?currency=${encodeURIComponent(currency)}`); }
-  async wallets() { return this.rest("GET", "/wallet/v1/accounts"); }
+  async paymentAgents(countryCode) {
+    return this.rest("GET", `/payment-agents/v1/agents?country=${encodeURIComponent(countryCode)}`);
+  }
 
   /**
    * Withdrawal through a payment agent. The API requires a verification code
@@ -97,28 +122,11 @@ export class DerivRestClient {
     });
   }
 
-  async statement({ limit = 50, offset = 0 } = {}) {
-    return this.rest("GET", `/account/v1/statement?limit=${limit}&offset=${offset}`);
-  }
-
   // ---- application management ----
-  async appList() { return this.rest("GET", "/applications/v1/list"); }
-  async appGet(appId) { return this.rest("GET", `/applications/v1/get?app_id=${appId}`); }
   async appMarkupStatistics(dateFrom, dateTo) {
     return this.rest("GET", `/applications/v1/markup-statistics?date_from=${dateFrom}&date_to=${dateTo}`);
   }
 
-  /**
-   * Register an OAuth application. Requires the trade scope and a redirect URI;
-   * the returned app_id/secret are what mark THIS app as a Deriv-connected app
-   * (markup commission, not just API access).
-   */
-  async appRegister({ name, redirectUri, scopes, appMarkUp = 0, verificationCode }) {
-    return this.rest("POST", "/applications/v1/register", {
-      name, redirect_uri: redirectUri, scopes, app_mark_up: appMarkUp, verification_code: verificationCode,
-    });
-  }
-
-  async appUpdate(appId, patch) { return this.rest("PATCH", `/applications/v1/update?app_id=${appId}`, patch); }
-  async appDelete(appId) { return this.rest("POST", `/applications/v1/delete?app_id=${appId}`); }
+  // ---- misc ----
+  async updateNickname(nickname) { return this.rest("POST", "/account/v1/nickname", { nickname }); }
 }

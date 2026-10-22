@@ -323,6 +323,37 @@ test("runDesignAgent: requires a goal and a generator", async () => {
   await assert.rejects(() => runDesignAgent({ goal: "flyer" }, deps), /generate dependency missing/);
 });
 
+test("normalizeBrief: PLACEHOLDER copy is dropped and quoted copy is unquoted", () => {
+  const b = normalizeBrief({
+    copy: {
+      headline: '"HAPPY BIRTHDAY"',
+      subhead: "Let's celebrate [Name] in style!",
+      body: "Date: [Insert Date] Venue: [Venue]",
+      cta: '"Join the party"',
+    },
+  }, { headline: "HAPPY BIRTHDAY", cta: "Join the party" });
+  assert.equal(b.copy.headline, "HAPPY BIRTHDAY", "the user's copy wins and is unquoted");
+  assert.equal(b.copy.cta, "Join the party");
+  assert.equal(b.copy.subhead, "", "a placeholder subhead must be dropped, not typeset");
+  assert.equal(b.copy.body, "", "a placeholder body must be dropped");
+});
+
+test("normalizeBrief: a placeholder in the USER copy is dropped too", () => {
+  const b = normalizeBrief({}, { headline: "[Name] party" });
+  assert.equal(b.copy.headline, "");
+});
+
+test("runDesignAgent: a placeholder never reaches the render prompt", async () => {
+  const { deps, prompts } = baseDeps({
+    synthesizeBrief: async () => ({
+      copy: { headline: "HAPPY BIRTHDAY", subhead: "celebrate [Name] today" },
+      palette: [{ hex: "#112233", role: "dominant", share_pct: 60 }],
+    }),
+  });
+  await runDesignAgent({ goal: "birthday flyer" }, deps);
+  assert.ok(!prompts[0].includes("[Name]"), "no placeholder may reach the renderer");
+});
+
 test("defaultBrief is a valid starting point on its own", () => {
   const b = defaultBrief({ headline: "SALE" });
   assert.equal(b.copy.headline, "SALE");

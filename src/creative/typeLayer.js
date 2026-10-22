@@ -121,6 +121,27 @@ export function applyCase(text, mode) {
   return t;
 }
 
+/**
+ * Clean a copy string before it is typeset.
+ *
+ * Two contaminations come straight from the model and are very visible on
+ * the finished poster:
+ *   * PLACEHOLDERS — "Let's celebrate [Name] in style!" The type layer sets
+ *     the copy VERBATIM, so the bracket went straight onto the artwork.
+ *   * QUOTES — '"HAPPY BIRTHDAY"' — the model quotes the copy in its JSON.
+ *
+ * A string carrying a placeholder is DROPPED (it is worse than absent: the
+ * user did not ask for it and it cannot be filled in).
+ */
+export function cleanCopy(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return "";
+  if (/\[[^\]]{1,60}\]|\{[^\}]{1,60}\}|<[^>]{1,60}>|\b(?:lorem ipsum|xxx+)\b/i.test(raw)) return "";
+  // Strip one layer of matching surrounding quotes.
+  const unquoted = raw.replace(/^["'“”‘’`\s]+/, "").replace(/["'“”‘’`\s]+$/, "");
+  return unquoted.trim();
+}
+
 /** Rough advance width per character, in em.
  *
  *  The estimate must err on the SAFE side: a headline that overflows the
@@ -211,7 +232,8 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
 
   const push = (text, spec, size, { gap = 0, lines = 3, weight, tracking, cased } = {}) => {
     if (!text) return;
-    const t = applyCase(text, cased ?? spec.case);
+    const t = applyCase(cleanCopy(text), cased ?? spec.case);
+    if (!t) return;
     const w = weight ?? spec.weight ?? 400;
     const tr = tracking ?? spec.tracking ?? 0;
     // Fit the block to the column before it is set: a headline that overflows
@@ -225,6 +247,10 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
       wrapped = wrapText(t, fitted, maxWidth, w, lines);
     }
     if (!wrapped.length) return;
+    // Leading: display type is set solid, running copy needs air. 106% of the
+    // font size made the body lines overlap — the reviewer called it
+    // "garbled and illegible".
+    const leading = spec.role === "headline" ? 1.04 : 1.28;
     items.push({
       role: spec.role,
       text: t,
@@ -238,8 +264,9 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
       anchor,
       align: alignment,
       width: maxWidth,
+      leading,
     });
-    y += wrapped.length * fitted * 1.06 + gap;
+    y += wrapped.length * fitted * leading + gap;
   };
 
   push(copy.headline, { ...headline, role: "headline" }, headlineSize, { gap: Math.round(headlineSize * 0.18), lines: 3 });
@@ -249,26 +276,35 @@ export function planTypeLayout(brief, { width, height, baseWidth = 1080 } = {}) 
   // CTA sits at the bottom, as a badge.
   let ctaItem = null;
   if (copy.cta) {
-    const ctaText = applyCase(copy.cta, cta.case);
-    const ctaFitted = fitTypeSize(ctaText, ctaSize, maxWidth, cta.weight || 700, cta.tracking || 0);
-    const w = Math.round(estimateWidth(ctaText, ctaFitted, cta.weight || 700) + Math.abs(cta.tracking || 0) * ctaText.length + ctaFitted * 1.6);
-    const h = Math.round(ctaFitted * 2);
-    const cx = alignment === "center" ? Math.round(width / 2 - w / 2) : alignment === "right" ? width - margin - w : margin;
-    const cy = Math.max(0, height - margin - h);
-    ctaItem = {
-      role: "cta",
-      text: ctaText,
-      lines: [ctaText],
-      size: ctaFitted,
-      weight: cta.weight || 700,
-      tracking: cta.tracking || 0,
-      font: cta.font || "sans-serif",
-      x: cx + w / 2,
-      y: cy + h * 0.5 + ctaFitted * 0.34,
-      anchor: "middle",
-      box: { x: cx, y: cy, w, h, r: Math.round(h / 2) },
-    };
-    items.push(ctaItem);
+    const ctaText = applyCase(cleanCopy(copy.cta), cta.case);
+    if (ctaText) {
+      const ctaFitted = fitTypeSize(ctaText, ctaSize, maxWidth, cta.weight || 700, cta.tracking || 0);
+      const textW = estimateWidth(ctaText, ctaFitted, cta.weight || 700) + Math.abs(cta.tracking || 0) * ctaText.length;
+      const pad = Math.round(ctaFitted * 0.8);
+      const w = Math.round(textW + pad * 2);
+      const h = Math.round(ctaFitted * 2);
+      const cx = alignment === "center" ? Math.round(width / 2 - w / 2) : alignment === "right" ? width - margin - w : margin;
+      const cy = Math.max(0, height - margin - h);
+      // The badge is flush with the margin AND the type inside it is flush
+      // with the badge's own edge — a centred label in a right-hand badge
+      // reads as "not aligned right".
+      const ctaAnchor = alignment === "center" ? "middle" : alignment === "right" ? "end" : "start";
+      const ctaX = alignment === "center" ? cx + w / 2 : alignment === "right" ? cx + w - pad : cx + pad;
+      ctaItem = {
+        role: "cta",
+        text: ctaText,
+        lines: [ctaText],
+        size: ctaFitted,
+        weight: cta.weight || 700,
+        tracking: cta.tracking || 0,
+        font: cta.font || "sans-serif",
+        x: ctaX,
+        y: cy + h * 0.5 + ctaFitted * 0.34,
+        anchor: ctaAnchor,
+        box: { x: cx, y: cy, w, h, r: Math.round(h / 2) },
+      };
+      items.push(ctaItem);
+    }
   }
 
   return {
@@ -339,6 +375,22 @@ function mapFontFamily(fontName) {
 function svgForPlan(plan) {
   const parts = [];
   parts.push(`<svg width="${plan.width}" height="${plan.height}" xmlns="http://www.w3.org/2000/svg">`);
+  // The scrim goes UNDER the type: a soft colour band that guarantees the
+  // copy is readable and covers the stray lettering an image model leaves
+  // behind when it ignores "no text in the image".
+  if (plan.scrim) {
+    const { y0, y1, color, alpha } = plan.scrim;
+    const h = Math.max(1, y1 - y0);
+    parts.push(
+      `<defs><linearGradient id="scrim" x1="0" y1="0" x2="0" y2="1">` +
+      `<stop offset="0%" stop-color="${color}" stop-opacity="${alpha}"/>` +
+      `<stop offset="12%" stop-color="${color}" stop-opacity="${alpha}"/>` +
+      `<stop offset="88%" stop-color="${color}" stop-opacity="${alpha}"/>` +
+      `<stop offset="100%" stop-color="${color}" stop-opacity="0"/>` +
+      `</linearGradient></defs>` +
+      `<rect x="0" y="${y0}" width="${plan.width}" height="${h + Math.round(h * 0.12)}" fill="url(#scrim)"/>`
+    );
+  }
   for (const item of plan.items) {
     const family = escapeXml(fontStack(item.font));
     const fill = item.role === "cta" ? onAccentColor(plan.colors.accent) : plan.colors.type;
@@ -346,8 +398,9 @@ function svgForPlan(plan) {
       parts.push(`<rect x="${item.box.x}" y="${item.box.y}" width="${item.box.w}" height="${item.box.h}" rx="${item.box.r}" fill="${plan.colors.accent}"/>`);
     }
     const lines = item.lines && item.lines.length ? item.lines : [item.text];
+    const step = item.size * (item.leading || 1.1);
     lines.forEach((line, i) => {
-      const dy = i === 0 ? 0 : item.size * 1.06;
+      const dy = i === 0 ? 0 : step;
       parts.push(
         `<text x="${item.x}" y="${item.y + dy}" font-family="${family}" font-size="${item.size}" ` +
         `font-weight="${item.weight}" letter-spacing="${item.tracking || 0}" ` +
@@ -357,6 +410,43 @@ function svgForPlan(plan) {
   }
   parts.push("</svg>");
   return parts.join("");
+}
+
+/**
+ * The mean luminance of the artwork BEHIND the type block.
+ *
+ * The brief's background colour is the DESIGN's background, not what the
+ * renderer actually painted (it may be a photo). Judging the type against
+ * the brief alone let "white on a bright photo" through, and the reviewer
+ * rightly called it illegible. This measures the real pixels.
+ */
+export async function measureBackdrop(buffer, plan, { sharp }) {
+  try {
+    const top = Math.max(0, Math.min(plan.height - 1, Math.round(plan.items[0]?.y ?? 0) - plan.margin));
+    const bottom = Math.max(top + 1, Math.min(plan.height, Math.round((plan.items[plan.items.length - 1]?.y ?? plan.height)) + plan.margin));
+    const left = Math.max(0, Math.min(plan.width - 1, Math.round(plan.margin)));
+    const right = Math.max(left + 1, Math.min(plan.width, plan.width - plan.margin));
+    const { channels } = await sharp(buffer)
+      .extract({ left, top, width: right - left, height: bottom - top })
+      .stats();
+    const ch = channels[0] || {};
+    // sharp's stats shape differs between versions: `mean`/`stdev` are
+    // per-channel arrays on some builds and single numbers on others.
+    const means = Array.isArray(ch.mean) ? ch.mean : [ch.mean, ch.mean, ch.mean];
+    const stdevs = Array.isArray(ch.stdev) ? ch.stdev : [ch.stdev, ch.stdev, ch.stdev];
+    const luma = (0.299 * (means[0] || 0) + 0.587 * (means[1] || 0) + 0.114 * (means[2] || 0)) / 255;
+    const stdev = ((stdevs[0] || 0) + (stdevs[1] || 0) + (stdevs[2] || 0)) / 3 / 255;
+    return { luma, busy: stdev > 0.16 };
+  } catch {
+    return null;
+  }
+}
+
+/** A grey with the given relative luminance. */
+export function greyAt(luma) {
+  const v = Math.round(Math.min(1, Math.max(0, luma)) * 255);
+  const h = v.toString(16).padStart(2, "0");
+  return `#${h}${h}${h}`;
 }
 
 /**
@@ -377,6 +467,34 @@ export async function applyTypeLayer(imageBuffer, brief, { width, height } = {})
     const w = width || meta.width || 1080;
     const h = height || meta.height || Math.round(w * 1.25);
     const plan = planTypeLayout(brief, { width: w, height: h });
+
+    // Measure the artwork behind the copy and re-pick the type colour
+    // against it. If the type still cannot be read, lay a scrim band behind
+    // it — the standard poster move, and it also covers the stray lettering
+    // an image model leaves behind when it ignores "no text".
+    let scrim = null;
+    const backdrop = await measureBackdrop(imageBuffer, plan, { sharp });
+    if (backdrop) {
+      const bgHex = greyAt(backdrop.luma);
+      // The best readable colour against the artwork's real pixels.
+      const picked = pickTypeColor([{ hex: plan.colors.type }, { hex: "#111111" }, { hex: "#FFFFFF" }], bgHex);
+      if (backdrop.busy || contrastRatio(picked, bgHex) < 4.5) {
+        // A busy backdrop (a photo, a pattern) or a low-contrast one: lay a
+        // scrim band. It guarantees the copy is readable AND covers the
+        // stray lettering an image model leaves when it ignores "no text".
+        const band = plan.colors.type;
+        plan.colors.type = pickTypeColor([{ hex: band }], band);
+        plan.scrim = {
+          y0: Math.max(0, Math.round(plan.items[0].y - plan.size * 1.1)),
+          y1: Math.min(h, Math.round((plan.items[plan.items.length - 1]?.y ?? h) + plan.size * 0.8)),
+          color: band, alpha: 0.82,
+        };
+        scrim = plan.scrim;
+      } else {
+        plan.colors.type = picked;
+      }
+    }
+
     const svg = svgForPlan(plan);
     const overlay = await sharp(Buffer.from(svg)).png().toBuffer();
     const out = await sharp(imageBuffer)
@@ -387,6 +505,7 @@ export async function applyTypeLayer(imageBuffer, brief, { width, height } = {})
     return {
       buffer: out,
       applied: true,
+      scrim: !!scrim,
       items: plan.items.map((i) => ({ role: i.role, lines: i.lines.length, size: i.size })),
       colors: plan.colors,
     };

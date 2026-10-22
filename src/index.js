@@ -537,6 +537,7 @@ const HAS_OR = !!OPENROUTER_API_KEY;
 let OR_PRIMARY = M("OR_PRIMARY_MODEL");
 let OR_FAST = M("OR_FAST_MODEL");
 let OR_DRAFT = M("OR_DRAFT_MODEL");
+let OR_CREATIVE = M("OR_CREATIVE_MODEL");
 let OR_IMAGE_MODEL = M("OR_IMAGE_MODEL");
 let OR_STT_MODEL = M("OR_STT_MODEL");
 // Graphic-design specialists (on demand, both currently FREE via NovitaAI):
@@ -657,13 +658,15 @@ const POCKET_EXPIRY_MIN = Number(process.env.POCKET_EXPIRY_MIN || 5);
 const POCKET_PAYOUT = Number(process.env.POCKET_PAYOUT || 0.8); // broker payout assumption for stats
 // Deriv execution (Rise/Fall). DEMO default: DERIV_DEMO_TOKEN active.
 // Real money requires BOTH DERIV_REAL_TOKEN and DERIV_LIVE=1 — otherwise a
-// real token is refused at the executor. Auto-execution itself needs
-// POCKET_DERIV_AUTO=1 (default 0 = signals + paper only).
-const DERIV_APP_ID = process.env.DERIV_APP_ID || "1089";
+// real token is refused at the executor. Auto-execution itself stays OFF
+// unless POCKET_DERIV_AUTO=1 is set (explicit opt-in; signals + paper only on
+// default) — the resolved values are logged once at boot so Render logs always
+// show the effective config.
+const DERIV_APP_ID = process.env.DERIV_APP_ID || "";
 const DERIV_LIVE = process.env.DERIV_LIVE === "1";
 const DERIV_DEMO_TOKEN = process.env.DERIV_DEMO_TOKEN || "";
 const DERIV_REAL_TOKEN = process.env.DERIV_REAL_TOKEN || "";
-const POCKET_DERIV_AUTO = process.env.POCKET_DERIV_AUTO !== "0"; // demo auto by default (virtual funds only — real needs DERIV_LIVE=1)
+const POCKET_DERIV_AUTO = process.env.POCKET_DERIV_AUTO === "1";
 const POCKET_DERIV_STAKE = Number(process.env.POCKET_DERIV_STAKE || 1);
 const POCKET_DERIV_MAX_DAY = Number(process.env.POCKET_DERIV_MAX_DAY || 20);
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
@@ -925,6 +928,34 @@ function buildDraftFallbackChain() {
   return [...new Set(chain)];
 }
 
+// The CREATIVE chain: cheap, image-capable models that ANSWER a JSON job.
+// Measured on the real tasks (read a reference image / write a brief), with
+// the prices from the live OpenRouter catalogue ($ per Mtok in/out):
+//
+//   z-ai/glm-5.3-flash        0.004/0.134   brief 1.8s  vision 7.1s  $0.00003/call
+//   google/gemma-3-4b-it     0.040/0.050   brief 1.5s  vision 2.2s  $0.00002/call
+//   google/gemini-2.5-flash  0.300/2.500   brief 6.9s  vision 2.1s  $0.00014/call
+//
+// GLM is first: it is the cheapest AND it is the model the app already uses
+// everywhere else. The token budget matters more than the model: at 900
+// tokens GLM spent the whole budget on reasoning and returned content:""
+// (that was the real cause of every "empty completion"). At 4000 it answers
+// cleanly. Gemma-3-4b is the cheap non-reasoning backstop; Gemini Flash is
+// the expensive last resort (best JSON, but 19x the price).
+function buildCreativeChain() {
+  const chain = [];
+  if (HAS_OR) {
+    if (OR_CREATIVE) chain.push(`openrouter:${OR_CREATIVE}`);
+    if (!chain.includes("openrouter:google/gemma-3-4b-it")) chain.push("openrouter:google/gemma-3-4b-it");
+    if (!chain.includes("openrouter:google/gemini-2.5-flash")) chain.push("openrouter:google/gemini-2.5-flash");
+    if (OR_DRAFT && !chain.includes(`openrouter:${OR_DRAFT}`)) chain.push(`openrouter:${OR_DRAFT}`);
+    if (OR_FAST && !chain.includes(`openrouter:${OR_FAST}`)) chain.push(`openrouter:${OR_FAST}`);
+  }
+  if (MISTRAL_API_KEY) chain.push("mistral-large-latest");
+  if (!chain.length) chain.push(MODELS.conversation);
+  return [...new Set(chain)];
+}
+
 const FALLBACK_CHAINS = {
   vision: buildVisionFallbackChain(MODELS.vision),
   agent: buildFallbackChain(MODELS.agent),
@@ -932,6 +963,7 @@ const FALLBACK_CHAINS = {
   conversation: buildFallbackChain(MODELS.conversation),
   fast: buildFallbackChain(MODELS.fast),
   draft: buildDraftFallbackChain(),
+  creative: buildCreativeChain(),
 };
 // The :free roster rotates — resolve the live list at boot, re-check every 6h.
 await refreshFreeModels();
@@ -943,6 +975,7 @@ function refreshModelConfig() {
   OR_PRIMARY = M("OR_PRIMARY_MODEL");
   OR_FAST = M("OR_FAST_MODEL");
   OR_DRAFT = M("OR_DRAFT_MODEL");
+  OR_CREATIVE = M("OR_CREATIVE_MODEL");
   OR_IMAGE_MODEL = M("OR_IMAGE_MODEL");
   OR_STT_MODEL = M("OR_STT_MODEL");
   OR_DESIGN_MODEL = M("OR_DESIGN_MODEL");
@@ -968,6 +1001,7 @@ function refreshModelConfig() {
   MODELS.fast = process.env.FAST_MODEL || (HAS_OR ? `openrouter:${OR_FAST}` : MISTRAL_FAST_MODEL);
   FALLBACK_CHAINS.vision = buildVisionFallbackChain(MODELS.vision);
   FALLBACK_CHAINS.draft = buildDraftFallbackChain();
+  FALLBACK_CHAINS.creative = buildCreativeChain();
   for (const role of ["agent", "tools", "conversation", "fast"]) {
     FALLBACK_CHAINS[role] = buildFallbackChain(MODELS[role]);
   }
@@ -1009,16 +1043,25 @@ async function chatWithFallback(role, { messages, tools = null, tool_choice = "a
     const model = chain[i];
     try {
       const out = await mistralChat({ model, messages, tools, tool_choice, temperature, max_tokens, retries, timeoutMs });
-      // An EMPTY completion is not a success: it is a model that answered
-      // with nothing (a reasoning model that spent the whole budget on
-      // thinking, or a provider quirk). It must move the chain on to the
-      // next model, exactly like an error does — otherwise the caller gets
-      // "" and silently falls back to a default. A tool call is a real
-      // answer even with empty content.
+      // A REASONING model (glm-5.3-flash, gpt-oss) burns the whole budget on
+      // `reasoning` and can leave `content` EMPTY. Two cases:
+      //   * content empty, reasoning present -> the model DID answer, in the
+      //     wrong field. Move it into `content` so every caller sees it
+      //     (the JSON extractors can still pull the object out of it, and
+      //     when they cannot, the error carries the reply as a snippet).
+      //   * content AND reasoning empty -> a genuine empty completion. It must
+      //     move the chain on to the next model, exactly like an error does.
       const msg = out?.choices?.[0]?.message;
-      const content = typeof msg?.content === "string"
+      const raw = typeof msg?.content === "string"
         ? msg.content
         : (Array.isArray(msg?.content) ? msg.content.map((p) => (typeof p === "string" ? p : (p?.text || ""))).join("") : "");
+      const reasoning = typeof msg?.reasoning === "string" ? msg.reasoning : "";
+      let content = raw;
+      if (!content.trim() && reasoning.trim()) {
+        content = reasoning;
+        if (msg) msg.content = reasoning;
+        console.warn(`[chatWithFallback] role=${role} model=${model} answered in the reasoning field — using it as the content`);
+      }
       if (!content.trim() && !(msg?.tool_calls || []).length) {
         throw new Error("empty completion");
       }
@@ -3521,7 +3564,12 @@ const liveFeed = new LiveFeed({
   backfillBudget: FEED_BACKFILL_BUDGET,
   pocketEnabled: POCKET_ENABLED,
   // Shared rail clients (defined below; arrows resolve at call time, post-boot).
-  makeDerivClient: () => derivClient,
+  // Deriv DATA rail gets its own keyless public-socket client per poll/backfill
+  // cycle (market data needs no token; the feed closes the socket when done —
+  // sharing the trading client here would close the executor's connection).
+  // The public socket covers ALL 89 Deriv markets: synthetics, OTC_* indices,
+  // frx* forex/metals, cry* crypto.
+  makeDerivClient: () => new DerivClient({ log: (...a) => console.log(...a) }),
   makeAlpacaClient: () => alpacaPaper,
   log: (...a) => console.log(...a),
   onCandleClose: (sym, interval) => { try { pocketOnClose(sym, interval); } catch (e) { console.warn("[pocket] close hook:", e.message); } },
@@ -3683,6 +3731,15 @@ if (DERIV_REAL_TOKEN && !DERIV_LIVE) {
 if (!DERIV_DEMO_TOKEN && !DERIV_REAL_TOKEN) {
   console.log("[deriv] no token — signals + paper only. Paste DERIV_DEMO_TOKEN from your Deriv demo account to enable execution.");
 }
+// Effective-config boot line: the Render startup log answers "why did nothing
+// execute?" before any signal ever fires.
+console.log(
+  `[deriv] config: auto=${POCKET_DERIV_AUTO ? "ON" : "off"}`
+  + ` stake=$${POCKET_DERIV_STAKE} cap=${POCKET_DERIV_MAX_DAY}/day`
+  + ` token=${_derivToken ? (DERIV_LIVE && DERIV_REAL_TOKEN && _derivToken === DERIV_REAL_TOKEN ? "REAL" : "DEMO") : "none"}`
+  + ` live=${DERIV_LIVE ? "1" : "0"}`
+  + (_derivToken && !DERIV_APP_ID ? " — WARN: DERIV_APP_ID unset (PAT tokens need a registered app id)" : "")
+);
 if (POCKET_DERIV_AUTO) console.log("[deriv] AUTO-EXECUTION ENABLED — pocket signals will buy Rise/Fall contracts");
 
 // ==================== ALPACA (stocks + crypto spot, paper default) ====================
@@ -3753,8 +3810,16 @@ setInterval(async () => {
 
 // Shared pre-trade gate: portfolio risk layer. Used by /trade AND the
 // scheduler executor so no path to the bridge bypasses account guards.
-function riskGate({ symbol, action, lotSize, entry, sl, balance }) {
-  return portfolioRisk.check({ symbol, action, lotSize, entry, sl, balance: balance || 1000 });
+//
+// F-50: `riskUsdOverride` was NOT in the destructuring, so it was silently
+// DROPPED. Every caller (deriv, alpaca, the pocket bot) carefully computes
+// the real dollar risk of the order it is about to place and passes it in —
+// and it was being thrown away. `check()` then fell back to the pip-table
+// math with `lotSize: 0`, i.e. it priced the risk of a DEFAULT 0.01 lot
+// instead of the actual position, so the per-trade cap was effectively
+// disabled on every Deriv/Alpaca order. Forward it.
+function riskGate({ symbol, action, lotSize, entry, sl, balance, riskUsdOverride = null }) {
+  return portfolioRisk.check({ symbol, action, lotSize, entry, sl, balance: balance || 1000, riskUsdOverride });
 }
 
 // Recurring "everyday analyze XAUUSD" tasks — paper-first by design.
@@ -4059,7 +4124,7 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "get_frit_manual", description: "Get a full reference of every real tool FRIT has, grouped by category, plus how to use the phone's installed-apps list correctly. Call this only if you're unsure what capabilities you have — don't call it for every task.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "delegate_subtasks", description: "Fan OUT independent subtasks to parallel OpenRouter subagents (GLM-5.3-Flash heavy, gpt-oss-20b speed, Qwen draft, zero extra agent turns). Use for: researching several angles at once, drafting + summarizing while you keep driving the phone, comparing options. Args: subtasks = [{task, kind}] where kind is lookup/extract/draft/summarize/research/analyze/code. Max 4 per call. Results come back merged in one response.", parameters: { type: "object", properties: { subtasks: { type: "array", items: { type: "object", properties: { task: { type: "string" }, kind: { type: "string" } }, required: ["task"] } } }, required: ["subtasks"] } } },
   { type: "function", function: { name: "generate_image", description: "Generate an image (default Seedream 5.0 Flash, cheap). ALWAYS ground_scene first for realistic scenes. Needs paid OpenRouter credits.", parameters: { type: "object", properties: { prompt: { type: "string" }, aspect_ratio: { type: "string" }, n: { type: "number" }, model: { type: "string" } }, required: ["prompt"] } } },
-  { type: "function", function: { name: "design_image", description: "Graphic-design generation (posters, UI, infographics, legible text) via Ming Design — FREE. Use when the user asks for design work, NOT photos.", parameters: { type: "object", properties: { prompt: { type: "string" }, output_format: { type: "string" } }, required: ["prompt"] } } },
+  { type: "function", function: { name: "design_image", description: "Graphic-design generation (posters, UI, infographics, legible text) via the configured graphics model (OR_GRAPHICS_MODEL, e.g. Seedream 5.0 Flash). Use when the user asks for design work, NOT photos. Needs paid OpenRouter credits.", parameters: { type: "object", properties: { prompt: { type: "string" }, output_format: { type: "string" } }, required: ["prompt"] } } },
   { type: "function", function: { name: "decompose_design", description: "Decompose a FLAT design image into editable RGBA layers (background + foreground) via Ming Layer — FREE. Needs the image (base64 data URL or http URL) + a layer plan.", parameters: { type: "object", properties: { image: { type: "string" }, prompt: { type: "string" }, layer_plan: { type: "string" } }, required: ["image"] } } },
   { type: "function", function: { name: "generate_video", description: "Generate a short video clip via OpenRouter (veo-3.1-lite 720p 4-8s default). Async: returns job id + polling_url, poll then download. Use for creative content shots.", parameters: { type: "object", properties: { prompt: { type: "string" }, duration: { type: "number" }, aspect_ratio: { type: "string" }, resolution: { type: "string" }, model: { type: "string" } }, required: ["prompt"] } } },
   { type: "function", function: { name: "create_content", description: "Creative mode: turn a video brief/transcript into script + shot list (image/video prompts) + caption. Then call generate_image/generate_video per shot.", parameters: { type: "object", properties: { brief: { type: "string" }, transcript: { type: "string" } } } } },
@@ -6969,39 +7034,39 @@ const designAgentDeps = {
   // retries: 1 + a bounded timeout. The default (3 polite retries that wait
   // out a 429) burned the whole stage budget on one rate-limited provider;
   // with this, a 429 moves to the NEXT MODEL in the chain immediately.
+  // The chain is the CREATIVE one (a model that answers, not one that
+  // reasons) and max_tokens is generous for the reasoning models in it.
   chat: async (messages, opts = {}) => {
-    // One retry: an "empty completion" from a vision model is a provider
-    // hiccup, not a verdict. The stage timeout bounds the total.
     let lastErr = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const out = await chatWithFallback("vision", {
+        const out = await chatWithFallback("creative", {
           messages,
-          max_tokens: opts.max_tokens ?? 900,
+          max_tokens: opts.max_tokens ?? 4000,
           temperature: opts.temperature ?? 0.2,
           retries: 1,
-          timeoutMs: 45_000,
+          timeoutMs: 60_000,
         });
         const c = String(out?.choices?.[0]?.message?.content || "");
         if (c.trim()) return c;
-        lastErr = new Error("the vision model returned an empty completion");
+        lastErr = new Error("the model returned an empty completion");
       } catch (e) {
         lastErr = e;
       }
     }
-    throw lastErr || new Error("the vision model returned nothing");
+    throw lastErr || new Error("the model returned nothing");
   },
   // The BRIEF writer only needs text (the reference DNA is already text), so
-  // it runs on the DRAFT chain. The vision model is reserved for reading the
-  // references and for reviewing the render. Using the vision model for the
-  // brief blew the stage budget on the first live run.
+  // it runs on the CREATIVE chain too. The vision model is reserved for
+  // reading the references and for reviewing the render. Using the vision
+  // model for the brief blew the stage budget on the first live run.
   chatText: async (messages, opts = {}) => {
-    const out = await chatWithFallback("draft", {
+    const out = await chatWithFallback("creative", {
       messages,
-      max_tokens: opts.max_tokens ?? 1400,
+      max_tokens: opts.max_tokens ?? 4000,
       temperature: opts.temperature ?? 0.4,
       retries: 1,
-      timeoutMs: 30_000,
+      timeoutMs: 60_000,
     });
     const c = out?.choices?.[0]?.message?.content;
     return typeof c === "string" ? c : (Array.isArray(c) ? c.map((p) => p?.text || "").join("") : "");
@@ -7118,12 +7183,15 @@ app.post("/creative-suite/director", requireAuth, limitCostly, async (req, res) 
 
     const deps = {
       chat: async (messages, opts = {}) => {
-        const out = await chatWithFallback("vision", {
+        const out = await chatWithFallback("creative", {
           messages,
-          max_tokens: opts.max_tokens ?? 1200,
+          max_tokens: opts.max_tokens ?? 4000,
           temperature: opts.temperature ?? 0.4,
+          retries: 1,
+          timeoutMs: 60_000,
         });
-        return String(out?.choices?.[0]?.message?.content || "");
+        const c = out?.choices?.[0]?.message?.content;
+        return typeof c === "string" ? c : (Array.isArray(c) ? c.map((p) => p?.text || "").join("") : "");
       },
       // Look research: cinematography vocabulary, not layout vocabulary.
       research: async (goal, { seed }) => {

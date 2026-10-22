@@ -23,6 +23,7 @@ import { DukascopyFeed } from "./dukascopy_poll.js";
 import { DerivFeed } from "./deriv_poll.js";
 import { AlpacaFeed } from "./alpaca_feed.js";
 import { isDerivSymbol, marketOf } from "../rails/router.js";
+import { canDerivServe, derivUnderlying } from "../deriv.js";
 
 const NEED_30M = 70;
 const NEED_4H = 40;
@@ -71,7 +72,13 @@ export class LiveFeed {
     // instances) so feeds never construct their own connections.
     this.makeDerivClient = deps.makeDerivClient || (() => { throw new Error("no deriv client"); });
     this.makeAlpacaClient = deps.makeAlpacaClient || (() => { throw new Error("no alpaca client"); });
-    this.deriv = new DerivFeed({ makeClient: this.makeDerivClient, onKline: (s, iv, k) => this.store.ingestKline(s, iv, k), log: this.log, onStatus });
+    this.deriv = new DerivFeed({
+      makeClient: this.makeDerivClient,
+      onKline: (s, iv, k) => this.store.ingestKline(s, iv, k),
+      log: this.log, onStatus,
+      // Pocket-watched symbols get 1m/5m/15m polls too (fixed-expiry engine).
+      isPocket: (s) => (this.pocketWatched?.has(s) ?? false),
+    });
     this.alpaca = new AlpacaFeed({ makeClient: this.makeAlpacaClient, onTick: (s, p, v, t) => this.store.ingestTick(s, p, v, t), log: this.log, onStatus });
 
     this.watched = new Map(); // symbol -> Set(user_id)
@@ -190,7 +197,6 @@ export class LiveFeed {
       && !toAlpaca.includes(s) && !(this.finnhub && FINNHUB_MAP[s] && finnhubLive));
     this.binance.setSymbols(crypto);
     if (this.finnhub) this.finnhub.setSymbols(fhSyms);
-    this.deriv.setSymbols(synth);
     this.alpaca.setSymbols(toAlpaca);
     const prevDuka = [...(this.dukascopy.symbols || [])].sort().join(",");
     this.dukascopy.setSymbols(dukaSyms);
@@ -203,10 +209,27 @@ export class LiveFeed {
       this.log(`[livefeed] dukascopy rerouted: ${nextDuka || "(none)"}`);
     }
     if (dukaSyms.length && !this.dukascopy.running) this.dukascopy.start().catch(() => {});
+    // Free Deriv fallback — the keyless public feed covers ALL 89 Deriv
+    // markets, so every deriv-servable symbol without a live claimant above
+    // (binance/finnhub/duka/alpaca) is served by Deriv; pure synthetics/OTC
+    // are ALWAYS on Deriv (nothing else streams them). Arbitration uses
+    // duka's ACCEPTED list, so a bot-blocked duka never starves a pair it
+    // nominally owns. Overlap is safe: CandleStore dedupes by bucket and
+    // resync re-evaluates every 5 min.
+    const dukaServing = this.dukascopy.status() === "live"
+      ? new Set(this.dukascopy.symbols || [])
+      : new Set();
+    const derivExtra = syms.filter(s => !isDerivSymbol(s) && canDerivServe(s)
+      && !(BINANCE_WS_MAP[s] && binanceLive)
+      && !(this.finnhub && FINNHUB_MAP[s] && finnhubLive)
+      && !dukaServing.has(s)
+      && !toAlpaca.includes(s));
+    const derivSyms = [...synth, ...derivExtra];
+    this.deriv.setSymbols(derivSyms);
     const routing = {};
     for (const s of syms) {
       routing[s] = BINANCE_WS_MAP[s] && binanceLive ? "binance-ws"
-        : isDerivSymbol(s) ? "deriv-poll"
+        : derivSyms.includes(s) ? "deriv-poll"
         : toAlpaca.includes(s) ? (this.alpaca.status() === "live" ? "alpaca-ws" : "alpaca-rest")
         : (this.finnhub && finnhubSymbol(s) && finnhubLive) ? "finnhub-ws"
         : (this.dukascopy.symbols || []).includes(s) ? "dukascopy-poll"
@@ -214,7 +237,7 @@ export class LiveFeed {
     }
     this.routing = routing;
     // (Re)start late feeds when they gain symbols (early-return when running).
-    if (synth.length) await this.deriv.start().catch(() => {});
+    if (derivSyms.length) await this.deriv.start().catch(() => {});
     if (toAlpaca.length) { try { await this.alpaca.start(); } catch { /* ignore */ } }
   }
 
@@ -250,13 +273,15 @@ export class LiveFeed {
 
   async _backfill(sym) {
     if (!this._needsBackfill(sym)) return;
-    // 0. Deriv synthetics: free keyless candle history, no budget involved.
-    if (isDerivSymbol(sym)) {
+    // 0. Deriv: free keyless candle history for synthetics, OTC indices and
+    // every mapped FX/metals/crypto pair — no budget involved.
+    if (canDerivServe(sym)) {
       try {
         const client = this.makeDerivClient();
+        const dSym = derivUnderlying(sym) || sym;
         const [m30, h1] = await Promise.all([
-          client.candles(sym, "30m", 200).catch(() => []),
-          client.candles(sym, "1h", 200).catch(() => []),
+          client.candles(dSym, "30m", 200).catch(() => []),
+          client.candles(dSym, "1h", 200).catch(() => []),
         ]);
         try { client.close(); } catch { /* ignore */ }
         if (m30?.length >= 10) {
@@ -364,6 +389,26 @@ export class LiveFeed {
     const need = spec.filter(([iv, , , , min]) =>
       this.store.candleCount(sym, iv) < min || this.store.stalenessSec(sym, iv) > 3600);
     if (!need.length) return;
+    // Deriv first for Deriv-served markets: free, keyless, and often the only
+    // source (synthetics/OTC indices have no other provider).
+    if (canDerivServe(sym)) {
+      let client = null;
+      try {
+        client = this.makeDerivClient();
+        const dSym = derivUnderlying(sym) || sym;
+        const res = await Promise.all(need.map(([iv]) => client.candles(dSym, iv, 130)));
+        let ok = false;
+        res.forEach((candles, i) => {
+          const [iv, bucket, , , min] = need[i];
+          if (candles?.length >= Math.min(min, 30)) {
+            this._seedInterval(sym, iv, bucket, candles, "deriv");
+            ok = true;
+          }
+        });
+        if (ok) { this.log(`[livefeed] pocket-backfilled ${sym} via deriv (free)`); return; }
+      } catch (e) { this.log(`[livefeed] pocket deriv backfill ${sym} failed: ${e.message}`); }
+      finally { try { client?.close(); } catch { /* ignore */ } }
+    }
     if (this.finnhub && FINNHUB_MAP[sym]) {
       try {
         const res = await Promise.all(need.map(([iv]) => this.finnhub.fetchCandles(sym, iv, 130)));

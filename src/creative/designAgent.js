@@ -327,8 +327,10 @@ export function normalizeBrief(raw, input = {}) {
   if (!typo.some((t) => t.role === "headline")) typo.unshift(base.typography[0]);
   out.typography = typo.sort((a, b) => TYPE_ROLES.indexOf(a.role) - TYPE_ROLES.indexOf(b.role));
 
+  // Keep the brief COMPACT. A reasoning model spends its budget on thinking
+  // first, and a long brief JSON gets truncated before the answer lands.
   const elements = [];
-  for (const e of Array.isArray(r.elements) ? r.elements.slice(0, 8) : []) {
+  for (const e of Array.isArray(r.elements) ? r.elements.slice(0, 6) : []) {
     const description = s(e?.description ?? e, 120);
     if (!description) continue;
     elements.push({
@@ -350,14 +352,23 @@ export function normalizeBrief(raw, input = {}) {
     color_hex: normalizeHex(r.background.color_hex, out.palette[0]?.hex || base.background.color_hex),
   };
 
+  // The copy is typeset VERBATIM, so it is cleaned first: a placeholder
+  // ("Let's celebrate [Name] in style!") or a quoted string would otherwise
+  // be set on the artwork exactly as the model wrote it.
+  const clean = (v) => {
+    const t = s(v, 200);
+    if (!t) return "";
+    if (/\[[^\]]{1,60}\]|\{[^\}]{1,60}\}|<[^>]{1,60}>|\b(?:lorem ipsum|xxx+)\b/i.test(t)) return "";
+    return t.replace(/^["'“”‘’`\s]+/, "").replace(/["'“”‘’`\s]+$/, "").trim();
+  };
   out.copy = {
-    headline: s(input.headline, 120) || s(r.copy?.headline, 120) || base.copy.headline,
-    subhead: s(r.copy?.subhead, 80) || base.copy.subhead,
-    body: s(input.body, 300) || s(r.copy?.body, 300) || base.copy.body,
-    cta: s(input.cta, 80) || s(r.copy?.cta, 80) || base.copy.cta,
+    headline: clean(input.headline) || clean(r.copy?.headline),
+    subhead: clean(r.copy?.subhead),
+    body: clean(input.body) || clean(r.copy?.body),
+    cta: clean(input.cta) || clean(r.copy?.cta),
   };
   out.mood = s(r.mood, 80) || base.mood;
-  out.checks = (Array.isArray(r.checks) ? r.checks.map((c) => s(c, 90)).filter(Boolean) : base.checks).slice(0, 8);
+  out.checks = (Array.isArray(r.checks) ? r.checks.map((c) => s(c, 90)).filter(Boolean) : base.checks).slice(0, 5);
   out.generation_prompt = s(r.generation_prompt, 900);
   out.negative_prompt = s(r.negative_prompt, 300) || "gibberish text, watermark, lorem ipsum, cluttered collage, blurry type, extra fingers, low contrast";
   return out;
@@ -599,7 +610,7 @@ export async function describeReference(ref, goal, { chat, fetchImpl, loaded = n
       { type: "text", text: prompt },
       { type: "image_url", image_url: { url: image } },
     ] },
-  ], { max_tokens: 900, temperature: 0.2 });
+  ], { max_tokens: 3000, temperature: 0.2 });
   const raw = parseJsonLoose(out);
   const split = splitDNA(raw);
   return { ref, dna: raw, structure: split.structure, content: split.content, palette: split.palette, typography: split.typography, mood: split.mood };
@@ -662,7 +673,7 @@ export async function synthesizeBrief(goal, input = {}, references = [], { chat 
     { role: "system", content: system },
     { role: "user", content: user },
   ];
-  const first = parseJsonLoose(await chat(messages, { max_tokens: 1400, temperature: 0.4 }));
+  const first = parseJsonLoose(await chat(messages, { max_tokens: 3000, temperature: 0.4 }));
   if (first && (first.palette || first.layout || first.copy || first.typography)) return first;
   // Some models answer with prose instead of JSON. One corrective retry is much
   // cheaper than silently shipping the default brief (Week 6: that happened).
@@ -671,7 +682,7 @@ export async function synthesizeBrief(goal, input = {}, references = [], { chat 
     ...messages,
     { role: "assistant", content: "(reply was not JSON)" },
     { role: "user", content: "Return ONLY the JSON object described above — no prose, no markdown, no explanation." },
-  ], { max_tokens: 1400, temperature: 0 }));
+  ], { max_tokens: 3000, temperature: 0 }));
   if (retry && (retry.palette || retry.layout || retry.copy || retry.typography)) return retry;
   // Neither reply was usable. THROW, so the caller falls back to the reference
   // DNA and says so. Returning {} here silently shipped a default brief that
@@ -707,10 +718,19 @@ export async function verifyRender(render, brief, { chat, fetchImpl, threshold =
     body: typesetString(brief, "body"),
     cta: typesetString(brief, "cta"),
     alignment: brief?.layout?.alignment,
+    // Judge the TYPE BLOCK, not the artwork's focal point. The renderer was
+    // asked for a background plate, so the artwork's own composition is not
+    // the brief's alignment — the type we set on top is.
+    alignment_note: "the copy block is set flush " + (brief?.layout?.alignment || "left") + " within the safe margins; judge the type, not the artwork's focal point",
     // The brief's px are relative to a 1080-wide canvas; the render may be a
     // different size. Without this the reviewer calls a correctly scaled
     // headline "too small".
     type_base_canvas_px: 1080,
+    type_size_note: "the sizes below are px on a 1080-wide canvas; the render canvas may differ, so judge them PROPORTIONALLY (96px headline = ~8.9% of the canvas width)",
+    // The type is set with the fonts the render host actually has
+    // (DejaVu Sans / DejaVu Serif / DejaVu Sans Mono). Judge legibility,
+    // hierarchy and weight — not whether it is literally the named family.
+    type_font_note: "the copy is set in the host's available families (DejaVu Sans / DejaVu Serif / DejaVu Sans Mono); judge legibility, weight and hierarchy, not the exact typeface named in the brief",
     typography: (brief?.typography || []).map((t) => `${t.role}:${t.font} ${t.size_px}px`),
     checks: brief?.checks || [],
   };
@@ -725,7 +745,7 @@ export async function verifyRender(render, brief, { chat, fetchImpl, threshold =
       ].filter(Boolean).join("\n") },
       { type: "image_url", image_url: { url: image } },
     ] },
-  ], { max_tokens: 600, temperature: 0 });
+  ], { max_tokens: 4000, temperature: 0 });
 
   let text = await ask();
   let parsed = parseJsonLoose(text);
@@ -781,7 +801,7 @@ async function withTimeout(promise, ms, label) {
 export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   const now = deps.now || (() => Date.now());
   const t0 = now();
-  const totalMs = opts.totalMs ?? 150_000;
+  const totalMs = opts.totalMs ?? 210_000;
   const maxAttempts = input.verify === false ? 1 : Math.min(3, Math.max(1, Number(input.maxAttempts) || 2));
   const maxRefs = Math.min(4, Math.max(0, Number(input.max_refs ?? 3)));
   const minRefs = Math.min(maxRefs, Math.max(0, Number(input.min_refs ?? 3)));
@@ -838,7 +858,10 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
         // The reference transport fetches the bytes ONCE, browser-like, and
         // falls back to a public origin-side proxy when the CDN refuses us.
         const loaded = deps.loadReference ? await deps.loadReference(ref) : null;
-        const out = await withTimeout(describe(ref, goal, { loaded }), Math.min(25_000, left() * 0.3), "reference read");
+        // The reference reads run in PARALLEL, so a generous per-read cap
+        // costs no wall-clock time — and a timeout is EXPENSIVE: it throws the
+        // read away and the agent falls back to a default brief.
+        const out = await withTimeout(describe(ref, goal, { loaded }), Math.min(45_000, Math.max(15_000, left() * 0.35)), "reference read");
         return out ? { ...out, ref_image: loaded?.url || null, ref_id: loaded?.id || null } : null;
       } catch (e) {
         warnings.push(`reference unreadable (${s(ref, 80)}): ${e.message}`);
@@ -869,7 +892,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
     // extracted), so it runs on the fast model. The vision model is reserved
     // for reading references and reviewing the render.
     const synth = deps.synthesizeBrief || ((g, i, r) => synthesizeBrief(g, i, r, { chat: deps.chatText || deps.chat }));
-    raw = await withTimeout(synth(goal, input, diverse), Math.min(60_000, Math.max(20_000, left() * 0.6)), "brief synthesis");
+    raw = await withTimeout(synth(goal, input, diverse), Math.min(75_000, Math.max(30_000, left() * 0.6)), "brief synthesis");
     brief = normalizeBrief(raw, input);
   } catch (e) {
     // The model timed out or failed. Do NOT throw the references away: build
@@ -978,7 +1001,7 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
     }
     try {
       const verify = deps.verifyRender || ((r, b) => verifyRender(r, b, { chat: deps.chat, fetchImpl: deps.fetchImpl, threshold }));
-      verification = await withTimeout(verify(render.image_url || render.image_b64, brief), Math.min(45_000, Math.max(10_000, left() - 1_000)), "verification");
+      verification = await withTimeout(verify(render.image_url || render.image_b64, brief), Math.min(45_000, Math.max(12_000, left() - 1_000)), "verification");
     } catch (e) {
       warnings.push(`verification failed: ${e.message}`);
       verification = { score: 0, pass: false, issues: [], threshold, checked: false };

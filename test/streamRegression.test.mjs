@@ -242,3 +242,25 @@ test("BUG 1 (guard): the provider reader supports BOTH web and Node stream bodie
   assert.doesNotMatch(src, /await res\.json\(\)/, "must not fall back to buffering the whole body");
 });
 
+// ---------------------------------------------------------------------------
+// F-50 guard: the shared pre-trade gate must forward the dollar-risk override.
+//
+// This is a WIRING bug in index.js, which is a 9,000-line module with side
+// effects on import and so cannot be unit tested directly. The bug: every
+// caller computed the real dollar risk of the order and passed it in as
+// `riskUsdOverride`, and `riskGate()` did not destructure it — so it was
+// silently dropped and the per-trade cap was priced against a default 0.01
+// lot instead of the actual position size.
+//
+// A source guard is the only thing that can pin this, so that is what it is.
+// ---------------------------------------------------------------------------
+
+test("F-50 (guard): riskGate forwards riskUsdOverride to the risk layer", () => {
+  const src = readFileSync(fileURLToPath(new URL("../src/index.js", import.meta.url)), "utf8");
+  const m = src.match(/function riskGate\(\{([^}]*)\}\)\s*\{([\s\S]{0,400}?)\n\}/);
+  assert.ok(m, "riskGate() must exist in index.js");
+  const [, params, body] = m;
+  assert.match(params, /riskUsdOverride/, "riskGate must accept riskUsdOverride");
+  assert.match(body, /riskUsdOverride/, "riskGate must pass riskUsdOverride on to portfolioRisk.check()");
+});
+

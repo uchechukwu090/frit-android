@@ -37,6 +37,11 @@ export function creditSpread({ S, legs, contracts = 1, dte = null }) {
   const credit = short.mid - long.mid;
   if (!(credit > 0)) return null; // debit, not a credit spread
   const maxLoss = width - credit;
+  // F-50: ironCondor has always guarded `maxLoss > 0`; creditSpread did not.
+  // A credit wider than the strike width produced maxLoss -1.5, a NEGATIVE
+  // R:R and maxLossDollars -150 — a "risk −$150" signal. The scanner builds
+  // spreads from raw chain quotes, so a stale/mispriced chain can reach this.
+  if (!(maxLoss > 0)) return null; // credit wider than the risk: not a valid defined-risk spread
   const breakeven = isPut ? short.strike - credit : short.strike + credit;
   return {
     kind: isPut ? "bull_put_spread" : "bear_call_spread",
@@ -86,7 +91,10 @@ export function ironCondor({ S, putShort, putLong, callShort, callLong, putCredi
  */
 export function netCredit(structure, costSpec = { perContract: 0.65 }) {
   if (!structure) return null;
-  const perContract = Number(costSpec.perContract) || 0;
+  // F-50: a NEGATIVE per-contract fee was used as-is, so fees INCREASED the
+  // net credit (a $150 credit minus a -$10 fee = $170 net) and the gate then
+  // said "ok: true". Costs can only ever reduce a credit.
+  const perContract = Math.max(0, Number(costSpec.perContract) || 0);
   const legs = structure.legs.length;
   const fees = perContract * legs * (structure.contracts || 1);
   return structure.maxProfitDollars - fees;
@@ -129,7 +137,10 @@ export function priceStructureGreeks(legs, { T, r = 0, q = 0 }) {
  * structure's own IV (sigma) — a ranking heuristic, not a forecast.
  */
 export function probProfit({ S, breakeven, sigma, T, direction }) {
-  if (!(S > 0) || !(sigma > 0) || !(T > 0)) return null;
+  // F-50: breakeven was NOT validated, so a missing one produced NaN (not
+  // null) — a NaN silently compares false against everything, so a caller
+  // checking `prob > 0` would read it as "no edge" instead of "no data".
+  if (!(S > 0) || !(sigma > 0) || !(T > 0) || !(breakeven > 0)) return null;
   const z = Math.log(breakeven / S) / (sigma * Math.sqrt(T));
   return direction === "above" ? 1 - normCdf(z) : normCdf(z);
 }

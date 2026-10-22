@@ -16,6 +16,13 @@ export const MODEL_DEFAULTS = {
   OR_PRIMARY_MODEL: "z-ai/glm-5.3-flash",
   OR_FAST_MODEL: "openai/gpt-oss-20b",
   OR_DRAFT_MODEL: "deepseek/deepseek-v4-flash",
+  // The creative stages (reading a reference, writing the brief, reviewing
+  // the render) are JSON jobs. They used to run on a reasoning model with a
+  // 900-token budget, which it spent entirely on reasoning and then returned
+  // content:"" (measured). With a 4000-token budget the SAME model answers in
+  // 1.8s / 7s and costs $0.00003 a call — cheaper than anything else on the
+  // roster and the same model the app already uses everywhere else.
+  OR_CREATIVE_MODEL: "z-ai/glm-5.3-flash",
   OR_IMAGE_MODEL: "bytedance-seed/seedream-5-0-flash",
   OR_STT_MODEL: "openai/whisper-large-v3",
   // Week 6: the old default (inclusionai/ming-image-0.1-design) is NO LONGER
@@ -39,6 +46,7 @@ export const MODEL_META = {
   OR_PRIMARY_MODEL: { label: "Primary brain", hint: "chat, tools, agent, vision" },
   OR_FAST_MODEL: { label: "Fast model", hint: "greetings, verifier, grounding" },
   OR_DRAFT_MODEL: { label: "Draft model", hint: "cheap bulk reasoning" },
+  OR_CREATIVE_MODEL: { label: "Creative model", hint: "reference reading + briefs — z-ai/glm-5.3-flash" },
   OR_IMAGE_MODEL: { label: "Image model", hint: "$0.018/img Seedream Flash class" },
   OR_STT_MODEL: { label: "Speech-to-text", hint: "transcribe + subtitles" },
   OR_DESIGN_MODEL: { label: "Design model", hint: "legible-text graphics" },

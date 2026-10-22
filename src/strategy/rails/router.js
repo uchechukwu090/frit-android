@@ -12,8 +12,14 @@
 // missing rails degrade to paper mode, never to a different live rail.
 // ============================================================================
 
-// Deriv synthetic families (from Deriv active_symbols taxonomy).
-const DERIV_RE = /^(R_\d+|1HZ\d+V?|BOOM\d+N|CRASH\d+N|STPRNG\d*|RDBULL\d*|RDBEAR\d*|JD\d+|GDA\d+|XPT\d+|STPRNG)$/;
+// Deriv families — refreshed Oct 2026 against the new "Options" API
+// (89 live codes). Own synthetics: most BOOM/CRASH codes dropped the trailing
+// N (BOOM50, BOOM500, BOOM1000...; only 150N/300N keep it), stpRNG* is
+// lowercase-sourced (canonicalized here), RDBULL/RDBEAR lost their numeric
+// suffix, RB100/RB200 and WLD*** baskets are new. Deriv's native quote codes
+// route here too (frx* forex/metals, cry* crypto, OTC_* derived indices) so a
+// user can watch any Deriv market on the free public rail with no bridge.
+const DERIV_RE = /^(R_\d+|1HZ\d+V|BOOM\d+N?|CRASH\d+N?|STPRNG\d*|RDBULL\d*|RDBEAR\d*|JD\d+|RB\d+|WLD[A-Z]{3}|OTC_[A-Z0-9]+|(FRX|CRY)[A-Z0-9]{3,20})$/;
 
 // Broker MT5 symbol aliases -> canonical engine symbol. CFD names differ per
 // broker (US30 vs DJ30 vs DowJones). Unknown symbols pass through unchanged.
