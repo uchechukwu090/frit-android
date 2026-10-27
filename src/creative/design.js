@@ -45,7 +45,11 @@ export function buildDesignPrompt({ template, headline, body, cta, palette, bran
 
 function tplLine(t) {
   if (!t) return "Professional graphic design, intentional composition.";
-  return `Graphic design (${t.name}): ${t.hint}. Zones in play: ${(t.zones || []).join(", ")}.`;
+  const zones = Array.isArray(t.zones) ? t.zones : [];
+  const zonesText = zones.length
+    ? `Layout zones: ${zones.join(", ")}. Use these as placement anchors — headline zone first, hero/imagery zone, body zone, CTA zone, logo/monogram zone — and keep each zone's job distinct. Never let copy drift into a zone meant for imagery.`
+    : "No layout zones declared — use a balanced editorial grid.";
+  return `Graphic design (${t.name}): ${t.hint}. ${zonesText}`;
 }
 
 export function variationCount(n) {

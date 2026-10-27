@@ -47,6 +47,16 @@ export function isTypeSpecialist(model) {
   return familyOf(model) === "recraft";
 }
 
+/**
+ * Aspect ratios a model family accepts, or null for "no known restriction".
+ * The app's Generate/Design screens render ONLY these chips, so it must never
+ * show a ratio the request builder is going to silently snap away from.
+ */
+export function aspectsFor(model) {
+  const allowed = ASPECTS[familyOf(model)];
+  return allowed ? [...allowed] : null;
+}
+
 /** Snap an aspect ratio to one the model family actually accepts. */
 export function snapAspect(model, aspect, fallback = "1:1") {
   const allowed = ASPECTS[familyOf(model)];

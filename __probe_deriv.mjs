@@ -1,17 +1,21 @@
-// Probe the live Deriv API (anonymous - no token needed for these calls)
-// to find which symbols actually offer MULTUP/MULTDN.
 import WebSocket from "ws";
 
-const WS_URL = "wss://ws.derivws.com/websockets/v3";
+const HOSTS = [
+  "wss://ws.binaryws.com/websockets/v3",
+  "wss://ws.derivws.com/websockets/v3",
+  "wss://ws.deriv.com/websockets/v3",
+];
+
 let reqId = 0;
 const pending = new Map();
 let ws;
 
-function connect() {
+function connect(url) {
   return new Promise((resolve, reject) => {
-    ws = new WebSocket(`${WS_URL}?app_id=1089`);
-    ws.on("open", () => resolve());
-    ws.on("error", reject);
+    try { ws = new WebSocket(`${url}?app_id=1089`); } catch (e) { return reject(e); }
+    const t = setTimeout(() => reject(new Error("connect timeout")), 15000);
+    ws.on("open", () => { clearTimeout(t); resolve(); });
+    ws.on("error", (e) => { clearTimeout(t); reject(e); });
     ws.on("message", (d) => {
       let m; try { m = JSON.parse(String(d)); } catch { return; }
       const id = m.req_id;
@@ -23,33 +27,38 @@ function call(obj, timeout = 20000) {
   return new Promise((resolve) => {
     const id = ++reqId;
     pending.set(id, resolve);
-    ws.send(JSON.stringify({ ...obj, req_id: id }));
+    try { ws.send(JSON.stringify({ ...obj, req_id: id })); } catch { resolve({ error: { message: "send failed" } }); return; }
     setTimeout(() => { if (pending.has(id)) { pending.delete(id); resolve({ error: { message: "timeout" } }); } }, timeout);
   });
 }
 
-const TARGETS = ["EURUSD", "XAUUSD", "XAGUSD", "GBPUSD", "USDJPY", "AUDUSD",
-  "frxEURUSD", "frxXAUUSD", "frxXAGUSD", "R_100", "1HZ100V", "OTC_DJI"];
+let connected = null;
+for (const h of HOSTS) {
+  try { await connect(h); connected = h; console.log("connected:", h); break; }
+  catch (e) { console.log("failed:", h, e.message.slice(0, 60)); }
+}
+if (!connected) { console.log("NO DERIV REACHABILITY FROM THIS HOST"); process.exit(2); }
 
-await connect();
+const TARGETS = ["EURUSD", "XAUUSD", "XAGUSD", "GBPUSD", "USDJPY", "frxEURUSD", "frxXAUUSD", "frxXAGUSD", "R_100", "1HZ100V"];
 
 const basic = await call({ active_symbols: "brief", product_type: "basic" });
 const full = await call({ active_symbols: "brief" });
 const basicSet = new Set(basic?.active_symbols || []);
 const fullSet = new Set(full?.active_symbols || []);
-console.log("basic count:", basicSet.size, " full count:", fullSet.size);
-console.log("basic has EURUSD?", basicSet.has("EURUSD"), " frxEURUSD?", basicSet.has("frxEURUSD"));
-console.log("full  has EURUSD?", fullSet.has("EURUSD"), " frxEURUSD?", fullSet.has("frxEURUSD"));
+console.log("basic count:", basicSet.size, "| full count:", fullSet.size);
+console.log("basic has EURUSD?", basicSet.has("EURUSD"), "| frxEURUSD?", basicSet.has("frxEURUSD"));
+console.log("full  has EURUSD?", fullSet.has("EURUSD"), "| frxEURUSD?", fullSet.has("frxEURUSD"));
+console.log("full  has XAUUSD?", fullSet.has("XAUUSD"), "| frxXAUUSD?", fullSet.has("frxXAUUSD"));
 
-console.log("\n--- contracts_for: MULT availability ---");
+console.log("\n--- contracts_for: MULT vs Rise/Fall availability ---");
 for (const sym of TARGETS) {
   const r = await call({ contracts_for: sym });
   if (r.error) { console.log(`${sym.padEnd(12)} ERROR ${r.error.message}`); continue; }
   const avail = r.contracts_for?.available || [];
   const types = new Set(avail.flatMap(a => [a.contract_type, ...(a.supported_contract_types || [])].filter(Boolean)));
-  const hasMult = types.has("MULTUP") && types.has("MULTDN");
-  const hasRf = types.has("CALL") && types.has("PUT");
-  console.log(`${sym.padEnd(12)} MULT=${hasMult ? "YES" : "no "}  RiseFall=${hasRf ? "YES" : "no "}  types=[${[...types].slice(0, 8).join(",")}]`);
+  console.log(`${sym.padEnd(12)} MULT=${types.has("MULTUP") && types.has("MULTDN") ? "YES" : "no "}` +
+    `  RiseFall=${types.has("CALL") && types.has("PUT") ? "YES" : "no "}` +
+    `  [${[...types].slice(0, 7).join(",")}]`);
 }
-ws.close();
+try { ws.close(); } catch { }
 process.exit(0);

@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 
 import { PortfolioRisk, usdExposureSign, groupOf, riskLimits } from "../src/strategy/risk.js";
-import { applyCosts, costInPrice, getSymbolCost, costToUsd } from "../src/strategy/costs.js";
+import { applyCosts, costInPrice, getSymbolCost, costToUsd, resetCostCache } from "../src/strategy/costs.js";
 import { PullbackJournal } from "../src/strategy/journal.js";
 import { PositionMonitor } from "../src/strategy/position_monitor.js";
 import { ensureBotsTables, saveBot, getBots, tickBots, scalpingAnalyze, BOT_DEFS } from "../src/strategy/bots.js";
@@ -334,6 +334,14 @@ test("bots: the daily cap counts EVERY placed trade, pocket CALL/PUT included (W
   let executions = 0;
   const deps = {
     db,
+    // R_100 is an RNG synthetic, so the pocket bot now reads it from the
+    // generator-aware engine instead of the EMA candle engine. Both deps are
+    // stubbed here so the test keeps measuring what it is named for: the cap.
+    analyzeSynth: () => ({
+      decision: "BUY", confidence: 90, entry: 100, sl: 95, tp: 110, rr: 2,
+      family: "VOL", reasons: ["test"],
+    }),
+    fetchCloses: async () => Array.from({ length: 80 }, (_, i) => 100 + i),
     pocketScan: () => ({ decision: "CALL", confidence: 90, entryRef: 100, reasons: ["test"] }),
     executor: async () => { executions++; return { mode: "paper" }; },
     storeSignal: () => {},
@@ -387,17 +395,41 @@ test("bots: scalping analysis warms up, respects the confidence floor and prices
   assert.equal(warm.decision, "WAIT");
   assert.match(warm.reasons.join(" "), /warming up/);
 
-  // 60 rising candles with a strong last bar -> BUY with SL below and TP above.
+  // 60 rising candles with a strong last bar.
   const candles = [];
   for (let i = 0; i < 60; i++) {
     const base = 1.1 + i * 0.001;
     candles.push({ open: base, high: base + 0.002, low: base - 0.002, close: base + 0.0015, volume: 100 });
   }
-  const up = scalpingAnalyze("EURUSD", candles, "5m");
+
+  // Under the DEFAULT retail cost table (1.6-pip EURUSD spread + 0.5-pip
+  // slippage each way), that 2xATR target does not survive friction: the cost
+  // gate refuses it, which is the whole point of the gate. Asserted first so
+  // the test pins the refusal, not just the happy path.
+  const retail = scalpingAnalyze("EURUSD", candles, "5m");
+  assert.equal(retail.decision, "WAIT");
+  assert.equal(retail.costs.weak, true, "retail friction knocks the fixed 1.33 gross RR under the weak floor");
+  assert.match(retail.reasons.join(" "), /cost penalty/);
+  assert.match(retail.reasons.join(" "), /below 55 floor/);
+
+  // The SAME setup on ECN-grade costs is priced normally — proving the fixture
+  // is a real setup and only the friction was standing in its way.
+  const prev = process.env.COST_OVERRIDES_JSON;
+  let up;
+  try {
+    process.env.COST_OVERRIDES_JSON = JSON.stringify({ EURUSD: { spread: 0.00002, slippage: 0.00001 } });
+    resetCostCache();
+    up = scalpingAnalyze("EURUSD", candles, "5m");
+  } finally {
+    if (prev === undefined) delete process.env.COST_OVERRIDES_JSON;
+    else process.env.COST_OVERRIDES_JSON = prev;
+    resetCostCache();
+  }
   assert.equal(up.decision, "BUY");
   assert.ok(up.sl < up.entry, "SL below entry for a long");
   assert.ok(up.tp1 > up.entry, "TP above entry for a long");
   assert.ok(up.confidence >= 55 && up.confidence <= 75, `confidence ${up.confidence} out of the documented band`);
+  assert.ok(up.rr <= up.rrGross, "even cheap costs come off the published R-R");
 });
 
 // ===========================================================================

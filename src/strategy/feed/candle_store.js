@@ -191,16 +191,20 @@ export class CandleStore {
   }
 
   // Engine-ready array, oldest -> newest: { open, high, low, close, volume, time }
+  // n = the NEWEST n bars. (This used to SELECT ASC LIMIT n, which — with
+  // KEEP_CLOSED rows in the table — handed back the OLDEST window and silently
+  // cut off the most recent bars: signals read hours-stale candles. Order DESC
+  // first, then reverse, so every caller gets the live edge.)
   getCandles(symbol, interval, n = 200) {
     const sym = String(symbol || "").toUpperCase();
     let rows = [];
     try {
       rows = this.db.prepare(`
         SELECT open_time AS t, o, h, l, c, v FROM feed_candles
-        WHERE symbol = ? AND interval = ? ORDER BY open_time ASC LIMIT ?
+        WHERE symbol = ? AND interval = ? ORDER BY open_time DESC LIMIT ?
       `).all(sym, interval, n);
     } catch { return []; }
-    const out = rows.map(r => ({
+    const out = rows.reverse().map(r => ({
       open: r.o, high: r.h, low: r.l, close: r.c, volume: r.v || 0, time: r.t,
     }));
     // Append the still-forming candle so the engine always sees the live edge.

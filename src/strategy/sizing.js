@@ -97,6 +97,44 @@ export function kellyFraction({ winRate = 0.45, rr = 1.5, profile = DEFAULT_RISK
 }
 
 /**
+ * Dollar risk of `lot` lots over the entry→stop distance, priced from the
+ * server's pip table. 0 when the symbol has no pip row (unknown risk).
+ */
+export function riskUsdForLot({ symbol, entry, sl, lot, pipConfig = {} } = {}) {
+  const cfg = pipConfig[String(symbol || "").toUpperCase()];
+  const e = Number(entry), s = Number(sl), l = Number(lot);
+  if (!cfg || !(e > 0) || !(s > 0) || !(l > 0) || e === s) return 0;
+  const dist = Math.abs(e - s);
+  const risk = cfg.pipSize && cfg.pipValue
+    ? (dist / cfg.pipSize) * cfg.pipValue * l
+    : dist * 10 * l;
+  return Number(risk.toFixed(2));
+}
+
+/**
+ * FIXED-lot sizing: the user pinned the lot, so nobody re-derives it.
+ * This is the "auto lot size" checkbox being OFF in the app — the whole point
+ * is that the 0.01 hard cap disappears and the number the user typed is the
+ * number that is sent. The per-trade risk gate still runs afterwards.
+ */
+export function fixedLotSizing({
+  symbol, entry, sl, lot, pipConfig = {}, minLot = 0.01, maxLot = 100,
+} = {}) {
+  const n = Number(lot);
+  const raw = Number.isFinite(n) && n > 0 ? n : minLot;
+  const fixed = Number(Math.min(maxLot, Math.max(minLot, Math.round(raw * 100) / 100)).toFixed(2));
+  const riskUsd = riskUsdForLot({ symbol, entry, sl, lot: fixed, pipConfig });
+  return {
+    lotSize: fixed,
+    riskUsd,
+    fraction: null,
+    mode: "fixed",
+    reason: `fixed ${fixed} lot(s) from your account settings (auto lot engine off)`
+      + (riskUsd > 0 ? ` — risking about $${riskUsd.toFixed(2)} at this stop` : ""),
+  };
+}
+
+/**
  * Lot size for a setup.
  * @param symbol    pair
  * @param balance   account balance the user entered (the sizing base)

@@ -402,7 +402,9 @@ function svgForPlan(plan) {
     const lines = item.lines && item.lines.length ? item.lines : [item.text];
     const step = item.size * (item.leading || 1.1);
     lines.forEach((line, i) => {
-      const dy = i === 0 ? 0 : step;
+      // Line N sits N steps below line 0. (It used to be `step` for every
+      // line after the first, so lines 2+ were drawn on top of each other.)
+      const dy = i * step;
       parts.push(
         `<text x="${item.x}" y="${item.y + dy}" font-family="${family}" font-size="${item.size}" ` +
         `font-weight="${item.weight}" letter-spacing="${item.tracking || 0}" ` +
@@ -493,8 +495,10 @@ export async function applyTypeLayer(imageBuffer, brief, { width, height } = {})
       // image model leaves when it ignores "no text in the image".
       const band = plan.colors.type;
       const scrimItems = needy.map((i) => i);
-      const y0 = Math.max(0, Math.round(Math.min(...scrimItems.map((i) => i.y)) - plan.size * 1.2));
-      const y1 = Math.min(h, Math.round(Math.max(...scrimItems.map((i) => i.y)) + plan.size * 0.9));
+      // (`plan.size` does not exist — it made y0/y1 NaN, which broke the SVG
+      // and silently dropped the whole type layer. Use the items' own sizes.)
+      const y0 = Math.max(0, Math.round(Math.min(...scrimItems.map((i) => i.y - i.size * 1.2))));
+      const y1 = Math.min(h, Math.round(Math.max(...scrimItems.map((i) => i.y + Math.max(0, (i.lines?.length || 1) - 1) * i.size * (i.leading || 1.1) + i.size * 0.9))));
       plan.scrim = { y0, y1, color: band, alpha: 0.82 };
       scrim = plan.scrim;
       // Every line now sits on the band, so re-pick against the band colour.

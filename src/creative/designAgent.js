@@ -249,6 +249,10 @@ function s(value, max = 200) {
 
 /** A brief that is ALWAYS complete, whatever the model returned. */
 export function defaultBrief(input = {}) {
+  // `free_brief` marks the headline field as a DESCRIPTION of the piece rather
+  // than the copy to typeset. Without this, the user's whole paragraph was set
+  // as the poster headline.
+  const headline = input.free_brief ? "" : input.headline;
   return {
     canvas: { aspect_ratio: s(input.aspect_ratio, 12) || DEFAULT_ASPECT, usage: s(input.usage, 40) || "social graphic" },
     layout: { grid: "rule-of-thirds", margins_pct: 8, alignment: "left", focal: "upper-left third", reading_order: "headline → subhead → body → cta" },
@@ -264,7 +268,7 @@ export function defaultBrief(input = {}) {
     ],
     imagery: { description: "", treatment: "clean cut-out, subtle shadow", placement: "right half" },
     background: { description: "flat brand color with a soft paper texture", color_hex: "#F4EFE4" },
-    copy: { headline: s(input.headline, 120), subhead: "", body: s(input.body, 300), cta: s(input.cta, 80) },
+    copy: { headline: s(headline, 200), subhead: "", body: s(input.body, 300), cta: s(input.cta, 80) },
     mood: s(input.mood, 80) || "confident, premium, uncluttered",
     checks: ["headline legible and spelled exactly", "palette matches the brief", "no gibberish text"],
   };
@@ -361,8 +365,9 @@ export function normalizeBrief(raw, input = {}) {
     if (/\[[^\]]{1,60}\]|\{[^\}]{1,60}\}|<[^>]{1,60}>|\b(?:lorem ipsum|xxx+)\b/i.test(t)) return "";
     return t.replace(/^["'“”‘’`\s]+/, "").replace(/["'“”‘’`\s]+$/, "").trim();
   };
+  const userHeadline = input.free_brief ? "" : clean(input.headline);
   out.copy = {
-    headline: clean(input.headline) || clean(r.copy?.headline),
+    headline: userHeadline || clean(r.copy?.headline),
     subhead: clean(r.copy?.subhead),
     body: clean(input.body) || clean(r.copy?.body),
     cta: clean(input.cta) || clean(r.copy?.cta),
@@ -657,9 +662,17 @@ export async function synthesizeBrief(goal, input = {}, references = [], { chat 
     '"copy":{"headline":"...","subhead":"...","body":"...","cta":"..."},',
     '"mood":"...","checks":["..."],"negative_prompt":"..."}',
   ].join("\n");
+  // How the user's words are used depends on WHAT they are:
+  //   free brief  -> the text is DIRECTION; the brief writer writes the copy
+  //   headline    -> the text IS the copy and must be used verbatim
+  // Treating a free brief as must-use copy is what made the agent set a whole
+  // paragraph as the headline.
+  const freeBriefText = input.free_brief ? s(input.headline || input.goal, 1200) : "";
   const user = [
-    `GOAL: ${s(goal, 400)}`,
-    input.headline ? `MUST-USE HEADLINE: "${s(input.headline, 120)}"` : "",
+    `GOAL: ${s(goal, 1200)}`,
+    freeBriefText
+      ? `USER'S OWN WORDS (a description of what they want — treat as DIRECTION, not as copy; you write the actual headline, body and CTA): "${freeBriefText}"`
+      : (input.headline ? `MUST-USE HEADLINE: "${s(input.headline, 200)}"` : ""),
     input.body ? `MUST-USE BODY: "${s(input.body, 300)}"` : "",
     input.cta ? `MUST-USE CTA: "${s(input.cta, 80)}"` : "",
     input.palette ? `USER COLORS (honour these): ${s(input.palette, 120)}` : "",
@@ -667,6 +680,7 @@ export async function synthesizeBrief(goal, input = {}, references = [], { chat 
     input.brand?.colors?.length ? `BRAND COLORS: ${input.brand.colors.join(", ")}` : "",
     input.brand?.font ? `BRAND FONT: ${s(input.brand.font, 60)}` : "",
     input.style ? `STYLE DIRECTION: ${s(input.style, 160)}` : "",
+    input.template ? `TEMPLATE: ${s(input.template.id, 40)} — ${s(input.template.name, 80)}${Array.isArray(input.template.zones) && input.template.zones.length ? `; layout zones: ${input.template.zones.join(", ")} (use these as placement anchors, keep each zone's job distinct)` : ""}` : "",
     refBlock ? `\n${refBlock}\n` : "\n(no references available — design from the goal alone)\n",
   ].filter(Boolean).join("\n");
   const messages = [
@@ -811,7 +825,9 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   const left = () => Math.max(0, totalMs - (now() - t0));
   const mark = (stage) => stages.push({ stage, ms: now() - t0 });
 
-  const goal = s(input.goal || input.prompt || input.headline, 400);
+  // A free-form brief is prose, not a headline: 400 chars truncated the tail of
+  // a real description before it ever reached the brief writer.
+  const goal = s(input.goal || input.prompt || input.headline, 1200);
   if (!goal) throw new Error("goal required");
 
   // The SEED. Everything that could repeat — the style token in the query,
@@ -854,15 +870,44 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   // Read in small batches, not all at once: five concurrent vision calls
   // congest the provider (they time out) and every timeout is an EXTRA paid
   // call when the chain falls through. Stop as soon as we have enough.
+  const describe = deps.describeReference || ((ref, g, extra) => describeReference(ref, g, { chat: deps.chat, fetchImpl: deps.fetchImpl, loaded: extra?.loaded || null }));
+
+  // The user's OWN images (mood-board + logo) are references too, and the
+  // strongest statement of what they want. They are read FIRST, they are never
+  // dropped by the diversity pick, and they are exempt from the divergence
+  // guard below: a mood-board is meant to be MATCHED, not pushed away from.
+  const userRefUrls = [];
+  if (typeof input.logo_url === "string" && input.logo_url.trim()) userRefUrls.push(input.logo_url.trim());
+  for (const u of Array.isArray(input.style_refs) ? input.style_refs : []) {
+    if (typeof u === "string" && u.trim()) userRefUrls.push(u.trim());
+  }
+
   let references = [];
+  if (userRefUrls.length && (deps.chat || deps.describeReference)) {
+    for (const u of userRefUrls.slice(0, Math.max(1, Math.min(4, maxRefs)))) {
+      try {
+        const out = await withTimeout(
+          describe(u, goal, { loaded: null }),
+          Math.min(40_000, Math.max(15_000, left() * 0.35)), "user reference read"
+        );
+        // ref_image stays null for a data: URI — the app already holds those
+        // bytes, and echoing a megabyte of base64 back in the trail is waste.
+        if (out) references.push({ ...out, ref_image: u.startsWith("data:") ? null : u, ref_id: null, source: "user" });
+      } catch (e) {
+        console.warn("[design-agent] user reference read failed:", e.message);
+        warnings.push(`user reference unreadable: ${e.message}`);
+      }
+    }
+  }
+  const userRefCount = references.length;
+
   if (inspiration.refs?.length && (deps.chat || deps.describeReference)) {
-    const describe = deps.describeReference || ((ref, g, extra) => describeReference(ref, g, { chat: deps.chat, fetchImpl: deps.fetchImpl, loaded: extra?.loaded || null }));
     const candidates = inspiration.refs.slice(0, candidateCount);
     const BATCH = 2;
     // Read one more than we need: the diversity pick needs a spare to choose
     // from, and a spare is also the fallback when one read fails.
-    const want = Math.min(candidates.length, maxRefs + 1);
-    for (let i = 0; i < candidates.length && references.length < want; i += BATCH) {
+    const want = Math.min(candidates.length, Math.max(0, maxRefs + 1 - userRefCount));
+    for (let i = 0; i < candidates.length && (references.length - userRefCount) < want; i += BATCH) {
       const slice = candidates.slice(i, i + BATCH);
       const batch = await Promise.all(slice.map(async (ref) => {
         try {
@@ -892,9 +937,13 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
 
   // Pick the references that are STRUCTURALLY FAR APART, not the top three of
   // one search. Three pins from the same board would otherwise masquerade as
-  // three references.
+  // three references. User-supplied references are kept unconditionally: the
+  // user put them there on purpose, so diversity only chooses among the ones
+  // the search found.
   const allCandidates = references;
-  const diverse = selectDiverse(allCandidates, { max: maxRefs });
+  const mustKeep = allCandidates.filter((r) => r.source === "user").slice(0, maxRefs);
+  const optional = allCandidates.filter((r) => !mustKeep.includes(r));
+  const diverse = [...mustKeep, ...selectDiverse(optional, { max: Math.max(0, maxRefs - mustKeep.length) })];
   const dropped = allCandidates.filter((r) => !diverse.includes(r));
 
   let brief;
@@ -929,7 +978,10 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
   // is a re-skin, not a design. Brand/user-pinned colours are never touched.
   // (A brief that already came FROM the reference DNA is already a synthesis —
   // pushing it away again would leave a generic default, so it is exempt.)
-  const refStructures = diverse.map((r) => r.structure).filter(Boolean);
+  // Only the SEARCHED references are pushed away from. A user's mood-board or
+  // logo is a direction to follow, not a re-skin risk to correct.
+  const userRefStructures = diverse.filter((r) => r.source === "user").map((r) => r.structure).filter(Boolean);
+  const refStructures = diverse.filter((r) => r.source !== "user").map((r) => r.structure).filter(Boolean);
   const userPinned = !!(input.palette || input.brand?.colors?.length);
   let divergence = { changed: [] };
   if (briefFromFallback) {
@@ -946,6 +998,9 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       console.warn("[design-agent] divergence check failed:", e.message);
       warnings.push(`divergence check failed: ${e.message}`);
     }
+  }
+  if (userRefStructures.length) {
+    divergence.changed = [...(divergence.changed || []), "user mood-board / logo honoured (exempt from the divergence guard)"];
   }
   mark("brief");
 
@@ -977,6 +1032,11 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
           brief,
           seed: seed + attempt,
           negative_prompt: brief.negative_prompt,
+          // The user's own images are handed to the renderer as input
+          // references. The caller gates this on the active model's live
+          // capabilities — a model that does not take image input never sees
+          // them, so a mood-board can never break a render.
+          input_references: userRefUrls.slice(0, 4).map((u) => ({ type: "image_url", image_url: { url: u } })),
         }),
         // The render gets whatever is LEFT: it is the one stage that must not
         // be cut short, and a cut render means no design at all.
@@ -1046,8 +1106,21 @@ export async function runDesignAgent(input = {}, deps = {}, opts = {}) {
       queries: inspiration.queries || [],
       refs: inspiration.refs || [],
       read: diverse.length,
-      studied: diverse.map((r) => ({ ref: r.ref, image_url: r.ref_image || null, structure: r.structure })),
-      dropped: dropped.map((r) => ({ ref: r.ref, image_url: r.ref_image || null, structure: r.structure })),
+      // `ref` is truncated to a label for user-supplied images: their "url" is a
+      // multi-hundred-KB data: URI, and echoing that back in the trail would
+      // dwarf the rest of the response.
+      studied: diverse.map((r) => ({
+        ref: r.source === "user" ? "(your image)" : s(r.ref, 300),
+        source: r.source || "search",
+        image_url: r.ref_image || null,
+        structure: r.structure,
+      })),
+      dropped: dropped.map((r) => ({
+        ref: r.source === "user" ? "(your image)" : s(r.ref, 300),
+        source: r.source || "search",
+        image_url: r.ref_image || null,
+        structure: r.structure,
+      })),
       errors: inspiration.errors || [],
     },
     divergence: { changed: divergence.changed || [], shared_axes: refStructures.map((s) => sharedAxes(briefAxes(brief), s)) },

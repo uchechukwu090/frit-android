@@ -18,7 +18,55 @@
 // Timeframes are validated per bot. Note the honest mapping: the intraday
 // engine analyzes 30M/4H structure regardless of the selected display TF —
 // the TF picks monitoring granularity, not a retuned engine.
+//
+// SIGNAL LIFECYCLE (directional bots): the engine still re-reads the market
+// on every cadence, but a re-read does NOT re-fire. A live signal keeps its
+// entry/TP/SL until it resolves (TP/SL/expiry/reversal), and the only thing
+// that earns a fresh entry + fresh TP/SL mid-signal is the predictive volume
+// engine forecasting an activity expansion WITH the trend. See
+// signalstate.js (the decision) and volumeforecast.js (the forecaster).
 // ============================================================================
+
+import { getActiveState, openState, retriggerState, closeState, markPlaced, decideLifecycle, stateKey } from "./signalstate.js";
+import { forecastVolume } from "./volumeforecast.js";
+import { applyCostsFor } from "./costs.js";
+import { isSynthetic } from "./synthetics.js";
+
+// Pocket settles by fixed expiry and options never trades — neither has a
+// TP/SL signal to hold open, so only these three run the lifecycle.
+const LIFECYCLE_BOTS = new Set(["scalping", "intraday", "longterm"]);
+
+/** Latest print from the live feed, or null when it has no data for the pair. */
+function livePrice(deps, pair) {
+  try {
+    const p = Number(deps.lastPrice?.(pair));
+    return Number.isFinite(p) && p > 0 ? p : null;
+  } catch { return null; }
+}
+
+/**
+ * Predictive volume forecast for a live signal.
+ * 5m is the FORECAST timeframe (does activity expand over the next 1-3 bars?),
+ * 1m only measures the pace inside the current 5m window. The local feed
+ * store is asked first — free, and it holds the live edge; REST is the
+ * fallback for a cold store. Any failure returns null and the lifecycle then
+ * treats "no forecast" as "no expansion": a retrigger is never granted on
+ * missing data.
+ */
+async function volumeForecast(deps, pair, trend) {
+  try {
+    const store = deps.storeCandles;
+    let c5 = store ? store(pair, "5m", 300) : null;
+    if (!Array.isArray(c5) || c5.length < 60) c5 = await deps.fetchCandles?.(pair, "5m");
+    if (!Array.isArray(c5) || c5.length < 60) return null;
+    let c1 = store ? store(pair, "1m", 300) : null;
+    if (!Array.isArray(c1) || c1.length < 25) c1 = await deps.fetchCandles?.(pair, "1m");
+    return forecastVolume({ c5, c1: Array.isArray(c1) ? c1 : [], trend });
+  } catch (e) {
+    deps.log?.("volume forecast failed:", e.message);
+    return null;
+  }
+}
 
 export const BOT_DEFS = {
   scalping: {
@@ -216,6 +264,62 @@ export function synthToSignal(pair, r) {
 }
 
 /**
+ * One synthetic pair, read by the GENERATOR-AWARE engine.
+ *
+ * Every directional bot routes a synthetic here — scalping and pocket used to
+ * run plain EMA9/21/RSI/ATR on an engineered RNG market, which is a coin flip
+ * minus costs no matter how good the signal looks. The engine reads what the
+ * generator actually does (z-fade for the constant-vol streams, post-spike
+ * reversion for BOOM/CRASH, the locked drift for RDBULL/RDBEAR).
+ *
+ * Data honesty: the SPIKE family is documented as a TICK detector (a move of
+ * >8x the median TICK). It is fed ticks when the caller can supply them; on a
+ * 1m-bar fallback it still detects a spike, but of a 1-MINUTE move — so the
+ * signal says which series it read instead of pretending they are the same.
+ */
+async function syntheticRoute(deps, pair, botName) {
+  let ticks = null;
+  if (typeof deps.recentTicks === "function") {
+    try { ticks = await deps.recentTicks(pair, 300); } catch { ticks = null; }
+  }
+  const hasTicks = Array.isArray(ticks) && ticks.length >= 60;
+  const series = hasTicks ? ticks : await deps.fetchCloses(pair, "1m");
+  const source = hasTicks ? "ticks" : "1m bars";
+  const r = await deps.analyzeSynth(pair, series);
+  const sig = synthToSignal(pair, r);
+  const family = r.family || null;
+  const notes = [];
+  if (family === "SPIKE" && !hasTicks) {
+    notes.push(`spike read taken from ${source} (tick feed unavailable for this pair) — coarser than the tick-level detector`);
+  }
+  if (family === "UNKNOWN") {
+    notes.push("unknown generator — the engine will not trade a process it cannot identify");
+  }
+  // Honest label, taken from the executor's own rule (deriv.js RNG_SYNTH): an
+  // RNG stream is refused for real-money Rise/Fall and can only ever execute on
+  // a demo account. Saying so on the signal is the difference between a demo
+  // study and a promise the engine will not keep.
+  notes.push("generated series: execution is demo-only — this app refuses RNG streams on a real-money account");
+
+  // A generator read has no calibration history of its own (the pocket
+  // calibration buckets are keyed by the EMA setup), so it is held to the same
+  // "learning mode" ceiling the calibrated engine applies until a setup has 30
+  // measured paper trades behind it. Never publish an unproven read as a
+  // high-confidence one.
+  const LEARNING_CAP = 65;
+  const confidence = Math.min(Number(sig.confidence) || 0, LEARNING_CAP);
+  return {
+    ...sig,
+    confidence,
+    scenario: `SYNTH_${family || "?"}`,
+    family,
+    source,
+    uncalibrated: true,
+    reasoning: [sig.reasoning, ...notes].filter(Boolean).join(" | "),
+  };
+}
+
+/**
  * One runner tick. Deps injected from index.js:
  * { db, mtfAnalyze(symbol)->result, analyzeSynth(symbol, closes)->result,
  *   scalpingAnalyze(symbol, closes, tf)->result, pocketScan(symbol, expiry)->result,
@@ -354,30 +458,60 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
   // ---- analyse ----
   let signal = null;
   if (botName === "scalping") {
-    const candles = await deps.fetchCandles(pair, timeframe);
-    if (!candles || candles.length < 30) {
-      out.note = "warming up — need 30+ candles";
-      out.results.push({ bot: botName, decision: "WAIT", note: out.note });
-      return out;
+    if (isSynthetic(pair)) {
+      // An EMA9/21 crossover on an engineered RNG stream is a coin flip minus
+      // costs — the generator has no order flow to read. Every directional
+      // bot now routes a synthetic to the generator-aware engine, exactly as
+      // intraday already did, so the FX logic never runs on an RNG market.
+      signal = await syntheticRoute(deps, pair, "scalping");
+    } else {
+      const candles = await deps.fetchCandles(pair, timeframe);
+      if (!candles || candles.length < 30) {
+        out.note = "warming up — need 30+ candles";
+        out.results.push({ bot: botName, decision: "WAIT", note: out.note });
+        return out;
+      }
+      // The same volume-matrix filter the intraday engine runs: the matrix is
+      // computed from the candle store and cached, so passing it here costs
+      // nothing and stops a scalp from fighting strong opposing flow.
+      const matrixBias = await deps.matrixBiasFor?.(pair);
+      const r = deps.scalpingAnalyze(pair, candles, timeframe, { matrixBias });
+      signal = {
+        id: `sig_${pair}_${Date.now()}_sc`, symbol: pair, decision: r.decision,
+        confidence: r.confidence, entry: r.entry, sl: r.sl, tp1: r.tp1, tp2: r.tp2,
+        rr: r.rr, rrGross: r.rrGross ?? null, costs: r.costs ?? null,
+        scenario: "SCALPING", reasoning: (r.reasons || []).join(" | "),
+        timestamp: Date.now(), botSource: "scalping",
+      };
     }
-    const r = deps.scalpingAnalyze(pair, candles, timeframe);
-    signal = {
-      id: `sig_${pair}_${Date.now()}_sc`, symbol: pair, decision: r.decision,
-      confidence: r.confidence, entry: r.entry, sl: r.sl, tp1: r.tp1, tp2: r.tp2,
-      rr: r.rr, scenario: "SCALPING", reasoning: (r.reasons || []).join(" | "),
-      timestamp: Date.now(), botSource: "scalping",
-    };
   } else if (botName === "pocket") {
     // TRUE pocket option: predicts if the candle ends bullish or bearish
     // within the given time. Expiry follows the chosen timeframe.
     const expiryMin = timeframe === "1m" ? 1 : timeframe === "5m" ? 5 : 15;
-    const r = deps.pocketScan(pair, expiryMin);
-    signal = {
-      id: `sig_${pair}_${Date.now()}_pk`, symbol: pair, decision: r.decision,
-      confidence: r.confidence, entry: r.entryRef, sl: null, tp1: null, tp2: null,
-      rr: null, scenario: "POCKET", reasoning: (r.reasons || []).join(" | "),
-      timestamp: Date.now(), botSource: "pocket", expiryMin,
-    };
+    if (isSynthetic(pair)) {
+      // Fixed-expiry Rise/Fall on an RNG stream must be read from the
+      // GENERATOR, not from an EMA cross. The synthetic engine's direction
+      // maps straight onto CALL/PUT (its families carry real structure: a
+      // z-fade, a post-spike reversion, or a generator-locked drift).
+      const route = await syntheticRoute(deps, pair, "pocket");
+      const dir = route.decision === "BUY" ? "CALL" : route.decision === "SELL" ? "PUT" : "WAIT";
+      signal = {
+        ...route,
+        id: `sig_${pair}_${Date.now()}_pksy`, decision: dir,
+        sl: null, tp1: null, tp2: null, rr: null,
+        scenario: `POCKET_SYNTH_${route.family || "?"}`,
+        reasoning: `${route.reasoning} | expiry ${expiryMin}m on the generator read, not an EMA cross`,
+        botSource: "pocket", expiryMin,
+      };
+    } else {
+      const r = deps.pocketScan(pair, expiryMin);
+      signal = {
+        id: `sig_${pair}_${Date.now()}_pk`, symbol: pair, decision: r.decision,
+        confidence: r.confidence, entry: r.entryRef, sl: null, tp1: null, tp2: null,
+        rr: null, scenario: "POCKET", reasoning: (r.reasons || []).join(" | "),
+        timestamp: Date.now(), botSource: "pocket", expiryMin,
+      };
+    }
   } else if (botName === "longterm") {
     const daily = await deps.fetchDaily(pair);
     const closes = timeframe === "1W" ? toWeekly(daily) : daily;
@@ -390,9 +524,9 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
     };
   } else {
     // intraday (and any other directional bot)
-    const isSynth = /^R_|^1HZ|^BOOM|^CRASH|^STPRNG|^RDBULL|^RDBEAR|^JD|^GDA/.test(pair);
+    const isSynth = isSynthetic(pair);
     const r = isSynth
-      ? synthToSignal(pair, await deps.analyzeSynth(pair, await deps.fetchCloses(pair, "1m")))
+      ? await syntheticRoute(deps, pair, "intraday")
       : await deps.mtfAnalyze(pair, {});
     const formatted = isSynth ? r : deps.formatSignal(pair, r);
     signal = { ...formatted, id: `sig_${pair}_${Date.now()}_${isSynth ? "sy" : "in"}`, botSource: "intraday" };
@@ -400,7 +534,52 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
 
   const actionable = ["BUY", "SELL", "CALL", "PUT"].includes(signal.decision)
     && signal.confidence >= minConf;
-  if (!actionable) {
+
+  // ---- LIFECYCLE DECISION (directional bots) ------------------------------
+  // The read above is recomputed on every cadence — that is the "recomputing
+  // entry and the threshold" part. Whether it becomes a SIGNAL is decided
+  // here, against whatever is already live for this (user, bot, pair).
+  const lifecycle = LIFECYCLE_BOTS.has(botName);
+  const key = stateKey(userId, botName, pair);
+  const state = lifecycle ? getActiveState(db, key) : null;
+  let vf = null;
+  let price = null;
+  if (state) {
+    // Forecast against the LIVE signal's direction: "will activity expand
+    // with the trend I am already in?" — not a free-floating volume guess.
+    vf = await volumeForecast(deps, pair, state.dir);
+    price = livePrice(deps, pair) ?? vf?.price ?? null;
+  }
+  const life = lifecycle
+    ? decideLifecycle({
+        state,
+        analysis: { decision: signal.decision, confidence: signal.confidence },
+        minConf, price, vf,
+      })
+    : { action: actionable ? "FIRE_NEW" : "NONE", reason: "" };
+
+  const noteOnly = (decision, note) => {
+    out.decision = decision;
+    out.confidence = signal.confidence;
+    out.note = note;
+    out.results.push({ bot: botName, decision, confidence: signal.confidence, note });
+    return out;
+  };
+
+  let mode = life.action === "RETRIGGER" ? "RETRIGGER" : "FIRE_NEW";
+  if (lifecycle) {
+    if (life.action === "NONE") return noteOnly(signal.decision, life.reason);
+    if (life.action === "HOLD") return noteOnly("HOLD", life.reason);
+    if (life.action === "CLOSE") {
+      closeState(db, key, life.reason);
+      // TP/SL hit or expiry: the signal is resolved. Fire only when the read
+      // is actionable AND the other direction — a WAIT just ends the cycle.
+      if (!actionable) return noteOnly(signal.decision, `closed — ${life.reason}`);
+    } else if (life.action === "CLOSE_AND_FIRE") {
+      closeState(db, key, life.reason);
+    }
+    if (mode === "RETRIGGER" && !vf?.levels) mode = "FIRE_NEW"; // defensive
+  } else if (!actionable) {
     out.decision = signal.decision;
     out.confidence = signal.confidence;
     out.note = "below confidence floor or no setup";
@@ -413,7 +592,35 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
   out.decision = signal.decision;
   out.confidence = signal.confidence;
 
-  // ---- lot size: Kelly against the USER's own balance (item 8 + 9) ----
+  // ---- RETRIGGER: the volume engine earned a fresh entry + fresh TP/SL ----
+  if (mode === "RETRIGGER") {
+    const lv = vf.levels;
+    signal = {
+      ...signal,
+      id: `sig_${pair}_${Date.now()}_vt`,
+      decision: state.dir,
+      // The forecast score IS the confidence of a retrigger — the engine's
+      // own read may be a plain WAIT right now, and that is fine.
+      confidence: Math.max(
+        Math.round(vf.score),
+        actionable && signal.decision === state.dir ? signal.confidence : 0,
+      ),
+      entry: lv.entry, sl: lv.sl, tp1: lv.tp, tp2: null, rr: lv.rr,
+      scenario: "VOLUME",
+      reasoning: `VOLUME RETRIGGER #${Number(state.retriggers || 0) + 1} — ${vf.reasons.join(" | ")}`,
+      retriggerOf: key,
+    };
+    // Levels are replaced, the open time is not: it is still ONE signal.
+    retriggerState(db, key, { entry: lv.entry, sl: lv.sl, tp: lv.tp, rr: lv.rr });
+    out.decision = signal.decision;
+    out.confidence = signal.confidence;
+  }
+
+  // ---- lot size: the USER's own setting decides (item 8 + 9) ----
+  // sizeFor returns { lotSize, riskUsd, reason, mode } where mode is
+  //   "auto"  — the lot size engine (Kelly) sized it from balance + profile
+  //   "fixed" — the user pinned an exact lot in Settings/Watchlist
+  // Both are passed straight through; the executor must not re-size either.
   // Legacy global bots have no user account, so they use the platform default.
   const sizing = deps.sizeFor
     ? deps.sizeFor(userId, signal)
@@ -421,12 +628,21 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
   signal.lotSize = sizing.lotSize || null;
   signal.lotReason = sizing.reason;
   signal.riskUsd = sizing.riskUsd || null;
+  signal.lotMode = sizing.mode || null;
 
   // ---- store the signal (for THIS user) ----
   if (signalEnabled) deps.storeSignal(userId, signal);
 
   // ---- execute ----
-  if (tradeEnabled && def.executes) {
+  // A RETRIGGER refreshes a signal whose order may ALREADY be at the broker:
+  // a second order would double the exposure instead of managing it. The
+  // fresh TP/SL still goes out as a signal; a new order is only sent when the
+  // original fire never placed one (signal-only, refused, or blocked).
+  const duplicateOrder = mode === "RETRIGGER" && Number(state?.placed || 0) === 1;
+  if (tradeEnabled && def.executes && duplicateOrder) {
+    out.note = "retrigger — fresh TP/SL signalled; open order keeps its own broker TP/SL (no duplicate order)";
+    out.results.push({ bot: botName, decision: signal.decision, confidence: signal.confidence, execution: "held", lotSize: sizing.lotSize, retrigger: true, note: out.note });
+  } else if (tradeEnabled && def.executes) {
     const exec = await deps.executor({
       symbol: pair,
       action: signal.decision === "SELL" || signal.decision === "PUT" ? "sell" : "buy",
@@ -436,6 +652,9 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
       source: `bot:${botName}`,
       userId,
       botName,
+      // "fixed" tells the executor to use the user's exact lot; "auto" means
+      // the sizing engine already computed it. Either way, no re-sizing.
+      sizingMode: sizing.mode || null,
       // The pocket bot buys a Rise/Fall contract with this expiry; the
       // scalping bot uses TP/SL on a MULT contract instead.
       expiryMin: signal.expiryMin || 0,
@@ -444,11 +663,26 @@ async function runOneBot(deps, { botName, pair, timeframe, userId, minConf, trad
     // "placed" means an order was actually SENT. A blocked/refused order
     // (risk gate, no Deriv market) is NOT a placed trade and must not
     // consume the daily cap.
-    out.traded = !!(exec && exec.mode !== "blocked" && exec.status !== "blocked");
+    out.traded = !!(exec && exec.mode !== "blocked" && exec.status !== "blocked" && exec.status !== "failed" && exec.status !== "refused");
     out.results.push({ bot: botName, decision: signal.decision, confidence: signal.confidence, execution: exec?.mode || null, lotSize: sizing.lotSize });
   } else {
     out.note = "signal only (trading off)";
-    out.results.push({ bot: botName, decision: signal.decision, confidence: signal.confidence, execution: null, lotSize: sizing.lotSize, signalOnly: true });
+    out.results.push({ bot: botName, decision: signal.decision, confidence: signal.confidence, execution: null, lotSize: sizing.lotSize, signalOnly: true, retrigger: mode === "RETRIGGER" });
+  }
+
+  // ---- record the signal's life -------------------------------------------
+  if (lifecycle) {
+    if (mode === "RETRIGGER") {
+      // Only when this retrigger actually placed an order does the signal
+      // become "placed" — that is what stops the next retrigger doubling it.
+      if (out.traded) markPlaced(db, key);
+    } else {
+      openState(db, {
+        key, userId, bot: botName, pair,
+        dir: signal.decision, entry: signal.entry, sl: signal.sl, tp: signal.tp1, rr: signal.rr,
+        placed: out.traded ? 1 : 0,
+      });
+    }
   }
   return out;
 }
@@ -506,7 +740,7 @@ function rsiLast(closes, period = SCALP_RSI_PERIOD) {
  * @param timeframe "1m" | "5m" | "15m"
  * @returns { decision, confidence, entry, sl, tp1, tp2, rr, reasons }
  */
-export function scalpingAnalyze(pair, candles, timeframe = "5m") {
+export function scalpingAnalyze(pair, candles, timeframe = "5m", opts = {}) {
   const sym = String(pair || "").toUpperCase();
   const out = {
     symbol: sym, decision: "WAIT", confidence: 0, entry: null, sl: null,
@@ -549,6 +783,50 @@ export function scalpingAnalyze(pair, candles, timeframe = "5m") {
   const sl = bull ? entry - slDist : entry + slDist;
   const tp1 = bull ? entry + tpDist : entry - tpDist;
   const tp2 = bull ? entry + 3.0 * atr : entry - 3.0 * atr;
+
+  // ---- VOLUME-MATRIX VETO ------------------------------------------------
+  // The same 5-timeframe bias the intraday engine already filters on. A
+  // scalping entry against strong opposing flow is the trade the tape is
+  // paying you to take the OTHER side of; stand down rather than fight it.
+  const mb = opts.matrixBias || null;
+  if (mb && mb.bias && mb.bias !== "NEUTRAL") {
+    const flowSide = mb.bias === "BULL" ? "BUY" : "SELL";
+    const strength = Math.abs(Number(mb.score) || 0);
+    if (flowSide !== dir && strength >= 2) {
+      out.reasons.push(
+        ...reasons,
+        `volume matrix disagrees (${mb.bias}, score ${mb.score}) — flow opposes ${dir}, scalps don't fight flow`,
+      );
+      return out;
+    }
+    if (flowSide === dir) { conf += 5; reasons.push(`volume matrix agrees (${mb.bias}, score ${mb.score}) — flow with the entry`); }
+  }
+
+  // ---- COST GATE ---------------------------------------------------------
+  // The published RR is meaningless until friction is subtracted. Which
+  // friction applies depends on the MARKET: a spread+commission+slippage cross
+  // on FX/CFDs, a payout markup on a Deriv synthetic. A setup whose NET RR is
+  // under 1.0 loses money even when the direction is right, and is not a
+  // trade — it is a donation. Never emit it as a signal.
+  const costs = applyCostsFor({ symbol: sym, entry, sl, tp: tp1 });
+  // Attached BEFORE any early return: a setup blocked by costs (or docked below
+  // the confidence floor by them) must still report WHAT priced it out. The
+  // caller, the run log and the app all need that number to explain the WAIT.
+  out.costs = costs;
+  out.rrGross = Number((tpDist / slDist).toFixed(2));
+  if (costs.blocked) {
+    out.reasons.push(
+      ...reasons,
+      `COST GATE: net RR ${costs.netRR} after ${costs.model === "payout_markup" ? `payout markup ${(costs.markupPct * 100).toFixed(1)}%` : `friction ${costs.costPrice.toFixed(5)} (${costs.costPctOfRisk}% of risk)`} — the edge does not survive costs on ${timeframe}, no signal`,
+    );
+    return out;
+  }
+  if (costs.weak) {
+    conf -= 12;
+    reasons.push(`cost penalty: net RR ${costs.netRR} (costs ${costs.costPctOfRisk}% of risk) is thin — confidence docked 12`);
+  }
+  reasons.push(`costs on ${sym}: ${costs.model === "payout_markup" ? `payout markup ${(costs.markupPct * 100).toFixed(1)}%` : `spread+slippage ${costs.costPrice.toFixed(5)}`}${costs.estimated ? " (estimated — override with COST_OVERRIDES_JSON)" : ""} → net RR ${costs.netRR}`);
+
   conf = Math.max(20, Math.min(75, Math.round(conf)));
   if (conf < SCALP_MIN_CONF) {
     out.reasons.push(...reasons, `confidence ${conf} below ${SCALP_MIN_CONF} floor`);
@@ -560,7 +838,9 @@ export function scalpingAnalyze(pair, candles, timeframe = "5m") {
   out.sl = sl;
   out.tp1 = tp1;
   out.tp2 = tp2;
-  out.rr = tpDist / slDist;
+  // `rr` is the NET reward:risk — the number a trader actually keeps. The
+  // gross geometry stays available as rrGross for the UI.
+  out.rr = costs.netRR;
   out.reasons = reasons;
   return out;
 }

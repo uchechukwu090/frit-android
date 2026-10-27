@@ -25,6 +25,8 @@
 // by the caller (index.js PIP_CONFIG) — see costToUsd().
 // ============================================================================
 
+import { isSynthetic } from "./synthetics.js";
+
 const DEFAULT_SYMBOL_COSTS = {
   // spread/slippage in PRICE units, commission in USD per 1.0 lot round-turn
   EURUSD: { spread: 0.00016, commission: 0, slippage: 0.00005 },
@@ -89,6 +91,16 @@ function overrides() {
   return _overrides;
 }
 
+/**
+ * Re-read COST_OVERRIDES_JSON (and any per-symbol markup) on the next lookup.
+ * The overrides are cached because this module is called per signal; this is
+ * the supported way to apply a config change (or a test's own cost table)
+ * without restarting the process.
+ */
+export function resetCostCache() {
+  _overrides = null;
+}
+
 /** { spread, commission, slippage, estimated } — estimated=true for unknown symbols. */
 export function getSymbolCost(symbol) {
   const sym = String(symbol || "").toUpperCase();
@@ -144,6 +156,125 @@ export function applyCosts({ symbol, entry, sl, tp }) {
     blocked: netRRShown < NET_RR_BLOCK,
     weak: netRRShown < NET_RR_WEAK,
   };
+}
+
+// ============================================================================
+// SYNTHETIC INDICES — a DIFFERENT cost model, because the cost is in a
+// different place
+// ----------------------------------------------------------------------------
+// Deriv synthetics are not FX, and the contract type decides where the cost
+// lives (verified against Deriv's own documentation):
+//
+//   * MULTIPLIER (what the scalping bot places): no bid/ask spread is crossed.
+//     The cost is a MARKUP on the payout — Deriv's API markup documentation
+//     states an app may add up to 3% of the potential payout
+//     (developers.deriv.com/docs/intro/markup). A payout markup reduces the
+//     WIN, not the risk, so it is modelled as a percentage of the TARGET
+//     distance. It never widens the stop.
+//
+//   * RISE/FALL (what the pocket bot places): there is no separately charged
+//     spread either. The cost sits inside the quoted payout, and the pocket
+//     engine already gates on its own break-even — 1/(1+payout) — before any
+//     contract is placed. See strategy/pocket/engine.js.
+//
+//   * CFD: Deriv publishes a MINIMUM spread per instrument on its synthetic-
+//     indices specification table. Those are minimums from a live table, in
+//     that instrument's own index points, and they are NOT the cost of a
+//     multiplier or an options contract. A handful of verified published
+//     values are recorded below as documentation only; nothing in this file
+//     silently substitutes a CFD spread for a multiplier markup.
+//
+// Anything we cannot source stays flagged `estimated: true`, and every figure
+// is overridable per deployment with COST_OVERRIDES_JSON (see the header).
+// ============================================================================
+
+/**
+ * Payout markup for a multiplier contract on a synthetic. Deriv documents a
+ * ceiling of 3%; the default models the common 2% case. A deployment that
+ * knows its own markup overrides it: {"R_100":{"markup":0.01}}.
+ */
+export const SYNTHETIC_MARKUP_PCT = 0.02;
+export const SYNTHETIC_MARKUP_CAP = 0.03;
+
+/**
+ * Published MINIMUM spreads (index points) from Deriv's synthetic-indices
+ * specification table, recorded as documentation. These describe CFD trading
+ * only — they are not applied by applyCostsFor().
+ * Source: https://deriv.com/markets/derived-indices/synthetic-indices
+ */
+export const SYNTHETIC_PUBLISHED_MIN_SPREAD = {
+  BOOM50: 1.2719,
+  BOOM100: 7.375,
+  BOOM150: 0.1705,
+  BOOM200: 7.615,
+  BOOM300: 0.5,
+  BOOM500: 0.535,
+  BOOM600: 0.774,
+  BOOM900: 0.968,
+  BOOM1000: 1.7245,
+};
+
+/** The payout markup (as a fraction) for a symbol; overridable per symbol. */
+export function markupFor(symbol) {
+  const sym = String(symbol || "").toUpperCase();
+  const ov = overrides()[sym] || {};
+  const raw = Number(ov.markup);
+  if (Number.isFinite(raw) && raw >= 0) return Math.min(raw, SYNTHETIC_MARKUP_CAP);
+  return SYNTHETIC_MARKUP_PCT;
+}
+
+/**
+ * Net-RR for a MULTIPLIER setup on a synthetic.
+ *
+ * No spread is crossed, so the risk is unchanged; the markup comes off the
+ * win. Shape matches applyCosts() so callers can treat the two models alike.
+ */
+export function applyPayoutMarkup({ symbol, entry, sl, tp }) {
+  const e = Number(entry), s = Number(sl), t = Number(tp);
+  const markupPct = markupFor(symbol);
+  const grossRisk = Math.abs(e - s);
+  const grossWin = Math.abs(t - e);
+  if (!(grossRisk > 0) || !(grossWin > 0)) {
+    return {
+      model: "payout_markup", markupPct, costPrice: 0, grossRisk, grossWin,
+      netRisk: grossRisk, netWin: grossWin, netRR: 0, costPctOfRisk: null,
+      blocked: true, weak: true, estimated: false,
+    };
+  }
+  const costPrice = grossWin * markupPct;
+  const netWin = grossWin - costPrice;
+  const netRisk = grossRisk;
+  const netRR = netWin / netRisk;
+  const netRRShown = Math.floor(netRR * 100) / 100;
+  return {
+    model: "payout_markup",
+    markupPct,
+    costPrice,
+    grossRisk,
+    grossWin,
+    netRisk,
+    netWin,
+    netRR: netRRShown,
+    costPctOfRisk: Number(((costPrice / grossRisk) * 100).toFixed(1)),
+    blocked: netRRShown < NET_RR_BLOCK,
+    weak: netRRShown < NET_RR_WEAK,
+    // The markup is a deployment assumption (0-3%), not a published per-symbol
+    // number — say so, so the UI and the journal never present it as exact.
+    estimated: true,
+  };
+}
+
+/**
+ * The cost gate for a setup, whichever market it is on.
+ *
+ * Chooses the model from the SYMBOL, not the caller: a synthetic is priced by
+ * payout markup, everything else by spread + commission + slippage. Callers
+ * that already know which model applies (or that want to force one) pass it.
+ */
+export function applyCostsFor({ symbol, entry, sl, tp, model = null }) {
+  const chosen = model || (isSynthetic(symbol) ? "payout_markup" : "spread");
+  if (chosen === "payout_markup") return applyPayoutMarkup({ symbol, entry, sl, tp });
+  return { model: "spread", ...applyCosts({ symbol, entry, sl, tp }) };
 }
 
 /**

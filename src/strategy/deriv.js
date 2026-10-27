@@ -236,7 +236,11 @@ export class DerivClient {
     try {
       const r = await this._rest("GET", "/trading/v1/options/accounts");
       if (!r.ok) return { ok: false, list: [], message: r.message };
-      const list = (r.data?.data?.accounts || r.data?.accounts || []).map((a) => ({
+      const body = r.data?.data;
+      const raw = Array.isArray(body) ? body
+        : Array.isArray(body?.accounts) ? body.accounts
+        : Array.isArray(r.data?.accounts) ? r.data.accounts : [];
+      const list = raw.map((a) => ({
         account_id: a.account_id,
         account_type: a.account_type,
         balance: Number(a.balance) || 0,
@@ -615,10 +619,16 @@ export class DerivClient {
 
 // ---- execution policy wrapper (caps + mapping + bookkeeping) ----
 export class DerivExecutor {
-  constructor({ db, client, liveAllowed = false, stake = 1.0, maxPerDay = 20, currency = "USD", log = null }) {
+  constructor({ db, client, liveAllowed = false, stake = 1.0, maxPerDay = 20, currency = "USD", log = null, allowRngOnDemo = true }) {
     this.db = db;
     this.client = client;
     this.liveAllowed = !!liveAllowed;
+    // RNG synthetics (R_*, 1HZ*, BOOM/CRASH, ...) are tradable on DEMO so every
+    // market Deriv lists can be exercised end to end. Real accounts still refuse
+    // them. Set DERIV_ALLOW_RNG=0 in the env (read by index.js) to restore the
+    // old blanket refusal.
+    this.allowRngOnDemo = !!allowRngOnDemo;
+    this._matrix = null;
     this.stake = Math.min(Math.max(Number(stake) || 1, 0.35), 50);
     this.maxPerDay = maxPerDay;
     this.currency = currency;
@@ -685,8 +695,9 @@ export class DerivExecutor {
     // Synthetics are their own Deriv codes — verify Rise/Fall availability
     // directly. OTC_* indices count too: Deriv's derived-index feed mirrors
     // real prices and is not exempt from availability checks.
-    if (RNG_SYNTH.test(sym) || /^(OTC_|FRX|CRY)/.test(sym)) {
-      const dSym = derivUnderlying(sym) || sym;
+    const nat = derivUnderlying(sym);
+    if (RNG_SYNTH.test(sym) || /^(OTC_|FRX|CRY)/.test(sym) || (nat && DERIV_UNIVERSE.has(nat))) {
+      const dSym = nat || sym;
       try {
         const avail = await this.client.contractsFor(dSym);
         const types = new Set((avail || []).map(a => a.contract_type).filter(Boolean));
@@ -730,9 +741,13 @@ export class DerivExecutor {
   async resolveMultSymbol(ours) {
     const sym = String(ours).toUpperCase();
     if (this.symbolCache.has(`MULT:${sym}`)) return this.symbolCache.get(`MULT:${sym}`);
-    const native = /^(R_|1HZ|BOOM|CRASH|stp|JD|RB|RDB|WLD|OTC_|FRX|CRY)/.test(sym)
+    // FIX: sym is upper-cased, so the old case-sensitive "stp" never matched
+    // STPRNG* and step indices could never be sent a Multiplier.
+    // Any code in the live universe (incl. newly listed DEX*/DSI*/GDA* codes that
+    // registerDerivSymbols picked up from active_symbols) resolves natively.
+    const native = /^(R_|1HZ|BOOM|CRASH|STP|JD|RB|RDB|WLD|OTC_|FRX|CRY)/i.test(sym)
       ? (derivUnderlying(sym) || sym)
-      : null;
+      : derivUnderlying(sym);
     const cands = native ? [native] : (DERIV_MAP[sym] || []);
     if (!cands.length) return null;
     let live = [];
@@ -761,8 +776,9 @@ export class DerivExecutor {
     return null;
   }
 
-  async execute({ symbol, direction, durationMin, positionId }) {
-    if (!this.client.token) return this._refuse(symbol, "NO_TOKEN — paste DERIV_DEMO_TOKEN in server/.env");
+  async execute({ symbol, direction, durationMin, positionId, stake: stakeIn = null }) {
+    const stake = stakeIn != null ? Math.min(Math.max(Number(stakeIn) || this.stake, 0.35), 1000) : this.stake;
+    if (!this.client.token) return this._refuse(symbol, "NO_TOKEN — set PAT (or DERIV_DEMO_TOKEN) in server/.env");
     if (direction !== "CALL" && direction !== "PUT") return this._refuse(symbol, "not directional");
     if (this.tradesToday() >= this.maxPerDay) {
       return this._refuse(symbol, `daily cap reached (${this.maxPerDay})`);
@@ -773,13 +789,13 @@ export class DerivExecutor {
     if (!this.client.account?.isDemo && !this.liveAllowed) {
       return this._refuse(symbol, "REAL-money token refused — set DERIV_LIVE=1 (demo token expected)");
     }
-    if (RNG_SYNTH.test(String(symbol).toUpperCase())) {
-      return this._refuse(symbol, "RNG-stream synthetic — never traded (random stream, no edge possible)");
+    if (RNG_SYNTH.test(String(symbol).toUpperCase()) && !(this.allowRngOnDemo && this.client.account?.isDemo)) {
+      return this._refuse(symbol, "RNG-stream synthetic refused on a real account (demo only)");
     }
     const dSym = await this.resolveSymbol(symbol);
     if (!dSym) return this._refuse(symbol, `no Rise/Fall market for ${symbol} on this account`);
     const r = await this.client.buyRiseFall({
-      symbol: dSym, direction, stake: this.stake, durationMin, currency: this.currency,
+      symbol: dSym, direction, stake, durationMin, currency: this.currency,
     });
     if (r.error) {
       return this._refuse(symbol, `buy failed: ${r.error}`);
@@ -794,10 +810,66 @@ export class DerivExecutor {
         (contract_id, position_id, symbol, deriv_symbol, direction, stake, duration_min, entry_tick, status, mode, placed_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
       `).run(String(r.contract_id), positionId || null, symbol, dSym, direction,
-        this.stake, r.durationMin ?? durationMin, r.entry_tick ?? null, mode, Date.now());
+        stake, r.durationMin ?? durationMin, r.entry_tick ?? null, mode, Date.now());
     } catch (e) { this.log(`[deriv] ledger failed: ${e.message}`); }
-    this.log(`[deriv] ${mode} ${direction} ${dSym} ${r.durationMin ?? durationMin}m stake=${this.stake} contract=${r.contract_id}`);
+    this.log(`[deriv] ${mode} ${direction} ${dSym} ${r.durationMin ?? durationMin}m stake=${stake} contract=${r.contract_id}`);
     return { ok: true, mode, ...r };
+  }
+
+  /**
+   * ONE entry point for ANY Deriv market. Sends the contract family the market
+   * actually offers: Multiplier first (price-based engine signals), then
+   * Rise/Fall (CALL/PUT) for everything Multiplier doesn't cover. Availability
+   * is verified live via contracts_for, so a market is never sent a contract it
+   * can't take. Hard failures (daily cap, real-money lock, no token) stop the
+   * chain instead of retrying under another contract type.
+   * direction: "buy"|"sell"|"CALL"|"PUT".
+   */
+  async executeBest({ symbol, direction, stake, multiplier = 100, takeProfit = null, stopLoss = null, durationMin = 5, positionId = null, prefer = "auto" }) {
+    const d = String(direction).toLowerCase();
+    const isSell = d === "sell" || d === "put";
+    const tried = [];
+    const HARD = /daily cap|REAL-money|no token|deriv unavailable|NO_TOKEN/i;
+    if (prefer !== "risefall") {
+      const m = await this.executeMult({ symbol, direction: isSell ? "sell" : "buy", stake, multiplier, takeProfit, stopLoss });
+      if (m.ok) return { ...m, contractType: isSell ? "MULTDN" : "MULTUP", tried };
+      tried.push(`MULT: ${m.why}`);
+      if (HARD.test(String(m.why))) return { ok: false, why: tried.join(" | "), tried };
+    }
+    const r = await this.execute({ symbol, direction: isSell ? "PUT" : "CALL", durationMin, positionId, stake });
+    if (r.ok) return { ...r, contractType: isSell ? "PUT" : "CALL", derivSymbol: this.symbolCache.get(String(symbol).toUpperCase()) || null, tried };
+    tried.push(`RISEFALL: ${r.why}`);
+    return { ok: false, why: tried.join(" | "), tried };
+  }
+
+  /**
+   * Capability matrix for EVERY market this account can see: which contract
+   * families each underlying offers (MULT, Rise/Fall, Digits). 30-min cache.
+   * Drives the all-markets test and the /api/trading/deriv/markets endpoint.
+   */
+  async marketMatrix({ force = false } = {}) {
+    if (!force && this._matrix && Date.now() - this._matrix.at < 30 * 60_000) return this._matrix;
+    const ok = await this.client.connect();
+    if (!ok) return { at: Date.now(), rows: [], error: `deriv unavailable: ${this.client.status()}` };
+    const detail = await this.client.activeSymbolsDetail();
+    const rows = [];
+    for (const dsc of detail) {
+      try {
+        const avail = await this.client.contractsFor(dsc.symbol);
+        const types = new Set((avail || []).flatMap(a => [a.contract_type, ...(a.supported_contract_types || [])].filter(Boolean)));
+        rows.push({
+          ...dsc,
+          mult: types.has("MULTUP") && types.has("MULTDN"),
+          riseFall: types.has("CALL") && types.has("PUT"),
+          digits: [...types].some(t => /^DIGIT/.test(t)),
+          types: [...types].sort(),
+        });
+      } catch (e) {
+        rows.push({ ...dsc, mult: false, riseFall: false, digits: false, types: [], error: e.message });
+      }
+    }
+    this._matrix = { at: Date.now(), rows };
+    return this._matrix;
   }
 
   /**

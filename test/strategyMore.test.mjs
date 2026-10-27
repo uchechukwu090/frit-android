@@ -460,7 +460,16 @@ test("bots: scalping analysis prices a long with the stop below and the targets 
   assert.equal(up.entry, 139);
   assert.ok(up.sl < up.entry, "stop below entry for a long");
   assert.ok(up.tp1 > up.entry && up.tp2 > up.tp1, "target 2 runs before target 3");
-  assert.ok(near(up.rr, 2 / 1.5, 1e-9), "the published R-R is the 2xATR/1.5xATR ratio");
+  // The geometry is 2xATR against 1.5xATR — but the PUBLISHED rr is the NET
+  // reward:risk, because costs do not care how clean the geometry is. Both
+  // numbers are asserted: the ratio is still computed, and what the user is
+  // shown is what survives friction.
+  // The raw geometry: the target is 2xATR, the stop is 1.5xATR.
+  const geometry = (up.tp1 - up.entry) / (up.entry - up.sl);
+  assert.ok(near(geometry, 2 / 1.5, 1e-6), `stop/target geometry ${geometry} must be 2xATR/1.5xATR`);
+  assert.ok(up.rrGross <= 2 / 1.5, "the published gross ratio is that geometry, rounded down");
+  assert.ok(up.rr <= up.rrGross, `net RR ${up.rr} must not exceed gross ${up.rrGross}`);
+  assert.equal(up.rr, up.costs.netRR, "the published R-R is the cost-adjusted one");
   assert.ok(up.confidence >= 55 && up.confidence <= 75, `confidence ${up.confidence}`);
   assert.match(up.reasons.join(" "), /trend bullish/);
 });
@@ -552,10 +561,23 @@ test("synthetics: the Deriv generators map onto their families", () => {
   assert.equal(classifyFamily(""), "UNKNOWN");
 });
 
-test("synthetics: BOOM and CRASH codes need their trailing N", () => {
-  assert.equal(classifyFamily("BOOM500"), "UNKNOWN", "BOOM500 is not a real Deriv code");
-  assert.equal(classifyFamily("CRASH25"), "UNKNOWN");
-  assert.equal(classifyFamily("BOOM500N"), "SPIKE");
+test("synthetics: BOOM and CRASH classify whether or not the code keeps its trailing N", () => {
+  // This test used to assert the OPPOSITE — that BOOM500 is "not a real Deriv
+  // code" and must therefore be UNKNOWN. The app's own verified universe
+  // (deriv.js DERIV_UNIVERSE, taken from active_symbols) lists BOOM500,
+  // BOOM600, BOOM900, BOOM1000 and the CRASH equivalents WITHOUT the suffix;
+  // only 150N and 300N keep it. So requiring the N classified the app's own
+  // live instruments as unknowns, and the synthetic engine never analysed
+  // them.
+  assert.equal(classifyFamily("BOOM500"), "SPIKE", "BOOM500 is in DERIV_UNIVERSE");
+  assert.equal(classifyFamily("CRASH500"), "SPIKE");
+  assert.equal(classifyFamily("BOOM500N"), "SPIKE", "the 150N/300N form keeps working");
+  assert.equal(classifyFamily("CRASH300N"), "SPIKE");
+  // The family is what is classified: any BOOM/CRASH code is a scheduled-jump
+  // process, and the engine decides direction from ticks. What must never be
+  // classified is a code that is not part of the family at all.
+  assert.equal(classifyFamily("EURUSD"), "UNKNOWN");
+  assert.equal(classifyFamily("BOOMX"), "UNKNOWN");
 });
 
 test("synthetics: the DSI regime length is clamped into 5..60 minutes", () => {

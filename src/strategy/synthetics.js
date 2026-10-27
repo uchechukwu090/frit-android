@@ -31,10 +31,30 @@
 // gate here — stake sizing (executor-level) is the risk control.
 // ============================================================================
 
+/**
+ * The canonical synthetic matcher.
+ *
+ * ONE definition, used by the cost model, the bot router and the engine — the
+ * three places that must agree on whether a symbol is an engineered process.
+ * Kept here (a module with no imports) so every caller can reach it without a
+ * cycle. The families are Deriv's active_symbols taxonomy: R_10..R_100 and
+ * 1HZ*V RNG streams, BOOM/CRASH jump indices (newer codes have NO trailing N),
+ * STPRNG, direction-locked RDBULL/RDBEAR, Jump JD*, Range-Break RB*, weighted
+ * baskets WLD***, drift-switch DSI*, directional DEX*UP/DN, and GDA*.
+ */
+export const SYNTHETIC = /^(R_\d+|1HZ\d+V?|BOOM\d+N?|CRASH\d+N?|STPRNG\d*|RDBULL\d*|RDBEAR\d*|JD\d+|RB\d+|WLD[A-Z]{3}|DSI\d+|DEX\d+(UP|DN)|GDA\d+)$/;
+
+export function isSynthetic(symbol) {
+  return SYNTHETIC.test(String(symbol || "").toUpperCase());
+}
+
 export function classifyFamily(symbol) {
   const s = String(symbol || "").toUpperCase();
   if (/^(R_\d+|1HZ\d+V?|STPRNG\d*)$/.test(s)) return "VOL";
-  if (/^(BOOM\d+N|CRASH\d+N|JD\d+|GDA\d+)$/.test(s)) return "SPIKE";
+  // BOOM/CRASH: the trailing N is optional. Only 150N/300N still carry it —
+  // BOOM500/600/900/1000 do not. Requiring the N classified the most-traded
+  // Boom/Crash indices as UNKNOWN, so they were never analysed at all.
+  if (/^(BOOM\d+N?|CRASH\d+N?|JD\d+|GDA\d+)$/.test(s)) return "SPIKE";
   if (/^RDBULL/.test(s)) return { family: "TREND", lock: "BUY" };
   if (/^RDBEAR/.test(s)) return { family: "TREND", lock: "SELL" };
   // DEX directional-bias indices trade like locked trends (UP buys only).

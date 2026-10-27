@@ -59,12 +59,23 @@ export function refId(url) {
  * the proxy fetches the origin server-side — which is exactly what a
  * hotlink-protected CDN allows.
  */
-export function proxyImageUrl(url) {
+export function proxyImageUrl(url, { output = "jpg", q = 85 } = {}) {
   const raw = String(url || "").trim();
   if (!/^https?:\/\//i.test(raw)) return null;
   const host = raw.replace(/^https?:\/\//i, "");
-  return `https://images.weserv.nl/?url=${encodeURIComponent(host)}&output=jpg&q=85`;
+  return `https://images.weserv.nl/?url=${encodeURIComponent(host)}&output=${output}&q=${q}`;
 }
+
+/** For documentation and UI explanations: which hosts this transport tries,
+ *  and why a reference can still come back empty.
+ */
+export const REFERENCE_SOURCES = {
+  search: ["bing image search (keyless HTML)", "openverse (keyless JSON)"],
+  hostsThatUsuallyWork: ["unsplash", "pexels", "pixabay"],
+  hostsThatOftenHotlinkProtect: ["pinterest", "behance", "dribbble"],
+  fallbackProxy: "images.weserv.nl (origin-side fetch, no hotlink ban)",
+  note: "Pinterest/Behance/Dribbble results frequently refuse direct server fetch; the proxy is tried next, and if both fail the reference is skipped rather than blocking the whole run.",
+};
 
 function mimeFromContentType(ct, url = "") {
   const v = String(ct || "").split(";")[0].trim().toLowerCase();
@@ -158,25 +169,41 @@ export async function readRef(id) {
  * Returns { id, dataUri, mime, bytes } or null. `dataUri` is what a vision
  * model can read directly; `id` is what our own endpoint can serve so the
  * app can show the reference without a third-party hotlink.
+ *
+ * NOTE: Pinterest/Behance/Dribbble results frequently refuse direct server
+ * fetch (hotlink protection). The proxy (images.weserv.nl) is tried next;
+ * if both fail, the reference is skipped rather than blocking the whole run.
+ * That is expected and is NOT a bug — the agent still designs from the goal.
  */
 export async function loadReference(url, { fetchImpl = fetch, cache = true } = {}) {
+  // 1. origin fetch (browser-like).
   let got = await fetchImageBuffer(url, { fetchImpl });
+  // 2. if the host hotlink-protects us, try the origin-side proxy; prefer the
+  //    original format so SVG/PNG references are not destroyed as JPEG.
   if (!got) {
-    const proxied = proxyImageUrl(url);
+    // Try the origin-side proxy; keep SVG/PNG refs as their original format
+    // instead of destroying them as JPEG.
+    const format = (got?.mime || mimeFromContentType(null, url) || "").startsWith("image/svg") ? "svg" : "jpg";
+    const proxied = proxyImageUrl(url, { output: format, q: format === "svg" ? 100 : 85 });
     if (proxied) got = await fetchImageBuffer(proxied, { fetchImpl });
   }
   if (!got) return null;
   const small = await shrinkForVision(got.buf);
-  const mime = small.mime || got.mime || "image/jpeg";
-  let id = null;
-  if (cache) {
-    const stored = await storeRef(url, small.buf, mime);
-    id = stored.id;
+  let smallBuf = small.buf;
+  let mime = small.mime || got.mime || "image/jpeg";
+  if (!smallBuf && got.buf.length <= 150 * 1024) {
+    smallBuf = got.buf;
+    mime = got.mime || mimeFromContentType(null, url) || "image/jpeg";
   }
+  if (!smallBuf) {
+    smallBuf = got.buf.slice(0, 600 * 1024);
+    mime = got.mime || "image/jpeg";
+  }
+  const id = cache ? (await storeRef(url, smallBuf, mime)).id : null;
   return {
     id,
     mime,
-    bytes: small.buf.length,
-    dataUri: `data:${mime};base64,${small.buf.toString("base64")}`,
+    bytes: smallBuf.length,
+    dataUri: `data:${mime};base64,${smallBuf.toString("base64")}`,
   };
 }

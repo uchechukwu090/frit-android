@@ -31,9 +31,11 @@ import { createBilling } from "./billing.js";
 import { readProviderStream, sseDone, sseError, sseDelta } from "./streamProvider.js";
 import { classifyStreamRoute, stripConversationPrefix, ROUTE_TASK, ROUTE_CONVERSATION } from "./streaming.js";
 import { getBots, saveBot, tickBots, BOT_DEFS, scalpingAnalyze, ensureBotPairTables, getBotPairs, saveBotPair, removeBotPair, botCooldown } from "./strategy/bots.js";
-import { recommendLotSize, kellyFraction, normalizeRiskProfile, riskProfileInfo, RISK_PROFILES, DEFAULT_RISK_PROFILE } from "./strategy/sizing.js";
+import { forecastVolume, backtestForecast } from "./strategy/volumeforecast.js";
+import { recommendLotSize, kellyFraction, normalizeRiskProfile, riskProfileInfo, RISK_PROFILES, DEFAULT_RISK_PROFILE, fixedLotSizing } from "./strategy/sizing.js";
 const RISK_PROFILE_INFO = RISK_PROFILES;
 import { marketOf, canonicalSymbol, isDerivSymbol } from "./strategy/rails/router.js";
+import { MetaApiRail, metaApiConfig, normalizeVolume } from "./strategy/metaapi.js";
 import { openPaperPosition, resolvePaperBook, ledgerSummary } from "./strategy/options/paper.js";
 import { maturitySummary } from "./strategy/ledger.js";
 import { runBacktest, walkForward } from "./strategy/options/backtest.js";
@@ -48,9 +50,12 @@ import * as designStudio from "./creative/design.js";
 import * as brandKit from "./creative/brand.js";
 import * as designAgent from "./creative/designAgent.js";
 import * as imageProviders from "./creative/imageProviders.js";
+import { creativeCapabilities, imageCapabilities } from "./creative/capabilities.js";
 import * as typeLayer from "./creative/typeLayer.js";
 import * as refs from "./creative/refs.js";
 import * as directorAgent from "./creative/directorAgent.js";
+import { generatePerformanceRecommendations } from "./strategy/recommendations.js";
+import { getMarketNewsCalendar } from "./strategy/news_calendar.js";
 import { runBounded } from "./concurrency.js";
 import { setModelDb, MODEL_DEFAULTS, MODEL_KEYS, MODEL_META, overrideOf, M } from "./model_config.js";
 
@@ -476,6 +481,10 @@ db.exec(`
     user_id TEXT PRIMARY KEY,
     balance REAL DEFAULT 1000,
     risk_profile TEXT DEFAULT 'MODERATE',
+    -- Lot sizing: AUTO = the lot-size engine (Kelly vs balance/profile);
+    -- FIXED = the user's own lot, used exactly as entered.
+    lot_mode TEXT DEFAULT 'AUTO',
+    fixed_lot REAL DEFAULT 0.01,
     deriv_token TEXT,
     deriv_token_mode TEXT DEFAULT 'platform',
     mt5_server TEXT,
@@ -520,6 +529,15 @@ if (!txnCols.includes("prev_hash")) {
 }
 if (!txnCols.includes("tx_hash")) {
   db.exec("ALTER TABLE wallet_txns ADD COLUMN tx_hash TEXT DEFAULT ''");
+}
+// Trading account: lot sizing mode (engine-chosen vs user-chosen lot).
+// Older frit.db files were created before this pair existed.
+const acctCols = db.prepare("PRAGMA table_info(trading_account)").all().map(c => c.name);
+if (!acctCols.includes("lot_mode")) {
+  db.exec("ALTER TABLE trading_account ADD COLUMN lot_mode TEXT DEFAULT 'AUTO'");
+}
+if (!acctCols.includes("fixed_lot")) {
+  db.exec("ALTER TABLE trading_account ADD COLUMN fixed_lot REAL DEFAULT 0.01");
 }
 
 // ========================= ENVIRONMENT ==============================
@@ -664,9 +682,19 @@ const POCKET_PAYOUT = Number(process.env.POCKET_PAYOUT || 0.8); // broker payout
 // show the effective config.
 const DERIV_APP_ID = process.env.DERIV_APP_ID || "";
 const DERIV_LIVE = process.env.DERIV_LIVE === "1";
-const DERIV_DEMO_TOKEN = process.env.DERIV_DEMO_TOKEN || "";
+// FIX: the new Deriv API issues a Personal Access Token (PAT). It was exported
+// as $env:PAT, which nothing read, so every order silently fell back to paper.
+// PAT / DERIV_PAT / DERIV_TOKEN are now accepted as aliases for the demo token.
+// The executor still picks the DEMO account first and refuses a real account
+// unless DERIV_LIVE=1, so a PAT that can see both is safe by default.
+const DERIV_PAT = process.env.PAT || process.env.DERIV_PAT || process.env.DERIV_TOKEN || "";
+const DERIV_DEMO_TOKEN = process.env.DERIV_DEMO_TOKEN || DERIV_PAT;
 const DERIV_REAL_TOKEN = process.env.DERIV_REAL_TOKEN || "";
-const POCKET_DERIV_AUTO = process.env.POCKET_DERIV_AUTO === "1";
+// Auto-execution defaults ON whenever a token exists (demo-first); set
+// POCKET_DERIV_AUTO=0 to turn it off.
+const POCKET_DERIV_AUTO = process.env.POCKET_DERIV_AUTO != null
+  ? process.env.POCKET_DERIV_AUTO === "1"
+  : !!(DERIV_DEMO_TOKEN || DERIV_REAL_TOKEN);
 const POCKET_DERIV_STAKE = Number(process.env.POCKET_DERIV_STAKE || 1);
 const POCKET_DERIV_MAX_DAY = Number(process.env.POCKET_DERIV_MAX_DAY || 20);
 const SANDBOX_URL = process.env.SANDBOX_URL || "https://sandbox-rexv.onrender.com";
@@ -691,6 +719,11 @@ const ENFORCE_BOUNDED_MONEY = process.env.ENFORCE_BOUNDED_MONEY === "1";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const HAS_ADMIN_SPLIT = !!ADMIN_TOKEN;
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL || "";
+// MetaApi.cloud is the MT5 rail: the user's FBS account is provisioned on
+// MetaApi's terminal and we place market orders over REST. Rise/Fall and every
+// Deriv synthetic stay on Deriv (see strategy/metaapi.js for the contract).
+const METAAPI_CFG = metaApiConfig();
+const metaApiRail = METAAPI_CFG.ready ? new MetaApiRail(METAAPI_CFG) : null;
 // Monetization (manual bank transfer — fill these, never commit real ones):
 const PAY_BANK_NAME = process.env.PAY_BANK_NAME || "";
 const PAY_ACCOUNT_NUMBER = process.env.PAY_ACCOUNT_NUMBER || "";
@@ -2148,12 +2181,38 @@ async function generateImage(prompt, opts = {}) {
   }
   // Normalize shapes: {data:[{b64_json|url}]} | {data:{...}} | {images:[...]}
   const item = data?.data?.[0] || data?.data || data?.images?.[0] || {};
+  const rawB64 = item.b64_json || item.b64Json || item.base64 || null;
+  const declaredMediaType = item.media_type || null;
+  // The OpenRouter /images response may declare a media_type, but the bytes
+  // are the truth: a model can return webp/png/svg despite the request format.
+  // Sniff early so both the agent path and the plain design path carry the real
+  // mime — the client must never assume image/png for a bare base64 blob.
+  let sniffedMediaType = null;
+  if (rawB64) {
+    try {
+      const head = Buffer.from(rawB64, "base64").slice(0, 64);
+      const txt = head.toString("binary");
+      if (head.length > 8 && head[0] === 0x89 && txt.slice(1, 4) === "PNG") sniffedMediaType = "image/png";
+      else if (head.length > 3 && head[0] === 0xff && head[1] === 0xd8) sniffedMediaType = "image/jpeg";
+      else if (txt.startsWith("RIFF") && txt.includes("WEBP")) sniffedMediaType = "image/webp";
+      else if (txt.includes("<svg") || txt.includes("<?xml")) sniffedMediaType = "image/svg+xml";
+    } catch { /* not valid base64 — leave null */ }
+  }
+  // Truth wins: if the server declared one thing and the bytes say another,
+  // use the bytes. If only one of the two is present, use that. Otherwise null
+  // and the client sniffs.
+  const truthyMediaType =
+    declaredMediaType && sniffedMediaType
+      ? declaredMediaType === sniffedMediaType
+        ? declaredMediaType
+        : sniffedMediaType
+      : declaredMediaType || sniffedMediaType;
   const out = {
     ok: true,
     model,
     image_url: item.url || null,
-    image_b64: item.b64_json || item.b64Json || item.base64 || null,
-    media_type: item.media_type || null,
+    image_b64: rawB64,
+    media_type: truthyMediaType,
   };
   if (!out.image_url && !out.image_b64) {
     // The API answered but carried no pixels — usually a moderation block or
@@ -3089,7 +3148,13 @@ function calculateLotSize({ symbol, balance, riskPercent = 1, entry, stopLoss })
 }
 
 // ==================== MT5 BRIDGE ====================
+// MetaApi first when configured (FBS via the cloud MT5 terminal); the legacy
+// self-hosted bridge stays as the fallback so nothing regresses for installs
+// that never provisioned MetaApi.
 async function sendToMT5Bridge({ symbol, action, lotSize, entry, sl, tp, reason = "" }) {
+  if (metaApiRail) {
+    return metaApiRail.placeMarketOrder({ symbol, action, lotSize, entry, sl, tp, reason });
+  }
   if (!MT5_BRIDGE_URL) {
     console.log(`[PAPER TRADE] ${action.toUpperCase()} ${symbol} | Lot:${lotSize} | Entry:${entry} | SL:${sl} | TP:${tp}`);
     return { mode: "paper", symbol, action, lotSize, entry, sl, tp, status: "simulated", message: "MT5_BRIDGE_URL not set — paper mode" };
@@ -3718,6 +3783,7 @@ const derivClient = new DerivClient({
 const derivExecutor = new DerivExecutor({
   db, client: derivClient,
   liveAllowed: DERIV_LIVE, stake: POCKET_DERIV_STAKE, maxPerDay: POCKET_DERIV_MAX_DAY,
+  allowRngOnDemo: process.env.DERIV_ALLOW_RNG !== "0",
   log: (...a) => console.log(...a),
 });
 // REST surface for account management / payments / app insights (DerivClient
@@ -3731,6 +3797,13 @@ if (DERIV_REAL_TOKEN && !DERIV_LIVE) {
 if (!DERIV_DEMO_TOKEN && !DERIV_REAL_TOKEN) {
   console.log("[deriv] no token — signals + paper only. Paste DERIV_DEMO_TOKEN from your Deriv demo account to enable execution.");
 }
+// Effective-config boot line for the MT5 rail: MetaApi owns FX/metals/indices/
+// energy, the legacy bridge is only the fallback, synthetics always stay Deriv.
+console.log(
+  metaApiRail
+    ? `[metaapi] rail ACTIVE: region=${METAAPI_CFG.region} account=${maskSecret(METAAPI_CFG.accountId)} — FBS FX/CFD orders execute on MetaApi; Rise/Fall + synthetics stay on Deriv`
+    : `[metaapi] not configured — set METAAPI_TOKEN + METAAPI_ACCOUNT_ID (region=${METAAPI_CFG.region}) to send FX/CFD orders to FBS; synthetics stay on Deriv`
+);
 // Effective-config boot line: the Render startup log answers "why did nothing
 // execute?" before any signal ever fires.
 console.log(
@@ -3831,7 +3904,7 @@ function riskGate({ symbol, action, lotSize, entry, sl, balance, riskUsdOverride
 // everything else -> MT5 bridge (existing behavior, paper while unset).
 // riskUsdOverride is ALWAYS set for deriv/alpaca so the per-trade cap can
 // never be silently skipped for lack of a PIP row.
-async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual", balance = 1000, riskPercent = 1, userId = null, botName = null, expiryMin = 0 }) {
+async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reason, source = "manual", balance = 1000, riskPercent = 1, userId = null, botName = null, expiryMin = 0, sizingMode = null }) {
   const sym = canonicalSymbol(symbol);
   const rail = marketOf(sym);
   const riskBudget = Math.max(0.5, (Number(balance) || 1000) * (Number(riskPercent) || 1) / 100);
@@ -3840,12 +3913,19 @@ async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reas
     const acct = getTradingAccount(userId);
     if (acct?.balance > 0) balance = acct.balance;
   }
-  if (rail === "deriv") return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName, expiryMin, balance });
+  // Rise/Fall (pocket bot) is a Deriv-only product, whatever the symbol: a
+  // pocket signal on EURUSD must become a Deriv Rise/Fall contract, never an
+  // MT5 market order (it carries no SL/TP, so it would open unprotected).
+  const isRiseFall = Number(expiryMin) > 0 || String(source) === "bot:pocket";
+  if (rail === "deriv" || isRiseFall) return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName, expiryMin, balance });
   if (rail === "alpaca") return executeAlpacaTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, balance });
-  // F-06: bots pass a placeholder 0.01 lot. Size MT5-bridge trades from the
-  // risk budget (balance x riskPercent, capped by calculateLotSize) instead;
-  // the risk gate below still has the final say.
-  if (String(source).startsWith("bot:") && sl && entry) {
+  // F-06: bots used to pass a placeholder 0.01 lot, so MT5-rail orders were
+  // re-sized here from the risk budget. That must NOT override a real size:
+  // when bots.js supplies sizingMode ("auto" = Kelly engine, "fixed" = the
+  // user's own lot) the sizing decision is already made against the user's
+  // balance/profile, and re-sizing would throw it away. Only a legacy caller
+  // that sends no sizingMode (placeholder 0.01) is re-sized.
+  if (String(source).startsWith("bot:") && !sizingMode && sl && entry) {
     const sized = calculateLotSize({ symbol: sym, balance, riskPercent, entry, stopLoss: sl });
     if (sized > 0) lotSize = sized;
   }
@@ -3854,19 +3934,24 @@ async function executeTradeSignal({ symbol, action, lotSize, entry, sl, tp, reas
     console.log(`[executor] RISK-BLOCKED ${sym}: ${gate.reasons.join(" | ")}`);
     return { mode: "blocked", status: "blocked", blocked_by: "risk", reasons: gate.reasons, exposure: gate.exposure };
   }
-  // No MT5 bridge (no VPS yet): Deriv MULT covers whatever it lists — the
-  // executor verifies MULT availability per symbol, so the only trades that
-  // stay paper are ones no connected broker supports. MT5 bridge wins back
-  // automatically the moment MT5_BRIDGE_URL is set.
+  // No MT5 rail at all: Deriv MULT covers whatever it lists — the executor
+  // verifies MULT availability per symbol, so the only trades that stay paper
+  // are ones no connected broker supports. The MT5 rail wins back the moment
+  // either METAAPI_TOKEN + METAAPI_ACCOUNT_ID (preferred) or MT5_BRIDGE_URL
+  // is set.
   //
-  // This is the path FX and metals take (they are "mt5" rail by symbol class
-  // but Deriv lists them as real OTC pairs), so bot orders for EURUSD/XAUUSD
-  // reach Deriv through here.
-  if (!MT5_BRIDGE_URL) {
+  // This is the fallback path FX and metals take (they are "mt5" rail by
+  // symbol class but Deriv lists them as real OTC pairs). Once MetaApi is
+  // configured, FX/metals/indices/energy leave Deriv and settle on the FBS
+  // account instead — Rise/Fall (pocket bot) and the synthetics never do,
+  // they are caught by the `rail === "deriv"` branch above.
+  if (!MT5_BRIDGE_URL && !metaApiRail) {
     return executeDerivTrade({ symbol: sym, action, entry, sl, tp, reason, source, riskBudget, userId, botName, expiryMin, balance });
   }
   const result = await sendToMT5Bridge({ symbol: sym, action, lotSize, entry, sl, tp, reason });
-  if (result.status !== "failed" && sl && tp) {
+  // "refused" = the broker declined it (no money, bad stops, market closed): no
+  // position exists, so nothing must be registered with the monitor.
+  if (result.status !== "failed" && result.status !== "refused" && sl && tp) {
     try {
       positionMonitor.register({ symbol: sym, action, lotSize, entry, sl, tp, source, reason });
     } catch (e) { console.warn("[PositionMonitor] register failed:", e.message); }
@@ -3958,16 +4043,27 @@ async function executeDerivTrade({ symbol, action, entry, sl, tp, reason, source
   }
   let result;
   try {
-    const r = executor.executeMult
-      ? await executor.executeMult({ symbol, direction, stake, multiplier: mult, takeProfit, stopLoss })
-      : { ok: false, why: "mult path unavailable" };
+    // executeBest: Multiplier where the market offers it, Rise/Fall everywhere
+    // else — so every market Deriv lists can take a FRIT signal.
+    const r = executor.executeBest
+      ? await executor.executeBest({
+          symbol, direction, stake, multiplier: mult, takeProfit, stopLoss,
+          durationMin: Number(expiryMin) > 0 ? Number(expiryMin) : POCKET_EXPIRY_MIN,
+        })
+      : { ok: false, why: "deriv execution path unavailable" };
     if (!r.ok) throw new Error(r.why || "deriv refused");
-    result = { mode: r.mode === "REAL" ? "deriv-live" : "deriv-demo", status: "sent", symbol, action: direction, stake, contract_id: r.contract_id, tp, sl, reason };
+    const isRF = r.contractType === "CALL" || r.contractType === "PUT";
+    result = { mode: r.mode === "REAL" ? "deriv-live" : "deriv-demo", status: "sent", symbol, action: direction, stake, contract_id: r.contract_id, contractType: r.contractType, tp: isRF ? null : tp, sl: isRF ? null : sl, reason };
     // Tag the source with the bot name so the portfolio attributes it.
     const src = botName ? `${source}` : source;
     try {
-      const pos = positionMonitor.register({ symbol, action: direction, lotSize: stake, entry, sl, tp, source: `${src}:${result.mode}`, reason });
+      // Rise/Fall expires on its own and settles on the BROKER outcome (linked
+      // via position_id below), so it is registered with no price SL/TP.
+      const pos = positionMonitor.register({ symbol, action: direction, lotSize: stake, entry, sl: isRF ? null : sl, tp: isRF ? null : tp, source: `${src}:${result.mode}`, reason });
       r.positionId = pos?.id;
+      if (isRF && pos?.id && r.contract_id != null) {
+        try { db.prepare("UPDATE deriv_contracts SET position_id = ? WHERE contract_id = ?").run(pos.id, String(r.contract_id)); } catch { /* best-effort */ }
+      }
     } catch (e) { console.warn("[PositionMonitor] deriv register failed:", e.message); }
   } catch (err) {
     console.log(`[Deriv] paper fallback ${symbol}: ${err.message}`);
@@ -4470,6 +4566,7 @@ app.get("/health", (_req, res) => {
     openrouter: { primary: OR_PRIMARY, fast: OR_FAST, draft: OR_DRAFT, image: OR_IMAGE_MODEL, stt: OR_STT_MODEL, video: OR_VIDEO_MODEL, avatar: OR_AVATAR_MODEL, free_fast: OR_FREE_FAST },
     twelve_data: !!TWELVE_DATA_KEY,
     mt5_bridge: !!MT5_BRIDGE_URL,
+    metaapi: { configured: !!metaApiRail, region: METAAPI_CFG.region },
     sandbox_url: SANDBOX_URL,
     sandbox_auth: !!SANDBOX_AUTH,
     frame_buffers: frameBuffers.size,
@@ -6012,6 +6109,53 @@ app.post("/creative-suite/videos/edit", requireAuth, limitCostly, async (req, re
   }
 });
 
+// ==================== CREATIVE CAPABILITIES ====================
+// "Which knobs may the UI show?" Every studio used to hardcode its own list
+// (Generate offered 4:5, Recraft rejects it; video offered nothing while the
+// server defaulted to 4s/720p). This resolves the ACTIVE model per role and
+// reports what it actually accepts, straight from the provider's own model
+// metadata, so a model downgrade (or a creator-console swap) changes the UI
+// instead of silently snapping the user's choice away.
+const CAP_TTL_MS = 30 * 60_000;
+
+/** Fetch + memoise an OpenRouter model list (images/models, videos/models). */
+async function openRouterModelList(path) {
+  const key = `or-models:${path}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+  const r = await fetch(`https://openrouter.ai/api/v1/${path}`, {
+    headers: orVideoHeaders(), signal: AbortSignal.timeout(20_000),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d?.error?.message || `models ${path} HTTP ${r.status}`);
+  const list = Array.isArray(d?.data) ? d.data : (Array.isArray(d?.models) ? d.models : []);
+  cacheSet(key, list, CAP_TTL_MS);
+  return list;
+}
+
+app.get("/creative-suite/capabilities", requireAuth, limitNormal, async (_req, res) => {
+  try {
+    const [imgList, vidList] = await Promise.all([
+      openRouterModelList("images/models").catch(() => []),
+      openRouterModelList("videos/models").catch(() => []),
+    ]);
+    res.json(creativeCapabilities(
+      {
+        imageModel: OR_IMAGE_MODEL,
+        // Design Studio renders text-led graphics; inherit the image model when
+        // no design specialist is configured (blank config = inherit).
+        designModel: OR_DESIGN_MODEL || OR_IMAGE_MODEL,
+        videoModel: OR_VIDEO_MODEL,
+        genjutsuModel: OR_GENJUTSU_MODEL,
+        avatarModel: OR_AVATAR_MODEL,
+      },
+      { images: imgList, videos: vidList },
+    ));
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Live capability table: which video models support what (durations,
 // resolutions, frame control, references) — the app reads this to route
 // Genjutsu/Cinema to a capable model instead of guessing.
@@ -6931,6 +7075,32 @@ function applyBrand(user_id, brandkit_id, prompt) {
   return { brand, prompt: brandKit.applyBrandToPrompt(prompt, brand) };
 }
 
+/**
+ * "Does this model accept input references?" as a cached predicate.
+ *
+ * Image input is a MODEL capability, not a request option. The app can hand us
+ * a mood-board or a logo, but a model that cannot read images answers 400 —
+ * which used to burn a slot in the fallback chain, and could cost the user a
+ * credit on a request that was never going to render. The predicate is built
+ * once per request against OpenRouter's own model list (30-minute cache) and
+ * is deliberately conservative: only LIVE metadata counts as a yes, and an
+ * unknown/unreachable provider means "no references" rather than a guess.
+ */
+async function modelTakesReferences(models) {
+  const wanted = new Set((Array.isArray(models) ? models : [models]).filter(Boolean));
+  if (!wanted.size) return () => false;
+  let allowed = new Set();
+  try {
+    const list = await openRouterModelList("images/models");
+    const caps = new Map();
+    for (const m of wanted) caps.set(m, imageCapabilities(m, list));
+    allowed = new Set([...caps].filter(([, c]) => c.source === "live" && c.reference === true).map(([m]) => m));
+  } catch {
+    allowed = new Set();
+  }
+  return (model) => allowed.has(model);
+}
+
 // Design Studio (graphics niche): flyers, posters, thumbnails, cards with REAL
 // legible text. Routed to the design specialist (OR_GRAPHICS_MODEL), never the
 // photo model. Template zones + brand kit keep every piece on-brand.
@@ -6947,6 +7117,10 @@ app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) =>
     const tpl = templateLibrary.getGraphicsTemplate(template || "") || null;
     // F-13: brand lock is resolved server-side (ownership-checked in SQL).
     const { brand } = applyBrand(uid, brandkit_id, "");
+    // If the caller passed a template, also send it as a layout hint for the
+    // agent: the brief writer treats zones as placement constraints (headline
+    // zone, hero zone, CTA zone, etc.), not just the aspect ratio.
+    const templateForAgent = tpl ? { id: tpl.id, name: tpl.name, aspect_ratio: tpl.aspect_ratio, zones: tpl.zones } : null;
     // Craft routing: each deliverable goes to the model built for it.
     const want = (craft || "auto").toLowerCase();
     const resolved = want === "auto" ? designStudio.pickCraft({ template, headline, body }) : want;
@@ -6965,6 +7139,9 @@ app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) =>
       refs.push({ type: "image_url", image_url: { url: String(r) } });
     }
     const n = designStudio.variationCount(variations);
+    // The mood-board/logo are only attached to a model whose live metadata says
+    // it takes image input — see modelTakesReferences().
+    const refsAllowed = refs.length ? await modelTakesReferences(models) : () => false;
     const base = { template: tpl, headline, body, cta, palette, brand, styleMood: refs.length > 1 ? "match the mood-board references" : "", font };
     // Same brief, distinct art directions, rendered in parallel — pick, don't settle.
     const designs = await Promise.all(Array.from({ length: n }, async (_, v) => {
@@ -6976,7 +7153,7 @@ app.post("/creative-suite/design", requireAuth, limitCostly, async (req, res) =>
             model,
             output_format: "png",
             ...(aspect_ratio ? { aspect_ratio } : {}),
-            ...(refs.length ? { input_references: refs } : {}),
+            ...(refsAllowed(model) ? { input_references: refs } : {}),
           });
           db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
           return { ok: true, model_used: model, image_url: out.image_url || null, image_b64: out.image_b64 || null };
@@ -7081,6 +7258,13 @@ const designAgentDeps = {
     const wanted = [...new Set([opts.model, OR_GRAPHICS_MODEL, OR_TYPE_MODEL, OR_IMAGE_MODEL].filter(Boolean))];
     const specialist = imageProviders.isTypeSpecialist(wanted[0] || "");
     const chain = imageProviders.classConsistentChain(wanted, { specialist });
+    // Image references are a MODEL capability, not a request option: only a
+    // model whose LIVE metadata lists input references may receive one. Sending
+    // a mood-board to a model that cannot read images is a 400 that burns a
+    // slot in the chain — so an unsupported model simply never sees the refs.
+    const refs = (Array.isArray(opts.input_references) ? opts.input_references : [])
+      .filter((r) => r?.image_url?.url);
+    const refsAllowed = refs.length ? await modelTakesReferences(chain) : () => false;
     let lastErr = null;
     for (const model of chain) {
       try {
@@ -7088,6 +7272,7 @@ const designAgentDeps = {
           model,
           output_format: opts.output_format || "png",
           ...(opts.aspect_ratio ? { aspect_ratio: opts.aspect_ratio } : {}),
+          ...(refsAllowed(model) ? { input_references: refs } : {}),
         });
       } catch (e) {
         lastErr = e;
@@ -7133,7 +7318,16 @@ app.post("/creative-suite/design/agent", requireAuth, limitCostly, async (req, r
     if (!ent.ok) return res.status(402).json({ error: ent.message, code: ent.code, needed: ent.needed, balance: ent.balance });
     // F-13: brand kit resolved server-side (ownership checked in SQL).
     const { brand } = applyBrand(uid, input.brandkit_id, "");
-    const out = await designAgent.runDesignAgent({ ...input, goal, brand, uid }, designAgentDeps);
+    // The template is resolved HERE. It used to be read from the sibling
+    // /creative-suite/design handler's scope, which threw
+    // "templateForAgent is not defined" on every agent call — the route never
+    // reached the agent at all. Zones + the layout hint are what make a
+    // template a real brief input instead of just the aspect ratio.
+    const tpl = templateLibrary.getGraphicsTemplate(input.template || "") || null;
+    const templateForAgent = tpl
+      ? { id: tpl.id, name: tpl.name, aspect_ratio: tpl.aspect_ratio, zones: tpl.zones, hint: tpl.hint }
+      : null;
+    const out = await designAgent.runDesignAgent({ ...input, goal, brand, uid, template: templateForAgent }, designAgentDeps);
     const id = `dsg_${Date.now()}`;
     const firstUrl = out.render?.image_url || out.render?.image_b64 || "";
     try {
@@ -7144,7 +7338,16 @@ app.post("/creative-suite/design/agent", requireAuth, limitCostly, async (req, r
     // Charge once per DELIVERED design (image rate), never before the work.
     debitCredits(uid, "image", "design agent");
     db.prepare("UPDATE usage_daily SET images = images + 1 WHERE user_id = ? AND day = ?").run(uid, todayStr());
-    res.json({ ok: true, job_id: id, brand_applied: !!brand, ...out });
+    // Return the design model's own zones/metadata so the client can explain
+    // what the template contributed (the agent brief uses template zones as
+    // layout constraints, not just the aspect ratio).
+    res.json({
+      ok: true,
+      job_id: id,
+      brand_applied: !!brand,
+      template: tpl ? { id: tpl.id, name: tpl.name, aspect_ratio: tpl.aspect_ratio, zones: tpl.zones } : null,
+      ...out,
+    });
   } catch (err) {
     console.error("[/creative-suite/design/agent]", err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -7610,6 +7813,37 @@ app.get("/api/trading/notifications", requireAuth, async (req, res) => {
   }
 });
 
+// --- Predictive volume forecast: is activity about to EXPAND? -------------
+// The forecaster behind the bot lifecycle's RETRIGGER. Exposed so the verdict
+// (and, with ?backtest=1, its measured hit-rate on the symbol's own history)
+// is inspectable instead of being a hidden gate inside the bot loop.
+app.get("/api/trading/volume-forecast", requireAuth, async (req, res) => {
+  try {
+    const sym = String(req.query.symbol || "XAUUSD").toUpperCase();
+    const trend = ["BUY", "SELL"].includes(String(req.query.trend || "").toUpperCase())
+      ? String(req.query.trend).toUpperCase() : null;
+    const store = globalThis.__liveFeed?.store;
+    let c5 = store?.getCandles(sym, "5m", 300) || null;
+    if (!c5?.length) c5 = await fetchCandles(sym, "5min", 300);
+    let c1 = store?.getCandles(sym, "1m", 300) || null;
+    if (!c1?.length) c1 = await fetchCandles(sym, "1min", 300);
+    if (!c5?.length) return res.status(400).json({ error: `no 5m data for ${sym}` });
+    const forecast = forecastVolume({ c5, c1: c1 || [], trend });
+    res.json({
+      symbol: sym,
+      timeframe: "5m",
+      paceTimeframe: "1m",
+      forecast,
+      // Measured, not claimed: lift > 1 means the trigger adds information
+      // over "volume expands anyway". Costs a local pass over the bars.
+      ...(req.query.backtest === "1" ? { backtest: backtestForecast(c5) } : {}),
+      serverTime: Date.now(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Forecast failed", details: err.message });
+  }
+});
+
 // --- Volume matrix: 5-timeframe bias filter (VP / VWAP / CVD / RVOL) -------
 app.get("/api/trading/volume-matrix", requireAuth, async (req, res) => {
   try {
@@ -7629,51 +7863,75 @@ app.get("/api/trading/volume-matrix", requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * Volume-matrix bias for a symbol, from the live candle store.
+ *
+ * Cached 5 minutes so the 60s bot tick never refetches, and null when the
+ * store is cold — the engine treats a missing matrix as "no filter", never as
+ * a veto, so a cold store can never silently block every entry.
+ *
+ * This used to be inline inside the mtfAnalyze dep, which is exactly why only
+ * the intraday bot benefited from it.
+ */
+function matrixBiasFor(symbol) {
+  try {
+    const ck = `mx:${String(symbol).toUpperCase()}`;
+    const cached = cacheGet(ck);
+    if (cached) return cached;
+    const store = globalThis.__liveFeed?.store;
+    const tf = {};
+    for (const iv of ["30m", "4h", "15m", "5m", "1m"]) {
+      const arr = store?.getCandles(String(symbol).toUpperCase(), iv, 120) || [];
+      if (arr.length) tf[iv] = arr.map((x) => ({ open: x.open, high: x.high, low: x.low, close: x.close, volume: x.volume }));
+    }
+    if (Object.keys(tf).length < 2) return null;
+    const bias = analyzeVolumeMatrix(symbol, tf);
+    cacheSet(ck, bias, 5 * 60 * 1000);
+    return bias;
+  } catch { return null; }
+}
+
 // Bots runner: 60s tick, each bot fires on its own cadence (see bots.js).
 setInterval(async () => {
   try {
     await tickBots({
       db,
       mtfAnalyze: async (symbol, opts = {}) => {
-        // Matrix bias from the candle store (ticks carve 1m..4h). Cached 5 min
-        // so the 60s bot tick never refetches. Null when the store is cold —
-        // the engine treats that as "no filter", not as a veto.
-        let matrixBias = null;
-        try {
-          const ck = `mx:${symbol.toUpperCase()}`;
-          const cached = cacheGet(ck);
-          if (cached) matrixBias = cached;
-          else {
-            const store = globalThis.__liveFeed?.store;
-            const tf = {};
-            for (const iv of ["30m", "4h", "15m", "5m", "1m"]) {
-              const arr = store?.getCandles(symbol.toUpperCase(), iv, 120) || [];
-              if (arr.length) tf[iv] = arr.map((x) => ({ open: x.open, high: x.high, low: x.low, close: x.close, volume: x.volume }));
-            }
-            if (Object.keys(tf).length >= 2) {
-              matrixBias = analyzeVolumeMatrix(symbol, tf);
-              cacheSet(ck, matrixBias, 5 * 60 * 1000);
-            }
-          }
-        } catch { /* matrix is a filter, never a blocker */ }
-        return mtfStrategy.analyze(symbol, { ...opts, matrixBias });
+        return mtfStrategy.analyze(symbol, { ...opts, matrixBias: matrixBiasFor(symbol) });
       },
+      // The scalping bot gets the SAME filter the intraday engine runs. It was
+      // wired only into the mtfAnalyze path, so a scalp could enter straight
+      // against strong opposing flow on the same instrument, from the same
+      // candle store, in the same tick.
+      matrixBiasFor: (symbol) => matrixBiasFor(symbol),
       analyzeSynth: (symbol, closes) => analyzeSynth(symbol, closes),
-      scalpingAnalyze: (symbol, closes, timeframe) => scalpingAnalyze(symbol, closes, timeframe),
+      scalpingAnalyze: (symbol, closes, timeframe, opts = {}) => scalpingAnalyze(symbol, closes, timeframe, opts),
       pocketScan: (symbol, expiryMin) => pocketScan(symbol, expiryMin),
       botCooldown: (db, key, intervalMin) => botCooldown(db, key, intervalMin),
       // Kelly lot size against the USER's own balance + risk profile (item 9).
       // The legacy "bot" pseudo-user has no account, so it gets the default.
       sizeFor: (userId, signal) => {
         if (!userId || userId === "bot") {
+          // Legacy platform-wide bots have no account of their own. mode stays
+          // null so the executor keeps its old behaviour of re-sizing the
+          // placeholder 0.01 from the risk budget.
           return {
             lotSize: 0.01,
             riskUsd: 0,
+            mode: null,
             reason: "platform default 0.01 lot (no user account attached)",
           };
         }
         const acct = getTradingAccount(userId);
-        if (!acct) return { lotSize: 0.01, riskUsd: 0, reason: "no account — 0.01 lot default" };
+        if (!acct) return { lotSize: 0.01, riskUsd: 0, mode: "auto", reason: "no account — 0.01 lot default" };
+        // FIXED: the user pinned the lot. Use it verbatim — the risk gate still
+        // runs afterwards, so an oversized lot is refused rather than sent.
+        if (acct.lotMode === "FIXED") {
+          return fixedLotSizing({
+            symbol: signal.symbol, entry: signal.entry, sl: signal.sl,
+            lot: normalizeFixedLot(acct.fixedLot), pipConfig: PIP_CONFIG,
+          });
+        }
         const m = measuredWinRate(signal.symbol);
         const sizing = recommendLotSize({
           symbol: signal.symbol,
@@ -7690,6 +7948,7 @@ setInterval(async () => {
         return {
           lotSize: sizing.lotSize || 0.01,
           riskUsd: sizing.riskUsd,
+          mode: "auto",
           reason: sizing.reason + (m.reliable
             ? ` (win rate ${(m.wr * 100).toFixed(0)}% over ${m.n} resolved setups)`
             : ` (default 45% win rate — only ${m.n} resolved setups)`),
@@ -7716,6 +7975,19 @@ setInterval(async () => {
       scanFx: (args) => scanFx(args),
       storeSignal: (userId, signal) => storeSignalHistory(userId, signal),
       formatSignal: (symbol, result) => formatTradingSignal(symbol, result),
+      // Latest print for the signal lifecycle's TP/SL check, and the local
+      // candle rings the predictive volume forecaster reads (5m forecast TF,
+      // 1m pace). Both come from the live feed — no API credits, live edge.
+      lastPrice: (symbol) => {
+        try {
+          const l = globalThis.__liveFeed?.lastPrice?.(symbol);
+          return l && Number.isFinite(l.price) ? l.price : null;
+        } catch { return null; }
+      },
+      storeCandles: (symbol, interval, n) => {
+        try { return globalThis.__liveFeed?.store?.getCandles(symbol, interval, n) || null; }
+        catch { return null; }
+      },
       storeOptionsSignal: (userId, signal) => storeOptionsSignal(userId, signal),
       openPaper: (userId, signal) => openPaperPosition(db, userId, signal),
       executor: (args) => executeTradeSignal({ ...args, source: args.source || "bots" }),      log: (...a) => console.log("[bots]", ...a),
@@ -7731,10 +8003,32 @@ setInterval(async () => {
 // It is per-user and persisted, so it survives restarts and device reboots.
 function ensureAccountRow(user_id) {
   try {
-    db.prepare("INSERT OR IGNORE INTO trading_account (user_id, balance, risk_profile, updated_at) VALUES (?, 1000, 'MODERATE', ?)")
+    db.prepare("INSERT OR IGNORE INTO trading_account (user_id, balance, risk_profile, lot_mode, fixed_lot, updated_at) VALUES (?, 1000, 'MODERATE', 'AUTO', 0.01, ?)")
       .run(user_id, Date.now());
   } catch { /* ignore */ }
 }
+
+// The two lot-sizing modes, mirrored exactly by the app's Watchlist card.
+const LOT_MODES = ["AUTO", "FIXED"];
+const MIN_FIXED_LOT = 0.01;
+const MAX_FIXED_LOT = 100;
+
+function normalizeLotMode(v, fallback = "AUTO") {
+  const s = String(v || "").trim().toUpperCase();
+  if (LOT_MODES.includes(s)) return s;
+  if (s === "MANUAL" || s === "CUSTOM") return "FIXED";
+  if (s === "ENGINE" || s === "KELLY" || s === "AUTOMATIC") return "AUTO";
+  return fallback;
+}
+
+/** Round to the 0.01 step every retail MT5/broker serves, clamped sanely. */
+function normalizeFixedLot(v, fallback = 0.01) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(MAX_FIXED_LOT, Math.max(MIN_FIXED_LOT, Math.round(n * 100) / 100));
+}
+
+
 
 function getTradingAccount(user_id) {
   ensureAccountRow(user_id);
@@ -7745,6 +8039,9 @@ function getTradingAccount(user_id) {
       userId: user_id,
       balance: Number(r.balance) > 0 ? Number(r.balance) : 1000,
       riskProfile: r.risk_profile || "MODERATE",
+      // AUTO = bot picks the lot with the sizing engine; FIXED = user's lot.
+      lotMode: normalizeLotMode(r.lot_mode),
+      fixedLot: normalizeFixedLot(r.fixed_lot),
       // Credentials are NEVER echoed back in full — only whether they exist.
       hasDerivToken: !!(r.deriv_token && String(r.deriv_token).length > 4),
       derivTokenMode: r.deriv_token_mode || "platform",
@@ -7772,6 +8069,14 @@ function saveTradingAccount(user_id, patch = {}) {
   const riskProfile = patch.riskProfile != null
     ? normalizeRiskProfile(patch.riskProfile)
     : (cur.risk_profile || "MODERATE");
+  // Lot sizing. FIXED requires a real lot; an invalid number keeps the last
+  // good value instead of silently falling back to 0.01 (which is the exact
+  // hard-cap behaviour this setting exists to remove).
+  const lotMode = normalizeLotMode(patch.lotMode != null ? patch.lotMode : cur.lot_mode);
+  const fixedLot = normalizeFixedLot(
+    patch.fixedLot != null ? patch.fixedLot : cur.fixed_lot,
+    normalizeFixedLot(cur.fixed_lot)
+  );
   const derivToken = patch.derivToken != null
     ? (String(patch.derivToken).trim() || null)
     : (cur.deriv_token || null);
@@ -7786,13 +8091,13 @@ function saveTradingAccount(user_id, patch = {}) {
   const mt5Broker = patch.mt5Broker != null ? String(patch.mt5Broker).trim() : (cur.mt5_broker || null);
   db.prepare(`
     INSERT INTO trading_account
-      (user_id, balance, risk_profile, deriv_token, deriv_token_mode, mt5_server, mt5_login, mt5_password, mt5_broker, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (user_id, balance, risk_profile, lot_mode, fixed_lot, deriv_token, deriv_token_mode, mt5_server, mt5_login, mt5_password, mt5_broker, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
-      balance = ?, risk_profile = ?, deriv_token = ?, deriv_token_mode = ?,
+      balance = ?, risk_profile = ?, lot_mode = ?, fixed_lot = ?, deriv_token = ?, deriv_token_mode = ?,
       mt5_server = ?, mt5_login = ?, mt5_password = ?, mt5_broker = ?, updated_at = ?
-  `).run(user_id, balance, riskProfile, derivToken, derivTokenMode, mt5Server, mt5Login, mt5Password, mt5Broker, Date.now(),
-    balance, riskProfile, derivToken, derivTokenMode, mt5Server, mt5Login, mt5Password, mt5Broker, Date.now());
+  `).run(user_id, balance, riskProfile, lotMode, fixedLot, derivToken, derivTokenMode, mt5Server, mt5Login, mt5Password, mt5Broker, Date.now(),
+    balance, riskProfile, lotMode, fixedLot, derivToken, derivTokenMode, mt5Server, mt5Login, mt5Password, mt5Broker, Date.now());
   return getTradingAccount(user_id);
 }
 
@@ -8012,6 +8317,33 @@ app.post("/api/trading/scan", requireAuth, async (req, res) => {
   }
 });
 
+// --- Execution rails: which broker owns which market, right now ---
+// This is the answer to "is my MetaApi key actually wired up?" — it performs a
+// live round-trip (balance + open positions) instead of only echoing env flags,
+// so a wrong region or a stale token is visible before a trade is attempted.
+app.get("/api/trading/rails", requireAuth, async (_req, res) => {
+  try {
+    const rail = metaApiRail ? await metaApiRail.health() : {
+      ok: false, configured: false, reason: "METAAPI_TOKEN / METAAPI_ACCOUNT_ID unset",
+    };
+    res.json({
+      routing: {
+        deriv: "Rise/Fall (pocket bot) + every Deriv synthetic index — never leaves Deriv",
+        metaapi: "FX, metals, indices, energy, crypto CFDs — FBS account via MetaApi",
+        alpaca: "US stocks/ETFs",
+      },
+      metaapi: {
+        ...rail,
+        region: METAAPI_CFG.region,
+        accountId: METAAPI_CFG.accountId ? maskSecret(METAAPI_CFG.accountId) : null,
+      },
+      mt5_bridge: { configured: !!MT5_BRIDGE_URL, used: !metaApiRail && !!MT5_BRIDGE_URL },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Rails check failed", details: err.message });
+  }
+});
+
 // --- Trading account: balance, risk profile, own broker credentials ---
 app.get("/api/trading/account", requireAuth, async (req, res) => {
   try {
@@ -8041,6 +8373,14 @@ app.post("/api/trading/lot-size", requireAuth, async (req, res) => {
     const acct = getTradingAccount(user_id);
     const sym = String(symbol || "").toUpperCase();
     if (!sym) return res.status(400).json({ error: "symbol required" });
+    // FIXED mode: the preview must show the lot that WILL be sent, not a Kelly
+    // number the executor will never use.
+    if (acct?.lotMode === "FIXED") {
+      const out = fixedLotSizing({
+        symbol: sym, entry, sl, lot: normalizeFixedLot(acct.fixedLot), pipConfig: PIP_CONFIG,
+      });
+      return res.json({ ok: true, sizing: out, account: acct });
+    }
     const out = recommendLotSize({
       symbol: sym,
       balance: acct?.balance || 1000,
@@ -8050,7 +8390,7 @@ app.post("/api/trading/lot-size", requireAuth, async (req, res) => {
       pipConfig: PIP_CONFIG,
       confidence,
     });
-    res.json({ ok: true, sizing: out, account: acct });
+    res.json({ ok: true, sizing: { ...out, mode: "auto" }, account: acct });
   } catch (err) {
     res.status(500).json({ error: "Lot size failed", details: err.message });
   }
@@ -8700,36 +9040,47 @@ app.post("/api/trading/ai/explain", requireAuth, async (req, res) => {
   }
 });
 
+// --- Recommendations (Performance-based across FX, Crypto, Stocks, Indices, Synthetics) ---
+app.get("/api/trading/recommendations", requireAuth, async (req, res) => {
+  try {
+    const { market = "ALL", type = "ALL", limit = 50 } = req.query;
+    const recommendations = generatePerformanceRecommendations({ market, type, limit: Number(limit) || 50 });
+    res.json({ ok: true, recommendations, total: recommendations.length, generatedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: "Recommendations failed", details: err.message });
+  }
+});
+
+// --- Market News Calendar (Forex News Calendar & Historical Analysis) ---
+app.get("/api/trading/news/calendar", requireAuth, async (req, res) => {
+  try {
+    const { impact = "ALL", mode = "ALL", currency = "ALL", limit = 40 } = req.query;
+    const calendar = await getMarketNewsCalendar({ impact, mode, currency, limit: Number(limit) || 40 });
+    res.json({ ok: true, ...calendar });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: "News calendar failed", details: err.message });
+  }
+});
+
+// --- Recent Signals Gotten Across All Engines ---
+app.get("/api/trading/signals/recent", requireAuth, async (req, res) => {
+  try {
+    const user_id = boundUser(req);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "30", 10)));
+    const rows = db.prepare("SELECT * FROM trading_signals WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?").all(user_id, limit);
+    const signals = rows.map(hydrateSignal);
+    res.json({ ok: true, signals, total: signals.length, generatedAt: Date.now() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: "Recent signals failed", details: err.message });
+  }
+});
+
 // --- AI Recommendations ---
 app.post("/api/trading/ai/recommendations", requireAuth, async (req, res) => {
   try {
-    const user_id = boundUser(req);
-    const { riskProfile = "MODERATE", capital = 10000 } = req.body || {};
-    
-    const watchlist = db.prepare("SELECT symbol FROM trading_watchlist WHERE user_id = ? AND is_enabled = 1").all(user_id);
-    const symbols = watchlist.map(w => w.symbol);
-    
-    const recommendations = [];
-    for (const sym of symbols.slice(0, 5)) {
-      const result = await mtfStrategy.analyze(sym, { balance: capital, riskPercent: riskProfile === "CONSERVATIVE" ? 0.5 : riskProfile === "AGGRESSIVE" ? 2 : 1 });
-      if (result.decision === "BUY" || result.decision === "SELL") {
-        recommendations.push({
-          symbol: sym,
-          action: result.decision,
-          confidence: result.confidence,
-          entry: result.entry,
-          sl: result.sl,
-          tp1: result.tp,
-          tp2: result.tp2,
-          rr: result.rr,
-          reasoning: result.reason,
-          regime: result.regime?.macro_trend,
-          positionSize: calculateLotSize({ symbol: sym, balance: capital, riskPercent: 1, entry: result.entry, stopLoss: result.sl })
-        });
-      }
-    }
-    
-    res.json({ recommendations, generatedAt: Date.now() });
+    const { market = "ALL", type = "ALL", limit = 50 } = req.body || {};
+    const recommendations = generatePerformanceRecommendations({ market, type, limit: Number(limit) || 50 });
+    return res.json({ ok: true, recommendations, total: recommendations.length, generatedAt: Date.now() });
   } catch (err) {
     res.status(500).json({ error: "Recommendations failed", details: err.message });
   }
@@ -8975,7 +9326,7 @@ app.get("/api/trading/deriv/status", requireAuth, async (req, res) => {
     // Only attempt the broker round-trip when a token exists — otherwise the
     // status call hangs on a socket nobody will answer.
     if (_derivToken) {
-      try { liveSymbols = (await derivClient.activeSymbols()).filter(s => !SYNTHETIC_ONLY.test(s)).slice(0, 400); } catch { /* ignore */ }
+      try { liveSymbols = (await derivClient.activeSymbols()).slice(0, 400); } catch { /* ignore */ }
     }
     res.json({
       ...derivExecutor.status(), balance: bal, diag,
@@ -8984,6 +9335,29 @@ app.get("/api/trading/deriv/status", requireAuth, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: "Deriv status failed", details: err.message });
+  }
+});
+
+// Which contract families (Multiplier / Rise-Fall / Digits) each Deriv market
+// offers on this account. ?force=1 bypasses the 30-min cache.
+app.get("/api/trading/deriv/markets", requireAuth, async (req, res) => {
+  try {
+    if (!requirePocket(req, res)) return;
+    if (!_derivToken) return res.status(400).json({ error: "no Deriv token — set PAT in server/.env" });
+    const m = await derivExecutor.marketMatrix({ force: req.query?.force === "1" });
+    if (m.error) return res.status(502).json({ error: m.error });
+    const rows = m.rows;
+    res.json({
+      at: m.at,
+      total: rows.length,
+      tradable: rows.filter(r => r.mult || r.riseFall).length,
+      mult: rows.filter(r => r.mult).length,
+      riseFall: rows.filter(r => r.riseFall).length,
+      untradable: rows.filter(r => !r.mult && !r.riseFall).map(r => r.symbol),
+      rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Deriv markets failed", details: err.message });
   }
 });
 
@@ -9137,8 +9511,8 @@ Single OpenRouter gateway:
  - whisper-large-v3 — STT (accuracy pick)
  - bytedance-seed/seedream-5-0-flash — image gen
 Infrastructure:
- - Lot size engine (per-pair pip math)
- - MT5 bridge (live) or paper mode
+ - Lot size engine (per-pair pip math, auto or user-fixed lot)
+ - MetaApi/FBS MT5 rail (live) or paper mode
  - Code sandbox (Python/JS)
  - Android automation (State Machine: Verify-Act)
  - Screen frame ingestion -> vision analysis
